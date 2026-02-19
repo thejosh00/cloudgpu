@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudgpu"
+version = "0.1.0"
+description = "CLI tool to install GPU Python apps on Lambda Labs cloud instances"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.scripts]
+cloudgpu = "cloudgpu.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
