@@ -7,7 +7,6 @@ import stat
 import time
 
 from ..installer import AppInstaller
-from ..state import State
 from ..utils import run, pip_install, pip_install_torch, venv_python, check_torch_cuda, log
 
 COMFYUI_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
