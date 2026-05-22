@@ -10,6 +10,10 @@ CONFIG_DIR = Path.home() / ".config" / "cloudgpu"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
+class ConfigError(Exception):
+    """Raised when required configuration is missing or invalid."""
+
+
 def load_config() -> dict[str, Any]:
     """Load config from disk, returning empty dict if missing."""
     if not CONFIG_FILE.exists():
@@ -33,7 +37,7 @@ def get_host(host: str | None = None) -> str:
         The resolved host string.
 
     Raises:
-        click.UsageError: If no host available.
+        ConfigError: If no host available.
     """
     if host:
         return host
@@ -41,8 +45,7 @@ def get_host(host: str | None = None) -> str:
     saved = config.get("host")
     if saved:
         return saved
-    import click
-    raise click.UsageError(
+    raise ConfigError(
         "No host specified. Run 'cloudgpu setup <host>' first, or pass a host."
     )
 
@@ -61,7 +64,6 @@ def get_persistent_dir(host: str | None = None) -> str:
     saved = config.get("persistent_dir")
     if saved:
         return saved
-    import click
-    raise click.UsageError(
+    raise ConfigError(
         "Persistent directory not configured. Run 'cloudgpu setup <host>' first."
     )

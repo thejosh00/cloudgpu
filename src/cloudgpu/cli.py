@@ -36,6 +36,16 @@ def _remote_run(host: str, persistent_dir: str, command: str, extra_args: list[s
     return result.stdout
 
 
+def _resolve_target(host: str | None) -> tuple[str, str]:
+    """Resolve the host and persistent dir, surfacing config errors to the user."""
+    try:
+        host = config.get_host(host)
+        persistent_dir = config.get_persistent_dir()
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+    return host, persistent_dir
+
+
 @click.group()
 def cli() -> None:
     """CloudGPU - Install GPU Python apps on Lambda Labs instances."""
@@ -99,8 +109,7 @@ def setup(host: str) -> None:
 @click.option("--app", type=click.Choice(AVAILABLE_APPS), help="App to install")
 def install(host: str | None, app: str | None) -> None:
     """Install a GPU app on the instance."""
-    host = config.get_host(host)
-    persistent_dir = config.get_persistent_dir()
+    host, persistent_dir = _resolve_target(host)
 
     # If no app specified, prompt interactively
     if not app:
@@ -133,8 +142,7 @@ def install(host: str | None, app: str | None) -> None:
 @click.argument("host", required=False)
 def recover(host: str | None) -> None:
     """Restore everything on a new instance from persistent storage."""
-    host = config.get_host(host)
-    persistent_dir = config.get_persistent_dir()
+    host, persistent_dir = _resolve_target(host)
 
     # Sync remote tool
     with console.status("Syncing remote tool..."):
@@ -162,8 +170,7 @@ def recover(host: str | None) -> None:
 @click.argument("host", required=False)
 def status(host: str | None) -> None:
     """Show what's installed and their health."""
-    host = config.get_host(host)
-    persistent_dir = config.get_persistent_dir()
+    host, persistent_dir = _resolve_target(host)
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
@@ -187,8 +194,7 @@ def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
         cloudgpu ssh -- comfyui
         cloudgpu ssh -H my-host -- nvidia-smi
     """
-    host = config.get_host(host)
-    persistent_dir = config.get_persistent_dir()
+    host, persistent_dir = _resolve_target(host)
 
     cmd = None
     if command:
