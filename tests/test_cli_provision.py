@@ -70,6 +70,44 @@ def test_failure_exits_nonzero(tmp_config_dir, monkeypatch):
         cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
 
 
+def test_secrets_transferred_and_sourced_not_inlined(tmp_config_dir, monkeypatch):
+    profile = _make_profile()
+    _write_provision("p")
+    # Secret value must never end up in the command string.
+    profiles.secrets_file().write_text("CIVITAI_TOKEN=SECRET123\n")
+
+    copied = []
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    monkeypatch.setattr(cli.sync, "copy_file",
+                        lambda local, host, remote: copied.append((local, remote)))
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+
+    # The secrets file is transferred to an ephemeral home path...
+    assert copied == [(str(profiles.secrets_file()), ".cloudgpu-secrets.env")]
+    # ...sourced and cleaned up on the instance...
+    assert 'set -a; . "$S"' in captured["command"]
+    assert "trap" in captured["command"]
+    # ...but the value never appears in the command we send.
+    assert "SECRET123" not in captured["command"]
+
+
+def test_no_secrets_means_no_secret_handling(tmp_config_dir, monkeypatch):
+    profile = _make_profile()
+    _write_provision("p")
+    # no secrets.env created
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    monkeypatch.setattr(cli.sync, "copy_file", lambda *a, **k: pytest.fail("no secrets to copy"))
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    assert ".cloudgpu-secrets.env" not in captured["command"]
+
+
 def test_provision_timeout_is_overridable(tmp_config_dir, monkeypatch):
     profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
     profiles.profile_path("p").write_text(

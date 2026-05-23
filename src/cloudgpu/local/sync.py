@@ -39,6 +39,26 @@ def sync_remote(host: str, persistent_dir: str) -> None:
     )
 
 
+def copy_file(local_path: str, host: str, remote_path: str) -> None:
+    """Rsync a single local file to ``remote_path`` (home-relative if it has no dir part).
+
+    The file content travels over the rsync/ssh stream, never as a command-line argument,
+    so it's safe for secrets.
+    """
+    if "/" in remote_path:
+        remote_dir = remote_path.rsplit("/", 1)[0]
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {remote_dir}"],
+            check=True,
+            timeout=15,
+        )
+    subprocess.run(
+        ["rsync", "-az", local_path, f"{host}:{remote_path}"],
+        check=True,
+        timeout=60,
+    )
+
+
 def copy_dir(local_dir: str, host: str, remote_dir: str) -> None:
     """Mirror a local directory's contents to ``remote_dir`` on the instance (rsync)."""
     subprocess.run(

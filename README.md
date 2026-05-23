@@ -89,6 +89,29 @@ dest="$comfy/user/default/workflows"; mkdir -p "$dest"
 for wf in "$CLOUDGPU_PROVISION_DIR"/workflows/*.json; do cp -f "$wf" "$dest/"; done
 ```
 
+#### Secrets (API tokens, e.g. Civitai)
+
+For downloads that need a private token, **do not put it in the script**. Add it to
+`~/.config/cloudgpu/secrets.env` (mode 600, `KEY=VALUE` per line):
+
+```bash
+CIVITAI_TOKEN=your_token_here
+```
+
+On `up`, cloudgpu transfers this file to the instance (as content, never on a command
+line), sources it into the provision environment, and removes it afterward — so the
+script references `$CIVITAI_TOKEN` and never hardcodes the value. Use a header so the
+token stays out of URLs and logs:
+
+```bash
+curl -fL -C - -H "Authorization: Bearer $CIVITAI_TOKEN" \
+  -o "$dest" "https://civitai.com/api/download/models/<versionId>"
+```
+
+`secrets.env` is never committed and never printed; the included `CLAUDE.md` instructs
+Claude not to read it, so you can have Claude edit provision scripts without exposing the
+value.
+
 Profiles are per-user (not checked in). You can keep several; more than one can run at once,
 as long as each uses its own filesystem (a filesystem backs only one instance at a time).
 A second profile (different filesystem) runs concurrently:

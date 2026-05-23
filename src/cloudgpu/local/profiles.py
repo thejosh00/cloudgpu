@@ -54,6 +54,16 @@ def runtime_path(name: str) -> Path:
     return runtime_dir() / f"{name}.json"
 
 
+def secrets_file() -> Path:
+    """Path to the optional shared secrets file (KEY=VALUE lines, e.g. CIVITAI_TOKEN).
+
+    If present it's transferred to the instance and sourced into the provision script's
+    environment, so scripts can reference $CIVITAI_TOKEN etc. without hardcoding values.
+    Keep it mode 600; it is never committed and must not be printed.
+    """
+    return config.CONFIG_DIR / "secrets.env"
+
+
 def provision_dir(name: str) -> Path:
     """Directory of optional provisioning assets for a profile, run on every ``up``.
 

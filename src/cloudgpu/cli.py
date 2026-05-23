@@ -418,6 +418,19 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
     remote_dir = f"{persistent_dir}/cloudgpu/provision"
     sync.copy_dir(str(pdir), host, remote_dir)
 
+    # Secrets (e.g. CIVITAI_TOKEN): transfer the file as content (never on the command
+    # line), source it into the environment on the instance, and remove it afterward.
+    # It goes to an ephemeral home path (not the persistent filesystem) so it doesn't
+    # linger on shared storage.
+    secrets_prefix = ""
+    if profiles.secrets_file().exists():
+        sync.copy_file(str(profiles.secrets_file()), host, ".cloudgpu-secrets.env")
+        secrets_prefix = (
+            'S="$HOME/.cloudgpu-secrets.env"; chmod 600 "$S"; '
+            'trap \'rm -f "$S"\' EXIT; set -a; . "$S"; set +a; '
+        )
+        display.info("Loaded secrets for provisioning.")
+
     env = (
         f"CLOUDGPU_PERSISTENT_DIR={persistent_dir} "
         f"CLOUDGPU_APPS_DIR={persistent_dir}/apps "
@@ -426,7 +439,10 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
         f"CLOUDGPU_PROVISION_DIR={remote_dir} "
         f"PATH={bin_dir}:$PATH"
     )
-    command = f"cd {remote_dir} && export {env} && chmod +x provision.sh && bash provision.sh"
+    command = (
+        f"{secrets_prefix}cd {remote_dir} && export {env} "
+        f"&& chmod +x provision.sh && bash provision.sh"
+    )
     result = ssh.ssh_run(host, command, capture=False, timeout=int(profile.get("provision_timeout", 3600)))
     if not result.ok:
         display.error(f"Provision failed (exit code {result.returncode})")
