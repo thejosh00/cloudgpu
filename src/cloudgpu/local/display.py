@@ -79,3 +79,121 @@ def show_status(apps: dict) -> None:
         )
 
     console.print(table)
+
+
+def _price(cents_per_hour: int | None) -> str:
+    """Format Lambda's price (cents/hour) as a dollar string."""
+    if cents_per_hour is None:
+        return "?"
+    return f"${cents_per_hour / 100:.2f}/hr"
+
+
+def _gib(bytes_used: object) -> str:
+    """Format a byte count as GiB (Lambda returns it as a string or int)."""
+    try:
+        return f"{int(bytes_used) / 1024 ** 3:.1f} GiB"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def show_filesystems(filesystems: list[dict]) -> None:
+    """Display filesystems in a table."""
+    if not filesystems:
+        info("No filesystems found.")
+        return
+
+    table = Table(title="Filesystems")
+    table.add_column("Name", style="bold")
+    table.add_column("ID")
+    table.add_column("Region")
+    table.add_column("In Use")
+    table.add_column("Used")
+    table.add_column("Mount Point")
+
+    for fs in filesystems:
+        region = fs.get("region") or {}
+        region_name = region.get("name") if isinstance(region, dict) else region
+        in_use = fs.get("is_in_use")
+        in_use_str = "[green]yes[/green]" if in_use else "no"
+        table.add_row(
+            fs.get("name", "?"),
+            fs.get("id", "?"),
+            region_name or "?",
+            in_use_str,
+            _gib(fs.get("bytes_used")),
+            fs.get("mount_point", "?"),
+        )
+
+    console.print(table)
+
+
+def show_instances(instances: list[dict]) -> None:
+    """Display running instances in a table."""
+    if not instances:
+        info("No running instances.")
+        return
+
+    table = Table(title="Instances")
+    table.add_column("Name", style="bold")
+    table.add_column("ID")
+    table.add_column("Status")
+    table.add_column("Type")
+    table.add_column("Region")
+    table.add_column("IP")
+
+    for inst in instances:
+        itype = inst.get("instance_type") or {}
+        region = inst.get("region") or {}
+        status = inst.get("status", "?")
+        style = "green" if status == "active" else "yellow"
+        table.add_row(
+            inst.get("name") or "[dim]-[/dim]",
+            inst.get("id", "?"),
+            f"[{style}]{status}[/{style}]",
+            itype.get("name", "?") if isinstance(itype, dict) else "?",
+            region.get("name", "?") if isinstance(region, dict) else "?",
+            inst.get("ip") or "[dim]-[/dim]",
+        )
+
+    console.print(table)
+
+
+def show_instance_types(instance_types: dict, available_only: bool = False) -> None:
+    """Display available instance types in a table.
+
+    Args:
+        instance_types: Map of name -> {instance_type, regions_with_capacity_available}.
+        available_only: If True, only show types with capacity in some region.
+    """
+    if not instance_types:
+        info("No instance types found.")
+        return
+
+    table = Table(title="Instance Types")
+    table.add_column("Name", style="bold")
+    table.add_column("GPU")
+    table.add_column("vCPUs", justify="right")
+    table.add_column("Memory", justify="right")
+    table.add_column("Price")
+    table.add_column("Regions Available")
+
+    for name in sorted(instance_types):
+        entry = instance_types[name]
+        spec = entry.get("instance_type", {})
+        specs = spec.get("specs", {})
+        regions = entry.get("regions_with_capacity_available", [])
+        region_names = ", ".join(r.get("name", "?") for r in regions)
+
+        if available_only and not regions:
+            continue
+
+        table.add_row(
+            name,
+            spec.get("gpu_description", "?"),
+            str(specs.get("vcpus", "?")),
+            f"{specs.get('memory_gib', '?')} GiB",
+            _price(spec.get("price_cents_per_hour")),
+            f"[green]{region_names}[/green]" if region_names else "[dim]none[/dim]",
+        )
+
+    console.print(table)

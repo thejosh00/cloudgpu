@@ -27,7 +27,7 @@ class TestComfyUIInstaller:
         assert installer.app_dir == os.path.join(tmp_persistent_dir, "apps", "comfyui")
         assert installer.venv_dir == os.path.join(tmp_persistent_dir, "venvs", "comfyui")
         assert installer.launch_script == os.path.join(
-            tmp_persistent_dir, ".cloudgpu", "bin", "comfyui"
+            tmp_persistent_dir, "cloudgpu", "bin", "comfyui"
         )
 
     def test_get_status_not_installed(self, installer):

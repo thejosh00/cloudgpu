@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from cloudgpu.local.config import load_config, save_config, get_host, save_host, get_persistent_dir
+from cloudgpu.local.config import load_config, save_config, get_host, save_host, get_persistent_dir, ConfigError
 
 
 class TestConfig:
@@ -35,8 +35,7 @@ class TestGetHost:
         assert get_host(None) == "saved-host"
 
     def test_no_host_raises(self, tmp_config_dir):
-        import click
-        with pytest.raises(click.UsageError, match="No host specified"):
+        with pytest.raises(ConfigError, match="No host specified."):
             get_host(None)
 
 
@@ -46,6 +45,5 @@ class TestGetPersistentDir:
         assert get_persistent_dir() == "/lambda/nfs/myfs"
 
     def test_no_dir_raises(self, tmp_config_dir):
-        import click
-        with pytest.raises(click.UsageError, match="Persistent directory not configured"):
+        with pytest.raises(ConfigError, match="Persistent directory not configured"):
             get_persistent_dir()

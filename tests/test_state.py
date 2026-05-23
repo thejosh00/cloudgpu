@@ -53,11 +53,11 @@ class TestState:
         state = State(tmp_persistent_dir)
         assert state.apps_dir == os.path.join(tmp_persistent_dir, "apps")
         assert state.venvs_dir == os.path.join(tmp_persistent_dir, "venvs")
-        assert state.bin_dir == os.path.join(tmp_persistent_dir, ".cloudgpu", "bin")
+        assert state.bin_dir == os.path.join(tmp_persistent_dir, "cloudgpu", "bin")
 
     def test_creates_directories_on_save(self, tmp_persistent_dir):
         state = State(tmp_persistent_dir)
         state.set_app("test", {"status": "ok"})
-        assert os.path.isdir(os.path.join(tmp_persistent_dir, ".cloudgpu"))
-        assert os.path.isdir(os.path.join(tmp_persistent_dir, ".cloudgpu", "bin"))
-        assert os.path.isdir(os.path.join(tmp_persistent_dir, ".cloudgpu", "remote"))
+        assert os.path.isdir(os.path.join(tmp_persistent_dir, "cloudgpu"))
+        assert os.path.isdir(os.path.join(tmp_persistent_dir, "cloudgpu", "bin"))
+        assert os.path.isdir(os.path.join(tmp_persistent_dir, "cloudgpu", "remote"))

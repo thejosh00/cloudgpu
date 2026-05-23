@@ -41,6 +41,34 @@ After `setup`, the host is saved locally so subsequent commands can omit it.
 | `cloudgpu recover [host]` | Restore everything on a new instance |
 | `cloudgpu status [host]` | Show installed apps and their health |
 | `cloudgpu ssh [-H host] [-- command]` | SSH wrapper with launch scripts on PATH |
+| `cloudgpu lambda ...` | Manage Lambda Cloud resources via the API (see below) |
+
+## Lambda Cloud API
+
+Provision instances and filesystems directly via the [Lambda Cloud API](https://docs-api.lambda.ai/api/cloud). Set your API key first ([create one here](https://cloud.lambda.ai/api-keys)):
+
+```bash
+export LAMBDA_API_KEY=secret_...
+```
+
+| Command | Description |
+|---|---|
+| `cloudgpu lambda instances` | List running instances |
+| `cloudgpu lambda instance-types [--available]` | List instance types, pricing, and capacity |
+| `cloudgpu lambda launch --region <r> --type <t> --ssh-key <k> [--filesystem <fs>] [--name <n>]` | Launch an instance |
+| `cloudgpu lambda restart <id>...` | Restart instance(s) |
+| `cloudgpu lambda terminate <id>... [-y]` | Terminate instance(s) |
+| `cloudgpu lambda filesystems` | List filesystems |
+| `cloudgpu lambda create-filesystem <name> --region <r>` | Create a filesystem |
+| `cloudgpu lambda delete-filesystem <id> [-y]` | Delete a filesystem |
+
+```bash
+# Find an available GPU, launch it with a filesystem, then set up cloudgpu on it
+cloudgpu lambda instance-types --available
+cloudgpu lambda launch --region us-tx-1 --type gpu_1x_a10 --ssh-key my-key --filesystem my-fs
+cloudgpu lambda instances          # grab the IP once it's active
+cloudgpu setup ubuntu@<instance-ip>
+```
 
 ## How It Works
 
@@ -86,3 +114,4 @@ uv pip install -e ".[dev]"
 - **Remote scripts are stdlib-only** - no pip install needed on the instance
 - **`--system-site-packages` venvs** - guaranteed CUDA compatibility with Lambda's PyTorch
 - **State in JSON** - simple, human-readable, easy to debug
+- **Lambda API via stdlib `urllib`** - no `requests`/`httpx` dependency; key read from `LAMBDA_API_KEY`

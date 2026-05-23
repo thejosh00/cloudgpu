@@ -8,7 +8,7 @@ import sys
 import click
 from rich.console import Console
 
-from cloudgpu.local import config, display, ssh, sync
+from cloudgpu.local import config, display, lambda_api, ssh, sync
 
 console = Console()
 
@@ -204,3 +204,122 @@ def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
 
     exit_code = ssh.ssh_interactive(host, cmd)
     sys.exit(exit_code)
+
+
+def _api_call(fn, *args, **kwargs):
+    """Run a Lambda API call, surfacing errors as a clean message and exit."""
+    try:
+        return fn(*args, **kwargs)
+    except lambda_api.LambdaAPIError as e:
+        display.error(str(e))
+        sys.exit(1)
+
+
+@cli.group(name="lambda")
+def lambda_group() -> None:
+    """Manage Lambda Cloud resources via the API (needs LAMBDA_API_KEY)."""
+    pass
+
+
+@lambda_group.command(name="instances")
+def lambda_instances() -> None:
+    """List running instances."""
+    display.show_instances(_api_call(lambda_api.list_instances))
+
+
+@lambda_group.command(name="instance-types")
+@click.option("--available", is_flag=True, help="Only show types with capacity available.")
+def lambda_instance_types(available: bool) -> None:
+    """List available instance types and their pricing/capacity."""
+    display.show_instance_types(_api_call(lambda_api.list_instance_types), available_only=available)
+
+
+@lambda_group.command(name="launch")
+@click.option("--region", "region_name", required=True, help="Region, e.g. us-tx-1")
+@click.option("--type", "instance_type_name", required=True, help="Instance type, e.g. gpu_1x_a10")
+@click.option("--ssh-key", "ssh_keys", multiple=True, required=True, help="SSH key name (repeatable)")
+@click.option("--filesystem", "filesystems", multiple=True, help="Filesystem to mount (repeatable)")
+@click.option("--name", "name", default=None, help="Instance name")
+def lambda_launch(
+    region_name: str,
+    instance_type_name: str,
+    ssh_keys: tuple[str, ...],
+    filesystems: tuple[str, ...],
+    name: str | None,
+) -> None:
+    """Launch a new instance."""
+    result = _api_call(
+        lambda_api.launch_instance,
+        region_name=region_name,
+        instance_type_name=instance_type_name,
+        ssh_key_names=list(ssh_keys),
+        file_system_names=list(filesystems) or None,
+        name=name,
+    )
+    ids = _extract_instance_ids(result)
+    if ids:
+        display.success("Launched instance(s): " + ", ".join(ids))
+    else:
+        display.success("Launch request accepted.")
+        display.info(json.dumps(result, indent=2))
+
+
+@lambda_group.command(name="restart")
+@click.argument("instance_ids", nargs=-1, required=True)
+def lambda_restart(instance_ids: tuple[str, ...]) -> None:
+    """Restart one or more instances by id."""
+    _api_call(lambda_api.restart_instances, list(instance_ids))
+    display.success("Restart requested for: " + ", ".join(instance_ids))
+
+
+@lambda_group.command(name="terminate")
+@click.argument("instance_ids", nargs=-1, required=True)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def lambda_terminate(instance_ids: tuple[str, ...], yes: bool) -> None:
+    """Terminate one or more instances by id."""
+    if not yes:
+        click.confirm(
+            f"Terminate {len(instance_ids)} instance(s): {', '.join(instance_ids)}?",
+            abort=True,
+        )
+    _api_call(lambda_api.terminate_instances, list(instance_ids))
+    display.success("Termination requested for: " + ", ".join(instance_ids))
+
+
+@lambda_group.command(name="filesystems")
+def lambda_filesystems() -> None:
+    """List filesystems."""
+    display.show_filesystems(_api_call(lambda_api.list_filesystems))
+
+
+@lambda_group.command(name="create-filesystem")
+@click.argument("name")
+@click.option("--region", "region", required=True, help="Region, e.g. us-tx-1")
+def lambda_create_filesystem(name: str, region: str) -> None:
+    """Create a filesystem named NAME in REGION."""
+    fs = _api_call(lambda_api.create_filesystem, name, region)
+    fs_id = fs.get("id") if isinstance(fs, dict) else None
+    display.success(f"Created filesystem '{name}'" + (f" (id: {fs_id})" if fs_id else ""))
+
+
+@lambda_group.command(name="delete-filesystem")
+@click.argument("filesystem_id")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def lambda_delete_filesystem(filesystem_id: str, yes: bool) -> None:
+    """Delete a filesystem by FILESYSTEM_ID."""
+    if not yes:
+        click.confirm(f"Delete filesystem {filesystem_id}?", abort=True)
+    _api_call(lambda_api.delete_filesystem, filesystem_id)
+    display.success(f"Deleted filesystem {filesystem_id}")
+
+
+def _extract_instance_ids(launch_result) -> list[str]:
+    """Pull instance ids out of a launch response (shape varies by API version)."""
+    if isinstance(launch_result, dict):
+        if isinstance(launch_result.get("instance_ids"), list):
+            return [str(i) for i in launch_result["instance_ids"]]
+        if launch_result.get("id"):
+            return [str(launch_result["id"])]
+    elif isinstance(launch_result, list):
+        return [str(i.get("id")) for i in launch_result if isinstance(i, dict) and i.get("id")]
+    return []
