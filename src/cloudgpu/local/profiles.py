@@ -17,6 +17,7 @@ The active profile (so commands don't need ``--profile`` every time) is recorded
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ _DEFAULTS: dict[str, Any] = {
     "region": "",
     "poll_seconds": 20,
     "max_hours": 12,
+    "provision_timeout": 3600,  # seconds; cap on the provision script (big downloads)
 }
 
 
@@ -50,6 +52,18 @@ def profile_path(name: str) -> Path:
 
 def runtime_path(name: str) -> Path:
     return runtime_dir() / f"{name}.json"
+
+
+def provision_dir(name: str) -> Path:
+    """Directory of optional provisioning assets for a profile, run on every ``up``.
+
+    If ``profiles/<name>.provision/`` exists, the whole directory is rsynced to the
+    instance and its ``provision.sh`` entry point is executed from inside it (so the
+    script can reference sibling files like ComfyUI workflows). It should be idempotent
+    (e.g. download a model only if missing) and write persistent data under the
+    filesystem so it survives termination.
+    """
+    return profiles_dir() / f"{name}.provision"
 
 
 def list_profiles() -> list[str]:
@@ -162,8 +176,9 @@ def create_profile(
 
 
 def delete_profile(name: str) -> None:
-    """Remove a profile's TOML, its runtime state, and clear it as active if set."""
+    """Remove a profile's TOML, provisioning dir, runtime state, and clear it as active."""
     profile_path(name).unlink(missing_ok=True)
+    shutil.rmtree(provision_dir(name), ignore_errors=True)
     clear_runtime(name)
     if get_active() == name:
         cfg = config.load_config()

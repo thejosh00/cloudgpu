@@ -37,3 +37,17 @@ def sync_remote(host: str, persistent_dir: str) -> None:
         check=True,
         timeout=60,
     )
+
+
+def copy_dir(local_dir: str, host: str, remote_dir: str) -> None:
+    """Mirror a local directory's contents to ``remote_dir`` on the instance (rsync)."""
+    subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {remote_dir}"],
+        check=True,
+        timeout=15,
+    )
+    subprocess.run(
+        ["rsync", "-az", "--delete", local_dir.rstrip("/") + "/", f"{host}:{remote_dir}/"],
+        check=True,
+        timeout=300,
+    )

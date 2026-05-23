@@ -397,6 +397,43 @@ def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
             sys.exit(1)
 
 
+def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
+    """Run the profile's provisioning (if any) on the instance.
+
+    Convention: ~/.config/cloudgpu/profiles/<name>.provision/ — a directory holding a
+    ``provision.sh`` entry point plus any files it needs (workflows, configs, ...). The
+    whole directory is rsynced to the instance and ``provision.sh`` runs from inside it
+    on every `up`, with the persistent-dir paths + CLOUDGPU_PROVISION_DIR in the
+    environment and cloudgpu/bin on PATH. Output streams live; a non-zero exit fails `up`.
+    """
+    pdir = profiles.provision_dir(profile["name"])
+    if not pdir.is_dir():
+        return
+    if not (pdir / "provision.sh").exists():
+        display.error(f"Provision dir {pdir} is missing its 'provision.sh' entry point.")
+        sys.exit(1)
+
+    display.info(f"Provisioning from {pdir.name}/ ...")
+    bin_dir = f"{persistent_dir}/cloudgpu/bin"
+    remote_dir = f"{persistent_dir}/cloudgpu/provision"
+    sync.copy_dir(str(pdir), host, remote_dir)
+
+    env = (
+        f"CLOUDGPU_PERSISTENT_DIR={persistent_dir} "
+        f"CLOUDGPU_APPS_DIR={persistent_dir}/apps "
+        f"CLOUDGPU_VENVS_DIR={persistent_dir}/venvs "
+        f"CLOUDGPU_BIN_DIR={bin_dir} "
+        f"CLOUDGPU_PROVISION_DIR={remote_dir} "
+        f"PATH={bin_dir}:$PATH"
+    )
+    command = f"cd {remote_dir} && export {env} && chmod +x provision.sh && bash provision.sh"
+    result = ssh.ssh_run(host, command, capture=False, timeout=int(profile.get("provision_timeout", 3600)))
+    if not result.ok:
+        display.error(f"Provision failed (exit code {result.returncode})")
+        sys.exit(1)
+    display.success("Provision complete.")
+
+
 def _report_up(name: str, runtime: dict, persistent_dir: str) -> None:
     """Print final status + how to reach the machine + billing reminder."""
     output = _remote_run(runtime["host"], persistent_dir, "status")
@@ -477,8 +514,9 @@ def up(profile_name: str | None) -> None:
     profiles.save_runtime(name, runtime)
     profiles.set_active(name)
 
-    # Ensure the profile's apps are present, then report.
+    # Ensure the profile's apps are present, run provisioning, then report.
     _ensure_apps(runtime["host"], persistent_dir, profile.get("apps", []))
+    _run_provision(profile, runtime["host"], persistent_dir)
     _report_up(name, runtime, persistent_dir)
 
 

@@ -49,6 +49,46 @@ cloudgpu profile edit          # edit the active profile's TOML in $EDITOR
 every later `up`. Set `filesystem` in the profile to name it yourself or to reuse an
 existing one.
 
+### Provisioning (extra setup, e.g. models + workflows)
+
+For setup beyond installing the app — downloading models, shipping ComfyUI workflows,
+custom nodes, etc. — create a directory `~/.config/cloudgpu/profiles/<name>.provision/`
+with a `provision.sh` entry point plus any files it needs:
+
+```
+~/.config/cloudgpu/profiles/
+└── comfyui.provision/
+    ├── provision.sh          # entry point (required)
+    └── workflows/            # companion files your script uses
+        └── my_workflow.json
+```
+
+On every `up`, cloudgpu rsyncs the whole directory to the instance and runs `provision.sh`
+from inside it (so it can reference its sibling files). Make it **idempotent** (download a
+model only if missing) and write data **under the filesystem** so it persists across
+terminations.
+
+`provision.sh` runs with its directory as CWD and these env vars (plus `cloudgpu/bin` on
+`PATH`): `CLOUDGPU_PROVISION_DIR` (where the files landed), `CLOUDGPU_PERSISTENT_DIR`,
+`CLOUDGPU_APPS_DIR`, `CLOUDGPU_VENVS_DIR`, `CLOUDGPU_BIN_DIR`. Raise the time budget with
+`provision_timeout = 7200` (seconds) in the profile.
+
+Example `provision.sh` — fetch SDXL once and install any bundled workflows:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+comfy="$CLOUDGPU_APPS_DIR/comfyui"
+ckpt="$comfy/models/checkpoints"; mkdir -p "$ckpt"
+[ -s "$ckpt/sd_xl_base_1.0.safetensors" ] || wget -O "$ckpt/sd_xl_base_1.0.safetensors" \
+  https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
+
+# Companion files travel with the script (CLOUDGPU_PROVISION_DIR):
+shopt -s nullglob
+dest="$comfy/user/default/workflows"; mkdir -p "$dest"
+for wf in "$CLOUDGPU_PROVISION_DIR"/workflows/*.json; do cp -f "$wf" "$dest/"; done
+```
+
 Profiles are per-user (not checked in). You can keep several; more than one can run at once,
 as long as each uses its own filesystem (a filesystem backs only one instance at a time).
 A second profile (different filesystem) runs concurrently:
