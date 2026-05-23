@@ -67,3 +67,35 @@ def get_persistent_dir(host: str | None = None) -> str:
     raise ConfigError(
         "Persistent directory not configured. Run 'cloudgpu setup <host>' first."
     )
+
+
+def save_launch_info(
+    filesystem: str,
+    *,
+    instance_type: str | None = None,
+    ssh_key: str | None = None,
+    region: str | None = None,
+) -> None:
+    """Record how to relaunch/recover this deployment.
+
+    Stored under the "launch" key so recovery can recreate the instance without
+    re-discovering everything. ``filesystem`` is the anchor (its region is
+    authoritative via the Lambda API); the rest are convenience caches. Only
+    provided fields are written, so partial updates don't clobber existing values.
+    """
+    config = load_config()
+    launch = config.get("launch", {})
+    launch["filesystem"] = filesystem
+    if instance_type is not None:
+        launch["instance_type"] = instance_type
+    if ssh_key is not None:
+        launch["ssh_key"] = ssh_key
+    if region is not None:
+        launch["region"] = region
+    config["launch"] = launch
+    save_config(config)
+
+
+def get_launch_info() -> dict[str, Any]:
+    """Return saved launch params (filesystem, instance_type, ssh_key, region), or {}."""
+    return load_config().get("launch", {})

@@ -46,6 +46,44 @@ def _resolve_target(host: str | None) -> tuple[str, str]:
     return host, persistent_dir
 
 
+def _record_launch_info(host: str, persistent_dir: str) -> dict:
+    """Save how to recover this deployment, enriching via the Lambda API if possible.
+
+    The filesystem (tail of persistent_dir) is always recorded. region,
+    instance_type, and ssh_key are best-effort: they need LAMBDA_API_KEY and the
+    instance to be findable, so any API failure is swallowed silently.
+    """
+    filesystem = persistent_dir.rstrip("/").split("/")[-1]
+    instance_type = region = ssh_key = None
+    try:
+        ip = host.split("@")[-1]
+        for inst in lambda_api.list_instances():
+            if inst.get("ip") == ip:
+                instance_type = (inst.get("instance_type") or {}).get("name")
+                region = (inst.get("region") or {}).get("name")
+                names = inst.get("ssh_key_names") or []
+                ssh_key = names[0] if names else None
+                break
+        if region is None:  # instance not matched; derive region from the filesystem
+            for fs in lambda_api.list_filesystems():
+                if fs.get("name") == filesystem:
+                    r = fs.get("region") or {}
+                    region = r.get("name") if isinstance(r, dict) else r
+                    break
+    except Exception:
+        pass  # best-effort enrichment: still record the filesystem below
+
+    config.save_launch_info(
+        filesystem, instance_type=instance_type, ssh_key=ssh_key, region=region
+    )
+    return {
+        "filesystem": filesystem,
+        "instance_type": instance_type,
+        "region": region,
+        "ssh_key": ssh_key,
+    }
+
+
 @click.group()
 def cli() -> None:
     """CloudGPU - Install GPU Python apps on Lambda Labs instances."""
@@ -103,6 +141,12 @@ def setup(host: str) -> None:
     config.save_host(host, persistent_dir)
     display.success(f"Config saved. You can now run commands without specifying the host.")
 
+    # 6. Record how to recover this deployment (filesystem + launch params)
+    info = _record_launch_info(host, persistent_dir)
+    detail = info.get("instance_type") or "?"
+    region = info.get("region") or "?"
+    display.info(f"Launch info saved for recovery: {info['filesystem']} ({detail}, {region})")
+
 
 @cli.command()
 @click.argument("host", required=False)
@@ -158,8 +202,9 @@ def recover(host: str | None) -> None:
     )
 
     if result.ok:
-        # Update saved host to new instance
+        # Update saved host (and launch info) to the new instance
         config.save_host(host, persistent_dir)
+        _record_launch_info(host, persistent_dir)
         display.success("Recovery complete!")
     else:
         display.error(f"Recovery failed (exit code {result.returncode})")
