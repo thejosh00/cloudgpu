@@ -1,4 +1,4 @@
-"""Click CLI: setup, install, recover, status, ssh."""
+"""Click CLI: setup, install, recover, status, ssh, forward."""
 
 from __future__ import annotations
 
@@ -248,6 +248,48 @@ def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
         cmd = f"export PATH={bin_dir}:$PATH && " + " ".join(command)
 
     exit_code = ssh.ssh_interactive(host, cmd)
+    sys.exit(exit_code)
+
+
+@cli.command(name="forward")
+@click.option("--host", "-H", default=None, help="SSH host (uses saved host if omitted)")
+@click.option("--port", "-p", default=8188, type=int, help="Remote port to forward (default 8188, ComfyUI)")
+@click.option("--local-port", "local_port", default=None, type=int, help="Local port (defaults to --port)")
+@click.option(
+    "--run", "run_cmd", is_flag=False, flag_value="comfyui",
+    help="Start a command on the instance over the same tunnel (default: comfyui). "
+         "The tunnel lives as long as the command; Ctrl-C stops both. "
+         "Omitting --run holds the tunnel only.",
+)
+def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | None) -> None:
+    """Forward a remote port to localhost over SSH (default: ComfyUI on 8188).
+
+    By default this just holds the tunnel (Ctrl-C to close); start the server
+    separately with `cloudgpu ssh -- comfyui`. With --run, a single command both
+    starts the server and tunnels it.
+
+    Examples:
+        cloudgpu forward                    # hold localhost:8188 -> instance:8188
+        cloudgpu forward --run              # start comfyui AND tunnel it
+        cloudgpu forward --run nvidia-smi   # run something else over the tunnel
+        cloudgpu forward -p 8888            # forward a different port
+        cloudgpu forward --local-port 9000  # serve locally on 9000
+    """
+    host, persistent_dir = _resolve_target(host)
+    local_port = local_port or port
+    spec = f"{local_port}:localhost:{port}"
+
+    display.info(f"Forwarding http://localhost:{local_port} -> {host} port {port}")
+    if run_cmd:
+        # Run the command over the forwarded connection: PATH includes the
+        # generated launch scripts (comfyui, etc.). Tunnel == command lifetime.
+        bin_dir = f"{persistent_dir}/cloudgpu/bin"
+        command = f"export PATH={bin_dir}:$PATH && {run_cmd}"
+        display.info(f"Starting '{run_cmd}' on the instance (Ctrl-C stops it and closes the tunnel)...")
+        exit_code = ssh.ssh_interactive(host, command, ssh_args=["-L", spec])
+    else:
+        display.info("Holding the tunnel; press Ctrl-C to close it.")
+        exit_code = ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"])
     sys.exit(exit_code)
 
 

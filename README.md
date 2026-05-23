@@ -21,7 +21,12 @@ cloudgpu install --app comfyui
 
 # 3. Launch it (SSH in and run the launch script)
 cloudgpu ssh -- comfyui
-# ComfyUI starts on 0.0.0.0:8188
+# ComfyUI starts on 127.0.0.1:8188 (loopback only, on the instance)
+
+# 3b. Reach the UI from your machine over an SSH tunnel
+cloudgpu forward --port 8188
+# then open http://localhost:8188
+# (or skip step 3 and run `cloudgpu forward --run comfyui` to start ComfyUI AND tunnel it)
 
 # 4. Instance terminated? Start a new one with the same storage, then:
 cloudgpu recover <new-ip>
@@ -41,6 +46,7 @@ After `setup`, the host is saved locally so subsequent commands can omit it.
 | `cloudgpu recover [host]` | Restore everything on a new instance |
 | `cloudgpu status [host]` | Show installed apps and their health |
 | `cloudgpu ssh [-H host] [-- command]` | SSH wrapper with launch scripts on PATH |
+| `cloudgpu forward [-H host] [-p port] [--local-port n] [--run [cmd]]` | Tunnel a remote port (default 8188/ComfyUI) to localhost; `--run` also starts the app over the same connection |
 | `cloudgpu lambda ...` | Manage Lambda Cloud resources via the API (see below) |
 
 ## Lambda Cloud API

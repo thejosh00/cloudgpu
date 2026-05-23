@@ -80,9 +80,20 @@ def ssh_test(host: str) -> bool:
         return False
 
 
-def ssh_interactive(host: str, command: str | None = None) -> int:
-    """Open an interactive SSH session, optionally running a command."""
-    cmd = ["ssh", *SSH_OPTIONS, host]
+def ssh_interactive(
+    host: str,
+    command: str | None = None,
+    *,
+    ssh_args: list[str] | None = None,
+) -> int:
+    """Open an interactive SSH session, optionally running a command.
+
+    Args:
+        host: SSH host (user@ip or hostname from ssh config).
+        command: Shell command to run; if omitted, opens a login shell.
+        ssh_args: Extra ssh flags inserted before the host (e.g. ["-L", spec]).
+    """
+    cmd = ["ssh", *SSH_OPTIONS, *(ssh_args or []), host]
     if command:
         cmd.append(command)
     result = subprocess.run(cmd)

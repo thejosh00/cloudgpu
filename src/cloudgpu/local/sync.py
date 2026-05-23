@@ -14,7 +14,7 @@ def get_remote_dir() -> Path:
 def sync_remote(host: str, persistent_dir: str) -> None:
     """Rsync the remote scripts to the instance's persistent directory.
 
-    Copies src/cloudgpu/remote/ -> <persistent>/cloudgpu/remote/
+    Copies src/cloudgpu/remote/ -> <persistent>//cloudgpu/remote/
     """
     local_dir = str(get_remote_dir()) + "/"
     remote_path = f"{persistent_dir}/cloudgpu/remote/"
