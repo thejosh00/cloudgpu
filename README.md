@@ -49,45 +49,52 @@ cloudgpu profile edit          # edit the active profile's TOML in $EDITOR
 every later `up`. Set `filesystem` in the profile to name it yourself or to reuse an
 existing one.
 
-### Provisioning (extra setup, e.g. models + workflows)
+### Provisioning (extra setup, e.g. model downloads)
 
-For setup beyond installing the app — downloading models, shipping ComfyUI workflows,
-custom nodes, etc. — create a directory `~/.config/cloudgpu/profiles/<name>.provision/`
-with a `provision.sh` entry point plus any files it needs:
+For setup beyond installing the app — downloading models, installing custom nodes, etc. —
+create a directory `~/.config/cloudgpu/profiles/<name>.provision/` with an entry point
+(`provision.py` preferred, or `provision.sh`) plus any files it needs. For ComfyUI, copy
+`scripts/comfylib.py` from this repo in alongside it:
 
 ```
 ~/.config/cloudgpu/profiles/
 └── comfyui.provision/
-    ├── provision.sh          # entry point (required)
-    └── workflows/            # companion files your script uses
-        └── my_workflow.json
+    ├── provision.py         # entry point (provision.py preferred, else provision.sh)
+    └── comfylib.py          # copied from scripts/comfylib.py — reusable helpers
 ```
 
-On every `up`, cloudgpu rsyncs the whole directory to the instance and runs `provision.sh`
-from inside it (so it can reference its sibling files). Make it **idempotent** (download a
-model only if missing) and write data **under the filesystem** so it persists across
-terminations.
+On every `up`, cloudgpu rsyncs the whole directory to the instance and runs the entry
+point from inside it (so it can `import comfylib` and reference sibling files). Make it
+**idempotent** (download a model only if missing — `comfylib` does this for you) and write
+data **under the filesystem** so it persists across terminations.
 
-`provision.sh` runs with its directory as CWD and these env vars (plus `cloudgpu/bin` on
+The entry point runs with its directory as CWD and these env vars (plus `cloudgpu/bin` on
 `PATH`): `CLOUDGPU_PROVISION_DIR` (where the files landed), `CLOUDGPU_PERSISTENT_DIR`,
 `CLOUDGPU_APPS_DIR`, `CLOUDGPU_VENVS_DIR`, `CLOUDGPU_BIN_DIR`. Raise the time budget with
 `provision_timeout = 7200` (seconds) in the profile.
 
-Example `provision.sh` — fetch SDXL once and install any bundled workflows:
+Example `provision.py` using `comfylib` — fetch SDXL and (optionally) a Civitai model:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-comfy="$CLOUDGPU_APPS_DIR/comfyui"
-ckpt="$comfy/models/checkpoints"; mkdir -p "$ckpt"
-[ -s "$ckpt/sd_xl_base_1.0.safetensors" ] || wget -O "$ckpt/sd_xl_base_1.0.safetensors" \
-  https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
+```python
+import comfylib as cl
 
-# Companion files travel with the script (CLOUDGPU_PROVISION_DIR):
-shopt -s nullglob
-dest="$comfy/user/default/workflows"; mkdir -p "$dest"
-for wf in "$CLOUDGPU_PROVISION_DIR"/workflows/*.json; do cp -f "$wf" "$dest/"; done
+# HuggingFace (public): SDXL base + fp16 VAE
+cl.huggingface("stabilityai/stable-diffusion-xl-base-1.0",
+               "sd_xl_base_1.0.safetensors", cl.checkpoints() / "sd_xl_base_1.0.safetensors")
+cl.huggingface("madebyollin/sdxl-vae-fp16-fix",
+               "sdxl_vae.safetensors", cl.vae() / "sdxl_vae.safetensors")
+
+# Civitai (needs CIVITAI_TOKEN in secrets.env): version id from the model's download URL
+# cl.civitai(128713, cl.checkpoints() / "dreamshaper_xl.safetensors")
+
+# Custom nodes (optional):
+# cl.custom_node("https://github.com/ltdrdata/ComfyUI-Impact-Pack")
 ```
+
+`comfylib` downloads idempotently/resumably, resolves ComfyUI's model dirs
+(`checkpoints()`, `vae()`, `loras()`, ...), and passes auth tokens to `curl` via stdin so
+they never hit the process list. (A plain `provision.sh` still works for non-ComfyUI or
+shell-only setups.)
 
 #### Secrets (API tokens, e.g. Civitai)
 

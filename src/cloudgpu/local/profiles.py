@@ -68,10 +68,10 @@ def provision_dir(name: str) -> Path:
     """Directory of optional provisioning assets for a profile, run on every ``up``.
 
     If ``profiles/<name>.provision/`` exists, the whole directory is rsynced to the
-    instance and its ``provision.sh`` entry point is executed from inside it (so the
-    script can reference sibling files like ComfyUI workflows). It should be idempotent
-    (e.g. download a model only if missing) and write persistent data under the
-    filesystem so it survives termination.
+    instance and its entry point (``provision.py`` preferred, else ``provision.sh``) is
+    executed from inside it (so it can reference sibling files like ``comfylib.py``). It
+    should be idempotent (e.g. download a model only if missing) and write persistent data
+    under the filesystem so it survives termination.
     """
     return profiles_dir() / f"{name}.provision"
 

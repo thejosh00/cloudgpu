@@ -53,6 +53,22 @@ def test_runs_dir_with_env_and_streams(tmp_config_dir, monkeypatch):
     assert "bash provision.sh" in captured["command"]
 
 
+def test_python_entrypoint_preferred(tmp_config_dir, monkeypatch):
+    profile = _make_profile()
+    d = profiles.provision_dir("p")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "provision.py").write_text("print('hi')\n")
+    (d / "provision.sh").write_text("echo hi\n")  # both present -> .py wins
+
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    assert "python3 provision.py" in captured["command"]
+    assert "bash provision.sh" not in captured["command"]
+
+
 def test_dir_without_entrypoint_errors(tmp_config_dir, monkeypatch):
     profile = _make_profile()
     profiles.provision_dir("p").mkdir(parents=True, exist_ok=True)  # no provision.sh inside

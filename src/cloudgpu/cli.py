@@ -400,17 +400,23 @@ def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
 def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
     """Run the profile's provisioning (if any) on the instance.
 
-    Convention: ~/.config/cloudgpu/profiles/<name>.provision/ — a directory holding a
-    ``provision.sh`` entry point plus any files it needs (workflows, configs, ...). The
-    whole directory is rsynced to the instance and ``provision.sh`` runs from inside it
-    on every `up`, with the persistent-dir paths + CLOUDGPU_PROVISION_DIR in the
-    environment and cloudgpu/bin on PATH. Output streams live; a non-zero exit fails `up`.
+    Convention: ~/.config/cloudgpu/profiles/<name>.provision/ — a directory holding an
+    entry point (provision.py preferred, else provision.sh) plus any files it needs
+    (e.g. comfylib.py, configs). The whole directory is rsynced to the instance and the
+    entry point runs from inside it on every `up`, with the persistent-dir paths +
+    CLOUDGPU_PROVISION_DIR in the environment and cloudgpu/bin on PATH. Output streams
+    live; a non-zero exit fails `up`.
     """
     pdir = profiles.provision_dir(profile["name"])
     if not pdir.is_dir():
         return
-    if not (pdir / "provision.sh").exists():
-        display.error(f"Provision dir {pdir} is missing its 'provision.sh' entry point.")
+    # Entry point: prefer provision.py (run with python3), else provision.sh.
+    if (pdir / "provision.py").exists():
+        entry = "python3 provision.py"
+    elif (pdir / "provision.sh").exists():
+        entry = "chmod +x provision.sh && bash provision.sh"
+    else:
+        display.error(f"Provision dir {pdir} needs a 'provision.py' or 'provision.sh' entry point.")
         sys.exit(1)
 
     display.info(f"Provisioning from {pdir.name}/ ...")
@@ -439,10 +445,7 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
         f"CLOUDGPU_PROVISION_DIR={remote_dir} "
         f"PATH={bin_dir}:$PATH"
     )
-    command = (
-        f"{secrets_prefix}cd {remote_dir} && export {env} "
-        f"&& chmod +x provision.sh && bash provision.sh"
-    )
+    command = f"{secrets_prefix}cd {remote_dir} && export {env} && {entry}"
     result = ssh.ssh_run(host, command, capture=False, timeout=int(profile.get("provision_timeout", 3600)))
     if not result.ok:
         display.error(f"Provision failed (exit code {result.returncode})")
