@@ -56,7 +56,7 @@ class ComfyUIInstaller(AppInstaller):
         log("Checking PyTorch CUDA availability...")
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA not available via system packages, installing...", "warn")
-            pip_install_torch(self.venv_dir, timeout=300)
+            pip_install_torch(self.venv_dir, timeout=600)
             if not check_torch_cuda(self.venv_dir):
                 log("PyTorch CUDA still not working after install!", "error")
                 raise RuntimeError("Failed to get PyTorch with CUDA support")
@@ -67,13 +67,13 @@ class ComfyUIInstaller(AppInstaller):
         # the venv torch version.
         log("Installing matching torchvision and torchaudio in venv...")
         pip_install(self.venv_dir, "--no-deps",
-                    "torchvision", "torchaudio", timeout=300)
+                    "torchvision", "torchaudio", timeout=600)
 
         # 4. Install requirements
         log("Installing ComfyUI requirements...")
         requirements = os.path.join(self.app_dir, "requirements.txt")
         if os.path.exists(requirements):
-            pip_install(self.venv_dir, "-r", requirements, timeout=300)
+            pip_install(self.venv_dir, "-r", requirements, timeout=600)
 
         # 5. Clone ComfyUI-Manager
         custom_nodes = os.path.join(self.app_dir, "custom_nodes")
@@ -133,7 +133,7 @@ class ComfyUIInstaller(AppInstaller):
             run(["python3", "-m", "venv", self.venv_dir])
             requirements = os.path.join(self.app_dir, "requirements.txt")
             if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=300)
+                pip_install(self.venv_dir, "-r", requirements, timeout=120)
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
         if not check_torch_cuda(self.venv_dir):
@@ -143,7 +143,7 @@ class ComfyUIInstaller(AppInstaller):
             run(["python3", "-m", "venv", self.venv_dir])
             requirements = os.path.join(self.app_dir, "requirements.txt")
             if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=300)
+                pip_install(self.venv_dir, "-r", requirements, timeout=600)
 
         # Regenerate launch script (points to transient paths need refreshing)
         self._create_launch_script()

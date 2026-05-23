@@ -1,14 +1,15 @@
-"""Click CLI: setup, install, recover, status, ssh, forward."""
+"""Click CLI: profile, up, down, setup, install, recover, status, ssh, forward."""
 
 from __future__ import annotations
 
 import json
 import sys
+import time
 
 import click
 from rich.console import Console
 
-from cloudgpu.local import config, display, lambda_api, ssh, sync
+from cloudgpu.local import config, display, lambda_api, orchestration, profiles, ssh, sync
 
 console = Console()
 
@@ -36,8 +37,23 @@ def _remote_run(host: str, persistent_dir: str, command: str, extra_args: list[s
     return result.stdout
 
 
-def _resolve_target(host: str | None) -> tuple[str, str]:
-    """Resolve the host and persistent dir, surfacing config errors to the user."""
+def _resolve_target(host: str | None = None, profile: str | None = None) -> tuple[str, str]:
+    """Resolve the (host, persistent_dir) to operate on.
+
+    Precedence:
+      1. An explicit ``host`` argument/flag (persistent_dir from config.json).
+      2. A profile (``--profile`` or the active profile) with saved runtime state.
+      3. The global single-host config saved by ``cloudgpu setup``.
+    """
+    if not host:
+        name = profile or profiles.get_active()
+        if name:
+            runtime = profiles.load_runtime(name)
+            if runtime.get("host") and runtime.get("persistent_dir"):
+                return runtime["host"], runtime["persistent_dir"]
+            raise click.UsageError(
+                f"Profile '{name}' has no running instance yet. Run 'cloudgpu up' first."
+            )
     try:
         host = config.get_host(host)
         persistent_dir = config.get_persistent_dir()
@@ -90,10 +106,12 @@ def cli() -> None:
     pass
 
 
-@cli.command()
-@click.argument("host")
-def setup(host: str) -> None:
-    """Test SSH, detect persistent dir, sync tool, save config."""
+def _setup_host(host: str) -> tuple[str, dict]:
+    """SSH-test, detect the persistent dir, sync the remote tool, run full detection.
+
+    Returns (persistent_dir, detection). Exits the process with a clear message on
+    SSH failure or a missing persistent directory. Shared by `setup` and `up`.
+    """
     # 1. Test SSH
     with console.status("Testing SSH connection..."):
         if not ssh.ssh_test(host):
@@ -102,9 +120,8 @@ def setup(host: str) -> None:
             sys.exit(1)
     display.success(f"SSH connection to {host} OK")
 
-    # 2. Sync remote scripts (need to detect persistent dir first)
+    # 2. Detect persistent dir (standalone one-liner, before the tool is synced)
     with console.status("Detecting instance environment..."):
-        # Run detect directly before syncing (it's a standalone script)
         detect_cmd = "python3 -c \"" + (
             "import os, subprocess, json; "
             "nfs='/lambda/nfs'; "
@@ -122,7 +139,6 @@ def setup(host: str) -> None:
         display.error("No persistent directory found at /lambda/nfs/")
         display.info("Make sure a filesystem is attached to this instance.")
         sys.exit(1)
-
     display.success(f"Persistent directory: {persistent_dir}")
 
     # 3. Sync remote tool
@@ -134,14 +150,22 @@ def setup(host: str) -> None:
     with console.status("Running full detection..."):
         output = _remote_run(host, persistent_dir, "detect")
         detection = json.loads(output)
-
     display.show_detection(detection)
 
-    # 5. Save config
-    config.save_host(host, persistent_dir)
-    display.success(f"Config saved. You can now run commands without specifying the host.")
+    return persistent_dir, detection
 
-    # 6. Record how to recover this deployment (filesystem + launch params)
+
+@cli.command()
+@click.argument("host")
+def setup(host: str) -> None:
+    """Test SSH, detect persistent dir, sync tool, save config."""
+    persistent_dir, _ = _setup_host(host)
+
+    # Save config
+    config.save_host(host, persistent_dir)
+    display.success("Config saved. You can now run commands without specifying the host.")
+
+    # Record how to recover this deployment (filesystem + launch params)
     info = _record_launch_info(host, persistent_dir)
     detail = info.get("instance_type") or "?"
     region = info.get("region") or "?"
@@ -151,9 +175,10 @@ def setup(host: str) -> None:
 @cli.command()
 @click.argument("host", required=False)
 @click.option("--app", type=click.Choice(AVAILABLE_APPS), help="App to install")
-def install(host: str | None, app: str | None) -> None:
+@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+def install(host: str | None, app: str | None, profile: str | None) -> None:
     """Install a GPU app on the instance."""
-    host, persistent_dir = _resolve_target(host)
+    host, persistent_dir = _resolve_target(host, profile)
 
     # If no app specified, prompt interactively
     if not app:
@@ -184,9 +209,10 @@ def install(host: str | None, app: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-def recover(host: str | None) -> None:
+@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+def recover(host: str | None, profile: str | None) -> None:
     """Restore everything on a new instance from persistent storage."""
-    host, persistent_dir = _resolve_target(host)
+    host, persistent_dir = _resolve_target(host, profile)
 
     # Sync remote tool
     with console.status("Syncing remote tool..."):
@@ -213,9 +239,10 @@ def recover(host: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-def status(host: str | None) -> None:
+@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+def status(host: str | None, profile: str | None) -> None:
     """Show what's installed and their health."""
-    host, persistent_dir = _resolve_target(host)
+    host, persistent_dir = _resolve_target(host, profile)
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
@@ -230,8 +257,9 @@ def status(host: str | None) -> None:
 
 @cli.command(name="ssh", context_settings={"ignore_unknown_options": True})
 @click.option("--host", "-H", default=None, help="SSH host (uses saved host if omitted)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
-def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
+def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> None:
     """Open SSH to instance, optionally running a command.
 
     Examples:
@@ -239,7 +267,7 @@ def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
         cloudgpu ssh -- comfyui
         cloudgpu ssh -H my-host -- nvidia-smi
     """
-    host, persistent_dir = _resolve_target(host)
+    host, persistent_dir = _resolve_target(host, profile)
 
     cmd = None
     if command:
@@ -261,7 +289,8 @@ def ssh_cmd(host: str | None, command: tuple[str, ...]) -> None:
          "The tunnel lives as long as the command; Ctrl-C stops both. "
          "Omitting --run holds the tunnel only.",
 )
-def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | None) -> None:
+@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | None, profile: str | None) -> None:
     """Forward a remote port to localhost over SSH (default: ComfyUI on 8188).
 
     By default this just holds the tunnel (Ctrl-C to close); start the server
@@ -275,7 +304,7 @@ def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | 
         cloudgpu forward -p 8888            # forward a different port
         cloudgpu forward --local-port 9000  # serve locally on 9000
     """
-    host, persistent_dir = _resolve_target(host)
+    host, persistent_dir = _resolve_target(host, profile)
     local_port = local_port or port
     spec = f"{local_port}:localhost:{port}"
 
@@ -291,6 +320,375 @@ def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | 
         display.info("Holding the tunnel; press Ctrl-C to close it.")
         exit_code = ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"])
     sys.exit(exit_code)
+
+
+# --- profile-driven machine management ------------------------------------
+
+
+def _live_instance(instance_id: str | None) -> dict | None:
+    """Return the instance dict if it's active with an IP, else None."""
+    if not instance_id:
+        return None
+    try:
+        inst = lambda_api.get_instance(instance_id)
+    except lambda_api.LambdaAPIError:
+        return None  # gone / terminated
+    if inst.get("status") == "active" and inst.get("ip"):
+        return inst
+    return None
+
+
+def _instance_mounting(filesystem: str) -> dict | None:
+    """Find a live instance already mounting ``filesystem`` (or None)."""
+    try:
+        for inst in lambda_api.list_instances():
+            names = inst.get("file_system_names") or []
+            if filesystem in names and inst.get("status") in ("active", "booting"):
+                return inst
+    except lambda_api.LambdaAPIError:
+        pass
+    return None
+
+
+def _runtime_from_instance(inst: dict, filesystem: str) -> dict:
+    """Build a runtime dict from a Lambda instance object (used when adopting)."""
+    itype = inst.get("instance_type") or {}
+    region = inst.get("region") or {}
+    ip = inst.get("ip")
+    return {
+        "instance_id": inst.get("id"),
+        "ip": ip,
+        "host": f"ubuntu@{ip}",
+        "filesystem": filesystem,
+        "instance_type": itype.get("name") if isinstance(itype, dict) else None,
+        "region": region.get("name") if isinstance(region, dict) else region,
+        "ssh_key": (inst.get("ssh_key_names") or [None])[0],
+        "price_cents_per_hour": itype.get("price_cents_per_hour") if isinstance(itype, dict) else None,
+    }
+
+
+def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
+    """Converge installed apps to the profile: recover what exists, install what's missing."""
+    if not apps:
+        return
+    output = _remote_run(host, persistent_dir, "status")
+    known = json.loads(output).get("apps", {})
+
+    # Recover restores everything already recorded on the filesystem (no re-download).
+    if known:
+        display.info("Recovering existing apps from persistent storage...")
+        result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "recover"), capture=False, timeout=1200)
+        if not result.ok:
+            display.error(f"Recovery failed (exit code {result.returncode})")
+            sys.exit(1)
+
+    # Install any profile app not yet present in state.json.
+    for app in [a for a in apps if a not in known]:
+        if app not in AVAILABLE_APPS:
+            display.warn(f"Unknown app '{app}' in profile; skipping. Known: {', '.join(AVAILABLE_APPS)}")
+            continue
+        display.info(f"Installing {app}...")
+        result = ssh.ssh_run(
+            host, _remote_cmd(persistent_dir, "install", [f"--app {app}"]),
+            capture=False, timeout=1200,
+        )
+        if not result.ok:
+            display.error(f"Installing {app} failed (exit code {result.returncode})")
+            sys.exit(1)
+
+
+def _report_up(name: str, runtime: dict, persistent_dir: str) -> None:
+    """Print final status + how to reach the machine + billing reminder."""
+    output = _remote_run(runtime["host"], persistent_dir, "status")
+    data = json.loads(output)
+    display.show_detection(data.get("detection", {}))
+    display.show_status(data.get("apps", {}))
+
+    display.success(f"Profile '{name}' is up.")
+    display.info(
+        f"  GPU: {runtime.get('instance_type') or '?'}   Region: {runtime.get('region') or '?'}"
+        f"   IP: {runtime.get('ip') or '?'}   Price: {display.price(runtime.get('price_cents_per_hour'))}"
+    )
+    display.info(f"  Instance: {runtime.get('instance_id') or '?'}   Filesystem: {runtime.get('filesystem')}")
+    display.info("Reach a UI app over SSH, e.g.:  cloudgpu forward --run comfyui  (then open http://localhost:8188)")
+    if runtime.get("instance_id"):
+        display.warn(
+            "Billing per hour while running. Tear down with 'cloudgpu down' (keeps the "
+            "filesystem; 'cloudgpu up' brings it back), or 'cloudgpu down --delete-filesystem' "
+            "to remove the data too."
+        )
+
+
+@cli.command()
+@click.option("--profile", "-P", "profile_name", default=None, help="Profile to bring up (default: active)")
+def up(profile_name: str | None) -> None:
+    """Converge a profile's machine to its desired state (launch/recover + apps).
+
+    Idempotent: reuses a running instance if one exists, otherwise polls for GPU
+    capacity, launches (auto-creating the filesystem if needed), sets up, and ensures
+    the profile's apps are installed. Re-run after a termination to recover.
+    """
+    try:
+        name = profiles.require_profile(profile_name)
+        profile = profiles.load_profile(name)
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+
+    filesystem = profile["filesystem"]
+
+    # Reuse a live instance if we already track one for this profile.
+    runtime = profiles.load_runtime(name)
+    inst = _live_instance(runtime.get("instance_id"))
+    if inst:
+        display.info(f"Reusing running instance {runtime['instance_id']} ({inst.get('ip')}).")
+        runtime["host"] = f"ubuntu@{inst.get('ip')}"
+        runtime["ip"] = inst.get("ip")
+    else:
+        if runtime.get("instance_id"):
+            display.info("Tracked instance is gone; reconciling...")
+            profiles.clear_runtime(name)
+        # Adopt an instance already mounting this filesystem (recovery / migration /
+        # lost runtime state). The filesystem is the profile's identity, so it's ours.
+        existing = _instance_mounting(filesystem)
+        if existing and existing.get("ip"):
+            display.info(
+                f"Adopting running instance {existing.get('id')} ({existing.get('ip')}) "
+                f"already mounting '{filesystem}'."
+            )
+            runtime = _runtime_from_instance(existing, filesystem)
+            profiles.save_runtime(name, runtime)
+        else:
+            try:
+                runtime = orchestration.acquire_instance(profile)
+            except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:
+                display.error(str(e))
+                sys.exit(1)
+            profiles.save_runtime(name, runtime)
+            if runtime.get("created_filesystem"):
+                display.success(f"Created filesystem '{filesystem}' in {runtime['region']}.")
+            display.success(
+                f"Launched {runtime['instance_type']} in {runtime['region']} at {runtime['ip']} "
+                f"({display.price(runtime.get('price_cents_per_hour'))})."
+            )
+
+    # Set up the host (SSH, detect, sync) and persist where it landed.
+    persistent_dir, _ = _setup_host(runtime["host"])
+    runtime["persistent_dir"] = persistent_dir
+    profiles.save_runtime(name, runtime)
+    profiles.set_active(name)
+
+    # Ensure the profile's apps are present, then report.
+    _ensure_apps(runtime["host"], persistent_dir, profile.get("apps", []))
+    _report_up(name, runtime, persistent_dir)
+
+
+def _find_filesystem(name: str) -> dict | None:
+    """Return the account filesystem with this name, or None."""
+    try:
+        for fs in lambda_api.list_filesystems():
+            if fs.get("name") == name:
+                return fs
+    except lambda_api.LambdaAPIError:
+        pass
+    return None
+
+
+def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bool:
+    """Poll until the instance is terminated/gone (so its filesystem frees up)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            inst = lambda_api.get_instance(instance_id)
+        except lambda_api.LambdaAPIError:
+            return True  # gone
+        if inst.get("status") == "terminated":
+            return True
+        time.sleep(poll)
+    return False
+
+
+@cli.command()
+@click.option("--profile", "-P", "profile_name", default=None, help="Profile to tear down (default: active)")
+@click.option("--delete-filesystem", is_flag=True, help="Also delete the persistent filesystem (DESTROYS its data)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def down(profile_name: str | None, delete_filesystem: bool, yes: bool) -> None:
+    """Terminate a profile's instance. Keeps the filesystem unless --delete-filesystem.
+
+    Without --delete-filesystem the data persists, so 'cloudgpu up' brings the machine
+    back later. With it, the instance is terminated and the filesystem (and all its data)
+    is permanently deleted.
+    """
+    try:
+        name = profiles.require_profile(profile_name)
+        profile = profiles.load_profile(name)
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+
+    filesystem = profile["filesystem"]
+    runtime = profiles.load_runtime(name)
+
+    # Find the instance: tracked id, or whatever is mounting the filesystem.
+    instance_id = runtime.get("instance_id")
+    if not instance_id:
+        inst = _instance_mounting(filesystem)
+        instance_id = inst.get("id") if inst else None
+
+    # Confirm (a single, appropriately-scoped prompt).
+    if not yes:
+        if delete_filesystem:
+            click.confirm(
+                f"Terminate profile '{name}' AND permanently delete filesystem "
+                f"'{filesystem}' and all its data?",
+                abort=True,
+            )
+        elif instance_id:
+            click.confirm(
+                f"Terminate instance {instance_id} for profile '{name}'? "
+                f"(filesystem '{filesystem}' is kept)",
+                abort=True,
+            )
+
+    if instance_id:
+        _api_call(lambda_api.terminate_instances, [instance_id])
+        display.success(f"Termination requested for {instance_id}.")
+    else:
+        display.info("No running instance for this profile.")
+    profiles.clear_runtime(name)
+
+    if not delete_filesystem:
+        return
+
+    fs = _find_filesystem(filesystem)
+    if not fs:
+        display.info(f"Filesystem '{filesystem}' not found; nothing to delete.")
+        return
+    # The filesystem can't be deleted while an instance still mounts it.
+    if instance_id:
+        display.info("Waiting for the instance to terminate before deleting the filesystem...")
+        if not _wait_terminated(instance_id):
+            display.error(
+                "Instance did not terminate in time. Re-run 'cloudgpu down --delete-filesystem' "
+                "once it's gone, or delete it with 'cloudgpu lambda delete-filesystem'."
+            )
+            sys.exit(1)
+    for attempt in range(6):
+        try:
+            lambda_api.delete_filesystem(fs.get("id"))
+            display.success(f"Deleted filesystem '{filesystem}'.")
+            return
+        except lambda_api.LambdaAPIError as e:
+            if attempt == 5:
+                display.error(f"Could not delete filesystem '{filesystem}': {e}")
+                sys.exit(1)
+            display.warn(f"Filesystem still busy ({e}); retrying in 10s...")
+            time.sleep(10)
+
+
+def _profile_or_active(name: str | None) -> str:
+    try:
+        return profiles.require_profile(name)
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+
+
+@cli.group(name="profile")
+def profile_group() -> None:
+    """Manage machine profiles (declarative desired state)."""
+
+
+@profile_group.command(name="create")
+@click.argument("name")
+@click.option("--filesystem", default=None, help="Persistent filesystem name (default: the profile name; auto-created on first 'up')")
+@click.option("--gpu", default="gh200,a100", help="GPU preference order, comma-separated (e.g. gh200,a100)")
+@click.option("--apps", default="comfyui", help="Comma-separated apps to keep installed")
+@click.option("--ssh-key", "ssh_key", required=True, help="Lambda SSH key name (a matching private key must be in ~/.ssh)")
+@click.option("--force", is_flag=True, help="Overwrite an existing profile")
+@click.option("--activate/--no-activate", default=True, help="Select this profile as active")
+def profile_create(name, filesystem, gpu, apps, ssh_key, force, activate):
+    """Scaffold a new profile TOML."""
+    gpu_list = [g.strip() for g in gpu.split(",") if g.strip()]
+    apps_list = [a.strip() for a in apps.split(",") if a.strip()]
+    try:
+        path = profiles.create_profile(
+            name, filesystem=filesystem, gpu=gpu_list, apps=apps_list,
+            ssh_key=ssh_key, overwrite=force,
+        )
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+    display.success(f"Created profile '{name}' at {path}")
+    if activate:
+        profiles.set_active(name)
+        display.info(f"Selected '{name}' as the active profile.")
+    display.info("Edit it with 'cloudgpu profile edit', then run 'cloudgpu up'.")
+
+
+@profile_group.command(name="list")
+def profile_list():
+    """List profiles (the active one is marked *)."""
+    rows = []
+    for n in profiles.list_profiles():
+        try:
+            p = profiles.load_profile(n)
+            fs, gpu = p["filesystem"], p["gpu"]
+        except config.ConfigError:
+            fs, gpu = "[invalid]", []
+        rows.append({
+            "name": n,
+            "filesystem": fs,
+            "gpu": gpu,
+            "last_ip": profiles.load_runtime(n).get("ip"),
+        })
+    display.show_profiles(rows, profiles.get_active())
+
+
+@profile_group.command(name="show")
+@click.argument("name", required=False)
+def profile_show(name):
+    """Print a profile's TOML and its runtime state."""
+    name = _profile_or_active(name)
+    try:
+        display.info(profiles.profile_path(name).read_text().rstrip())
+    except OSError as e:
+        raise click.UsageError(str(e)) from e
+    runtime = profiles.load_runtime(name)
+    if runtime:
+        display.info("\n[bold]runtime[/bold]:")
+        display.info(json.dumps(runtime, indent=2))
+
+
+@profile_group.command(name="use")
+@click.argument("name")
+def profile_use(name):
+    """Select NAME as the active profile."""
+    try:
+        profiles.set_active(name)
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+    display.success(f"Active profile: {name}")
+
+
+@profile_group.command(name="edit")
+@click.argument("name", required=False)
+def profile_edit(name):
+    """Open a profile's TOML in $EDITOR."""
+    name = _profile_or_active(name)
+    path = profiles.profile_path(name)
+    if not path.exists():
+        raise click.UsageError(f"No profile named '{name}'.")
+    click.edit(filename=str(path))
+
+
+@profile_group.command(name="delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def profile_delete(name, yes):
+    """Delete a profile and its runtime state (does NOT touch the filesystem/instance)."""
+    if not profiles.profile_path(name).exists():
+        raise click.UsageError(f"No profile named '{name}'.")
+    if not yes:
+        click.confirm(f"Delete profile '{name}' (and its runtime state)?", abort=True)
+    profiles.delete_profile(name)
+    display.success(f"Deleted profile '{name}'.")
 
 
 def _api_call(fn, *args, **kwargs):

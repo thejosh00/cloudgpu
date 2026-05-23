@@ -76,7 +76,8 @@ class TestComfyUIInstaller:
         with open(installer.launch_script) as f:
             content = f.read()
         assert "#!/bin/bash" in content
-        assert "--listen 0.0.0.0" in content
+        # Binds to loopback only; reach it via an SSH tunnel (cloudgpu forward).
+        assert "--listen 127.0.0.1" in content
         assert "--port 8188" in content
         assert os.access(installer.launch_script, os.X_OK)
 

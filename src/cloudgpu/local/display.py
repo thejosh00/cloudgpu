@@ -96,6 +96,38 @@ def _gib(bytes_used: object) -> str:
         return "?"
 
 
+def price(cents_per_hour: int | None) -> str:
+    """Public alias for formatting Lambda's price (cents/hour) as a dollar string."""
+    return _price(cents_per_hour)
+
+
+def show_profiles(rows: list[dict], active: str | None) -> None:
+    """Display profiles. Each row: {name, filesystem, gpu, last_ip}."""
+    if not rows:
+        info("No profiles. Create one with 'cloudgpu profile create ...'.")
+        return
+
+    table = Table(title="Profiles")
+    table.add_column("", style="bold")  # active marker
+    table.add_column("Profile", style="bold")
+    table.add_column("Filesystem")
+    table.add_column("GPU")
+    table.add_column("Last IP")
+
+    for row in rows:
+        name = row.get("name", "?")
+        marker = "[green]*[/green]" if name == active else ""
+        table.add_row(
+            marker,
+            name,
+            row.get("filesystem", "?"),
+            ", ".join(row.get("gpu", [])),
+            row.get("last_ip") or "[dim]-[/dim]",
+        )
+
+    console.print(table)
+
+
 def show_filesystems(filesystems: list[dict]) -> None:
     """Display filesystems in a table."""
     if not filesystems:

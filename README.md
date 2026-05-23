@@ -1,6 +1,6 @@
-# CloudGPU Install
+# CloudGPU
 
-CLI tool to install Python apps on Lambda Labs cloud instances. Apps are installed on persistent storage and can be restored to a new instance with one command.
+Declaratively manage GPU machines on Lambda Cloud. Describe the machine you want in a profile — GPU preference order, a persistent filesystem, and the apps to run — and `cloudgpu up` finds capacity, launches it, sets it up, and installs (or recovers) your apps. Because apps and data live on the persistent filesystem, a terminated instance is routine: re-run `cloudgpu up` and everything comes back on a fresh GPU.
 
 ## Install
 
@@ -10,7 +10,68 @@ uv tool install -e .
 
 This makes `cloudgpu` available globally. Requires Python 3.10+ locally. No dependencies needed on the instance (remote scripts use stdlib only).
 
-## Quick Start
+## Quick Start (profiles)
+
+A **profile** describes the machine you want — which GPU (in preference order), which
+filesystem holds its data, and which apps to keep installed. `cloudgpu up` then makes it so:
+it finds capacity and launches the right GPU, sets the instance up, and installs/recovers
+your apps. Run it again any time the instance has been terminated to bring everything back.
+
+```bash
+# 0. Export your Lambda Cloud API key (create one at https://cloud.lambda.ai/api-keys)
+export LAMBDA_API_KEY=secret_...
+
+# 1. Describe the machine you want (saved under ~/.config/cloudgpu/profiles/, per-user)
+cloudgpu profile create comfyui --ssh-key my-key --gpu gh200,a100 --apps comfyui
+
+# 2. Bring it up: poll for a GH200 (fallback A100), create a filesystem if needed,
+#    launch, set up, install/recover comfyui.
+#    Idempotent — re-run after a termination to recover onto a fresh instance.
+cloudgpu up
+
+# 3. Reach the UI: start ComfyUI and tunnel it in one command
+cloudgpu forward --run comfyui
+# then open http://localhost:8188
+
+# 4. Done for now? Terminate the instance (data is kept on the filesystem):
+cloudgpu down
+#    ...or tear down everything including the filesystem and its data:
+cloudgpu down --delete-filesystem
+
+# Manage profiles
+cloudgpu profile list          # the active one is marked *
+cloudgpu profile use <name>    # switch the active profile (commands default to it)
+cloudgpu profile edit          # edit the active profile's TOML in $EDITOR
+```
+
+`cloudgpu` manages the persistent filesystem for you: on the first `up` it creates one
+(named after the profile, in whichever region first has GPU capacity) and reuses it on
+every later `up`. Set `filesystem` in the profile to name it yourself or to reuse an
+existing one.
+
+Profiles are per-user (not checked in). You can keep several; more than one can run at once,
+as long as each uses its own filesystem (a filesystem backs only one instance at a time).
+A second profile (different filesystem) runs concurrently:
+
+```bash
+cloudgpu profile create sd --ssh-key my-key --gpu a10 --apps comfyui   # filesystem "sd"
+cloudgpu up --profile sd
+```
+
+An example `~/.config/cloudgpu/profiles/washington.toml`:
+
+```toml
+gpu = ["gh200", "a100"]       # GPU preference order (alias or full type name)
+apps = ["comfyui"]            # apps to keep installed
+ssh_key = "my-key"            # required: Lambda SSH key name (matching key in ~/.ssh)
+# filesystem = "comfyui"      # optional; defaults to the profile name, auto-created on first up
+poll_seconds = 20             # capacity poll interval
+max_hours = 12                # give up after this long
+```
+
+## Manual workflow (low-level)
+
+The individual steps `up` orchestrates are also available on their own:
 
 ```bash
 # 1. Set up a new instance (tests SSH, detects persistent storage, syncs tool)
@@ -39,14 +100,22 @@ After `setup`, the host is saved locally so subsequent commands can omit it.
 
 ## Commands
 
+Commands that target an instance (`install`, `recover`, `status`, `ssh`, `forward`) default
+to the active profile's running instance; pass `-P/--profile <name>` to target another, or an
+explicit host to bypass profiles entirely.
+
 | Command | Description |
 |---|---|
+| `cloudgpu up [-P profile]` | Converge a profile's machine to its desired state: find the GPU, create the filesystem if needed, launch, set up, install/recover apps. Idempotent — re-run to recover after a termination |
+| `cloudgpu down [-P profile] [--delete-filesystem] [-y]` | Terminate the profile's instance (data kept); `--delete-filesystem` also deletes the filesystem and its data |
+| `cloudgpu profile create <name> --ssh-key <key> [--filesystem <fs>] [--gpu gh200,a100] [--apps comfyui]` | Scaffold a profile and select it (filesystem defaults to the profile name) |
+| `cloudgpu profile list / show / use / edit / delete` | Manage profiles and the active selection |
 | `cloudgpu setup <host>` | Test SSH, detect persistent dir, sync tool, save config |
-| `cloudgpu install [host] [--app comfyui]` | Install an app (interactive selection if no `--app`) |
-| `cloudgpu recover [host]` | Restore everything on a new instance |
-| `cloudgpu status [host]` | Show installed apps and their health |
-| `cloudgpu ssh [-H host] [-- command]` | SSH wrapper with launch scripts on PATH |
-| `cloudgpu forward [-H host] [-p port] [--local-port n] [--run [cmd]]` | Tunnel a remote port (default 8188/ComfyUI) to localhost; `--run` also starts the app over the same connection |
+| `cloudgpu install [host] [-P profile] [--app comfyui]` | Install an app (interactive selection if no `--app`) |
+| `cloudgpu recover [host] [-P profile]` | Restore everything on a new instance |
+| `cloudgpu status [host] [-P profile]` | Show installed apps and their health |
+| `cloudgpu ssh [-H host] [-P profile] [-- command]` | SSH wrapper with launch scripts on PATH |
+| `cloudgpu forward [-H host] [-P profile] [-p port] [--local-port n] [--run [cmd]]` | Tunnel a remote port (default 8188/ComfyUI) to localhost; `--run` also starts the app over the same connection |
 | `cloudgpu lambda ...` | Manage Lambda Cloud resources via the API (see below) |
 
 ## Lambda Cloud API
@@ -78,12 +147,11 @@ cloudgpu setup ubuntu@<instance-ip>
 
 ## How It Works
 
-1. Local CLI (your Mac) connects via SSH using your existing keys/config
+1. Local CLI connects via SSH using your existing keys/config
 2. `rsync` copies lightweight remote scripts to persistent storage
 3. SSH runs `python3` on those scripts to install/recover/check status
-4. Venvs use `--system-site-packages` to inherit Lambda's pre-installed PyTorch + CUDA (avoids re-downloading ~2GB)
-5. `state.json` on persistent storage tracks what's installed
-6. Recovery verifies files, checks PyTorch/CUDA compat, regenerates launch scripts
+4. `state.json` on persistent storage tracks what's installed
+5. Recovery verifies files, checks PyTorch/CUDA compat, regenerates launch scripts
 
 ## Persistent Storage Layout
 
@@ -118,6 +186,5 @@ uv pip install -e ".[dev]"
 - **SSH via subprocess** (not paramiko) - uses your existing SSH config/keys, zero extra deps
 - **rsync for sync** - efficient delta transfers, available on both Mac and Ubuntu
 - **Remote scripts are stdlib-only** - no pip install needed on the instance
-- **`--system-site-packages` venvs** - guaranteed CUDA compatibility with Lambda's PyTorch
 - **State in JSON** - simple, human-readable, easy to debug
 - **Lambda API via stdlib `urllib`** - no `requests`/`httpx` dependency; key read from `LAMBDA_API_KEY`

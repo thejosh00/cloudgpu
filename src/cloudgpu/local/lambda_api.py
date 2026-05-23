@@ -113,6 +113,16 @@ def list_instances() -> list[dict]:
     return _request("GET", "/instances")
 
 
+def get_instance(instance_id: str) -> dict:
+    """Get a single instance by id (status, ip, instance_type, region, ...)."""
+    return _request("GET", f"/instances/{instance_id}")
+
+
+def list_ssh_keys() -> list[dict]:
+    """List the account's SSH keys (name + public_key)."""
+    return _request("GET", "/ssh-keys")
+
+
 def list_instance_types() -> dict:
     """List available instance types, keyed by instance type name."""
     return _request("GET", "/instance-types")
