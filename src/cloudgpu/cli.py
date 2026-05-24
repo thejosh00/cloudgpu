@@ -1,10 +1,11 @@
-"""Click CLI: profile, up, down, setup, install, recover, status, ssh, forward."""
+"""Click CLI: init, up, down, setup, install, recover, status, ssh, forward."""
 
 from __future__ import annotations
 
 import json
 import sys
 import time
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -37,22 +38,30 @@ def _remote_run(host: str, persistent_dir: str, command: str, extra_args: list[s
     return result.stdout
 
 
-def _resolve_target(host: str | None = None, profile: str | None = None) -> tuple[str, str]:
+def _resolve_target(host: str | None = None, profile_dir: str | None = None) -> tuple[str, str]:
     """Resolve the (host, persistent_dir) to operate on.
 
     Precedence:
       1. An explicit ``host`` argument/flag (persistent_dir from config.json).
-      2. A profile (``--profile`` or the active profile) with saved runtime state.
+      2. A profile directory (``--profile``, else the current dir if it has a
+         cloudgpu.toml) — uses its cloudgpu.state.json.
       3. The global single-host config saved by ``cloudgpu setup``.
     """
     if not host:
-        name = profile or profiles.get_active()
-        if name:
-            runtime = profiles.load_runtime(name)
-            if runtime.get("host") and runtime.get("persistent_dir"):
-                return runtime["host"], runtime["persistent_dir"]
+        d = None
+        if profile_dir:
+            try:
+                d = profiles.find_profile_dir(profile_dir)
+            except config.ConfigError as e:
+                raise click.UsageError(str(e)) from e
+        elif profiles.has_profile(Path.cwd()):
+            d = Path.cwd()
+        if d is not None:
+            state = profiles.load_state(d)
+            if state.get("host") and state.get("persistent_dir"):
+                return state["host"], state["persistent_dir"]
             raise click.UsageError(
-                f"Profile '{name}' has no running instance yet. Run 'cloudgpu up' first."
+                f"Profile at '{d}' has no running instance yet. Run 'cloudgpu up' first."
             )
     try:
         host = config.get_host(host)
@@ -175,7 +184,7 @@ def setup(host: str) -> None:
 @cli.command()
 @click.argument("host", required=False)
 @click.option("--app", type=click.Choice(AVAILABLE_APPS), help="App to install")
-@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
 def install(host: str | None, app: str | None, profile: str | None) -> None:
     """Install a GPU app on the instance."""
     host, persistent_dir = _resolve_target(host, profile)
@@ -209,7 +218,7 @@ def install(host: str | None, app: str | None, profile: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
 def recover(host: str | None, profile: str | None) -> None:
     """Restore everything on a new instance from persistent storage."""
     host, persistent_dir = _resolve_target(host, profile)
@@ -239,7 +248,7 @@ def recover(host: str | None, profile: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
 def status(host: str | None, profile: str | None) -> None:
     """Show what's installed and their health."""
     host, persistent_dir = _resolve_target(host, profile)
@@ -257,7 +266,7 @@ def status(host: str | None, profile: str | None) -> None:
 
 @cli.command(name="ssh", context_settings={"ignore_unknown_options": True})
 @click.option("--host", "-H", default=None, help="SSH host (uses saved host if omitted)")
-@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> None:
     """Open SSH to instance, optionally running a command.
@@ -289,7 +298,7 @@ def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> 
          "The tunnel lives as long as the command; Ctrl-C stops both. "
          "Omitting --run holds the tunnel only.",
 )
-@click.option("--profile", "-P", "profile", default=None, help="Profile to target (default: active)")
+@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
 def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | None, profile: str | None) -> None:
     """Forward a remote port to localhost over SSH (default: ComfyUI on 8188).
 
@@ -400,29 +409,24 @@ def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
 def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
     """Run the profile's provisioning (if any) on the instance.
 
-    Convention: ~/.config/cloudgpu/profiles/<name>.provision/ — a directory holding an
-    entry point (provision.py preferred, else provision.sh) plus any files it needs
-    (e.g. comfylib.py, configs). The whole directory is rsynced to the instance and the
-    entry point runs from inside it on every `up`, with the persistent-dir paths +
+    The profile folder itself is the payload: it's rsynced to the instance (excluding
+    tool state / secrets / VCS) and its entry point (``provision.py`` preferred, else
+    ``provision.sh``) runs from inside it on every `up`, with the persistent-dir paths +
     CLOUDGPU_PROVISION_DIR in the environment and cloudgpu/bin on PATH. Output streams
-    live; a non-zero exit fails `up`.
+    live; a non-zero exit fails `up`. A profile with no entry point skips provisioning.
     """
-    pdir = profiles.provision_dir(profile["name"])
-    if not pdir.is_dir():
-        return
-    # Entry point: prefer provision.py (run with python3), else provision.sh.
+    pdir = profile["dir"]
     if (pdir / "provision.py").exists():
         entry = "python3 provision.py"
     elif (pdir / "provision.sh").exists():
         entry = "chmod +x provision.sh && bash provision.sh"
     else:
-        display.error(f"Provision dir {pdir} needs a 'provision.py' or 'provision.sh' entry point.")
-        sys.exit(1)
+        return  # no provisioning in this profile
 
-    display.info(f"Provisioning from {pdir.name}/ ...")
+    display.info("Provisioning...")
     bin_dir = f"{persistent_dir}/cloudgpu/bin"
     remote_dir = f"{persistent_dir}/cloudgpu/provision"
-    sync.copy_dir(str(pdir), host, remote_dir)
+    sync.copy_dir(str(pdir), host, remote_dir, exclude=profiles.PROVISION_EXCLUDES)
 
     # Secrets (e.g. CIVITAI_TOKEN): transfer the file as content (never on the command
     # line), source it into the environment on the instance, and remove it afterward.
@@ -476,67 +480,68 @@ def _report_up(name: str, runtime: dict, persistent_dir: str) -> None:
 
 
 @cli.command()
-@click.option("--profile", "-P", "profile_name", default=None, help="Profile to bring up (default: active)")
-def up(profile_name: str | None) -> None:
+@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
+def up(profile_dir: str | None) -> None:
     """Converge a profile's machine to its desired state (launch/recover + apps).
 
-    Idempotent: reuses a running instance if one exists, otherwise polls for GPU
-    capacity, launches (auto-creating the filesystem if needed), sets up, and ensures
-    the profile's apps are installed. Re-run after a termination to recover.
+    Run from inside a profile folder (one with a cloudgpu.toml). Idempotent: reuses a
+    running instance if one exists, otherwise polls for GPU capacity, launches
+    (auto-creating the filesystem if needed), sets up, ensures the profile's apps are
+    installed, and runs provisioning. Re-run after a termination to recover.
     """
     try:
-        name = profiles.require_profile(profile_name)
-        profile = profiles.load_profile(name)
+        d = profiles.find_profile_dir(profile_dir)
+        profile = profiles.load_profile(d)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
 
+    name = profile["name"]
     filesystem = profile["filesystem"]
 
     # Reuse a live instance if we already track one for this profile.
-    runtime = profiles.load_runtime(name)
-    inst = _live_instance(runtime.get("instance_id"))
+    state = profiles.load_state(d)
+    inst = _live_instance(state.get("instance_id"))
     if inst:
-        display.info(f"Reusing running instance {runtime['instance_id']} ({inst.get('ip')}).")
-        runtime["host"] = f"ubuntu@{inst.get('ip')}"
-        runtime["ip"] = inst.get("ip")
+        display.info(f"Reusing running instance {state['instance_id']} ({inst.get('ip')}).")
+        state["host"] = f"ubuntu@{inst.get('ip')}"
+        state["ip"] = inst.get("ip")
     else:
-        if runtime.get("instance_id"):
+        if state.get("instance_id"):
             display.info("Tracked instance is gone; reconciling...")
-            profiles.clear_runtime(name)
-        # Adopt an instance already mounting this filesystem (recovery / migration /
-        # lost runtime state). The filesystem is the profile's identity, so it's ours.
+            profiles.clear_state(d)
+        # Adopt an instance already mounting this filesystem (recovery / lost state).
+        # The filesystem is the profile's identity, so it's ours.
         existing = _instance_mounting(filesystem)
         if existing and existing.get("ip"):
             display.info(
                 f"Adopting running instance {existing.get('id')} ({existing.get('ip')}) "
                 f"already mounting '{filesystem}'."
             )
-            runtime = _runtime_from_instance(existing, filesystem)
-            profiles.save_runtime(name, runtime)
+            state = _runtime_from_instance(existing, filesystem)
+            profiles.save_state(d, state)
         else:
             try:
-                runtime = orchestration.acquire_instance(profile)
+                state = orchestration.acquire_instance(profile)
             except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:
                 display.error(str(e))
                 sys.exit(1)
-            profiles.save_runtime(name, runtime)
-            if runtime.get("created_filesystem"):
-                display.success(f"Created filesystem '{filesystem}' in {runtime['region']}.")
+            profiles.save_state(d, state)
+            if state.get("created_filesystem"):
+                display.success(f"Created filesystem '{filesystem}' in {state['region']}.")
             display.success(
-                f"Launched {runtime['instance_type']} in {runtime['region']} at {runtime['ip']} "
-                f"({display.price(runtime.get('price_cents_per_hour'))})."
+                f"Launched {state['instance_type']} in {state['region']} at {state['ip']} "
+                f"({display.price(state.get('price_cents_per_hour'))})."
             )
 
     # Set up the host (SSH, detect, sync) and persist where it landed.
-    persistent_dir, _ = _setup_host(runtime["host"])
-    runtime["persistent_dir"] = persistent_dir
-    profiles.save_runtime(name, runtime)
-    profiles.set_active(name)
+    persistent_dir, _ = _setup_host(state["host"])
+    state["persistent_dir"] = persistent_dir
+    profiles.save_state(d, state)
 
     # Ensure the profile's apps are present, run provisioning, then report.
-    _ensure_apps(runtime["host"], persistent_dir, profile.get("apps", []))
-    _run_provision(profile, runtime["host"], persistent_dir)
-    _report_up(name, runtime, persistent_dir)
+    _ensure_apps(state["host"], persistent_dir, profile.get("apps", []))
+    _run_provision(profile, state["host"], persistent_dir)
+    _report_up(name, state, persistent_dir)
 
 
 def _find_filesystem(name: str) -> dict | None:
@@ -565,27 +570,28 @@ def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bo
 
 
 @cli.command()
-@click.option("--profile", "-P", "profile_name", default=None, help="Profile to tear down (default: active)")
+@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
 @click.option("--delete-filesystem", is_flag=True, help="Also delete the persistent filesystem (DESTROYS its data)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def down(profile_name: str | None, delete_filesystem: bool, yes: bool) -> None:
+def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
     """Terminate a profile's instance. Keeps the filesystem unless --delete-filesystem.
 
-    Without --delete-filesystem the data persists, so 'cloudgpu up' brings the machine
-    back later. With it, the instance is terminated and the filesystem (and all its data)
-    is permanently deleted.
+    Run from inside a profile folder. Without --delete-filesystem the data persists, so
+    'cloudgpu up' brings the machine back later. With it, the instance is terminated and
+    the filesystem (and all its data) is permanently deleted.
     """
     try:
-        name = profiles.require_profile(profile_name)
-        profile = profiles.load_profile(name)
+        d = profiles.find_profile_dir(profile_dir)
+        profile = profiles.load_profile(d)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
 
+    name = profile["name"]
     filesystem = profile["filesystem"]
-    runtime = profiles.load_runtime(name)
+    state = profiles.load_state(d)
 
     # Find the instance: tracked id, or whatever is mounting the filesystem.
-    instance_id = runtime.get("instance_id")
+    instance_id = state.get("instance_id")
     if not instance_id:
         inst = _instance_mounting(filesystem)
         instance_id = inst.get("id") if inst else None
@@ -610,7 +616,7 @@ def down(profile_name: str | None, delete_filesystem: bool, yes: bool) -> None:
         display.success(f"Termination requested for {instance_id}.")
     else:
         display.info("No running instance for this profile.")
-    profiles.clear_runtime(name)
+    profiles.clear_state(d)
 
     if not delete_filesystem:
         return
@@ -641,111 +647,36 @@ def down(profile_name: str | None, delete_filesystem: bool, yes: bool) -> None:
             time.sleep(10)
 
 
-def _profile_or_active(name: str | None) -> str:
-    try:
-        return profiles.require_profile(name)
-    except config.ConfigError as e:
-        raise click.UsageError(str(e)) from e
-
-
-@cli.group(name="profile")
-def profile_group() -> None:
-    """Manage machine profiles (declarative desired state)."""
-
-
-@profile_group.command(name="create")
-@click.argument("name")
-@click.option("--filesystem", default=None, help="Persistent filesystem name (default: the profile name; auto-created on first 'up')")
+@cli.command()
+@click.argument("directory", required=False, default=".")
+@click.option("--ssh-key", "ssh_key", required=True, help="Lambda SSH key name (a matching private key must be in ~/.ssh)")
 @click.option("--gpu", default="gh200,a100", help="GPU preference order, comma-separated (e.g. gh200,a100)")
 @click.option("--apps", default="comfyui", help="Comma-separated apps to keep installed")
-@click.option("--ssh-key", "ssh_key", required=True, help="Lambda SSH key name (a matching private key must be in ~/.ssh)")
-@click.option("--force", is_flag=True, help="Overwrite an existing profile")
-@click.option("--activate/--no-activate", default=True, help="Select this profile as active")
-def profile_create(name, filesystem, gpu, apps, ssh_key, force, activate):
-    """Scaffold a new profile TOML."""
+@click.option("--filesystem", default=None, help="Persistent filesystem name (default: the folder name)")
+@click.option("--force", is_flag=True, help="Overwrite an existing cloudgpu.toml")
+def init(directory: str, ssh_key: str, gpu: str, apps: str, filesystem: str | None, force: bool) -> None:
+    """Scaffold a profile in DIRECTORY (default: current dir).
+
+    Writes cloudgpu.toml, vendors comfylib.py, and drops a starter provision.py. Then
+    `cd` into the folder, edit the files, and run `cloudgpu up`.
+    """
     gpu_list = [g.strip() for g in gpu.split(",") if g.strip()]
     apps_list = [a.strip() for a in apps.split(",") if a.strip()]
     try:
-        path = profiles.create_profile(
-            name, filesystem=filesystem, gpu=gpu_list, apps=apps_list,
-            ssh_key=ssh_key, overwrite=force,
+        toml_path = profiles.scaffold(
+            directory, ssh_key=ssh_key, gpu=gpu_list, apps=apps_list,
+            filesystem=filesystem, force=force,
         )
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
-    display.success(f"Created profile '{name}' at {path}")
-    if activate:
-        profiles.set_active(name)
-        display.info(f"Selected '{name}' as the active profile.")
-    display.info("Edit it with 'cloudgpu profile edit', then run 'cloudgpu up'.")
 
-
-@profile_group.command(name="list")
-def profile_list():
-    """List profiles (the active one is marked *)."""
-    rows = []
-    for n in profiles.list_profiles():
-        try:
-            p = profiles.load_profile(n)
-            fs, gpu = p["filesystem"], p["gpu"]
-        except config.ConfigError:
-            fs, gpu = "[invalid]", []
-        rows.append({
-            "name": n,
-            "filesystem": fs,
-            "gpu": gpu,
-            "last_ip": profiles.load_runtime(n).get("ip"),
-        })
-    display.show_profiles(rows, profiles.get_active())
-
-
-@profile_group.command(name="show")
-@click.argument("name", required=False)
-def profile_show(name):
-    """Print a profile's TOML and its runtime state."""
-    name = _profile_or_active(name)
-    try:
-        display.info(profiles.profile_path(name).read_text().rstrip())
-    except OSError as e:
-        raise click.UsageError(str(e)) from e
-    runtime = profiles.load_runtime(name)
-    if runtime:
-        display.info("\n[bold]runtime[/bold]:")
-        display.info(json.dumps(runtime, indent=2))
-
-
-@profile_group.command(name="use")
-@click.argument("name")
-def profile_use(name):
-    """Select NAME as the active profile."""
-    try:
-        profiles.set_active(name)
-    except config.ConfigError as e:
-        raise click.UsageError(str(e)) from e
-    display.success(f"Active profile: {name}")
-
-
-@profile_group.command(name="edit")
-@click.argument("name", required=False)
-def profile_edit(name):
-    """Open a profile's TOML in $EDITOR."""
-    name = _profile_or_active(name)
-    path = profiles.profile_path(name)
-    if not path.exists():
-        raise click.UsageError(f"No profile named '{name}'.")
-    click.edit(filename=str(path))
-
-
-@profile_group.command(name="delete")
-@click.argument("name")
-@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def profile_delete(name, yes):
-    """Delete a profile and its runtime state (does NOT touch the filesystem/instance)."""
-    if not profiles.profile_path(name).exists():
-        raise click.UsageError(f"No profile named '{name}'.")
-    if not yes:
-        click.confirm(f"Delete profile '{name}' (and its runtime state)?", abort=True)
-    profiles.delete_profile(name)
-    display.success(f"Deleted profile '{name}'.")
+    d = toml_path.parent
+    display.success(f"Initialized cloudgpu profile in {d}")
+    display.info("  cloudgpu.toml   — edit GPU / apps / filesystem")
+    display.info("  provision.py    — extra setup (model downloads); uses comfylib.py")
+    here = directory in (".", "")
+    cd_hint = "" if here else f"cd {d} && "
+    display.info(f"Next: {cd_hint}cloudgpu up")
 
 
 def _api_call(fn, *args, **kwargs):

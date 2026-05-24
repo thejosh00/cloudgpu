@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
 
-_LIB = Path(__file__).resolve().parent.parent / "scripts" / "comfylib.py"
+from cloudgpu.templates import comfylib
 
 
 @pytest.fixture
 def cl():
-    spec = importlib.util.spec_from_file_location("comfylib", _LIB)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return comfylib
 
 
 class TestPaths:

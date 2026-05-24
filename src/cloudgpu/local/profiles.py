@@ -1,23 +1,20 @@
-"""Profile store: declarative desired state (TOML) + tool-owned runtime state (JSON).
+"""Directory-as-profile store.
 
-A *profile* is the user's desired state for one logical GPU machine — the GPU
-preference order, the filesystem that gives it a persistent identity, and the apps
-to keep installed. Profiles are per-user and live under ~/.config/cloudgpu/, not in
-a repo.
+A *profile* is a folder anywhere on disk that holds its definition, its provisioning, and
+its state. You ``cd`` into it and run ``cloudgpu up``.
 
-Two stores, deliberately separate so the tool never clobbers the user's edits:
+- ``cloudgpu.toml``        — desired state, hand-edited (``cloudgpu init`` scaffolds it).
+- ``provision.py`` / etc.  — optional provisioning payload (the whole folder is rsynced).
+- ``cloudgpu.state.json``  — tool-written runtime state (which instance is up); gitignored
+                             and never rsynced to the instance.
 
-- ``profiles/<name>.toml``  — desired state, hand-edited (we only scaffold it).
-- ``runtime/<name>.json``   — runtime state, tool-written (which instance is up now).
-
-The active profile (so commands don't need ``--profile`` every time) is recorded as
-``active_profile`` in the existing config.json.
+Secrets stay in the shared ``~/.config/cloudgpu/secrets.env`` (see ``secrets_file``).
 """
 
 from __future__ import annotations
 
 import json
-import shutil
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +25,15 @@ except ModuleNotFoundError:  # py3.10 backport (declared in pyproject)
 
 from . import config
 
-# Defaults applied to every loaded profile. (ssh_key and filesystem/gpu are required.)
+PROFILE_FILE = "cloudgpu.toml"
+STATE_FILE = "cloudgpu.state.json"
+
+# Files in the profile folder that must NOT be rsynced to the instance with the
+# provisioning payload (tool state, secrets, VCS, build artifacts).
+PROVISION_EXCLUDES = [STATE_FILE, "secrets.env", ".git", "__pycache__", "*.pyc"]
+
+# Defaults applied to every loaded profile. (ssh_key and gpu are required; filesystem
+# defaults to the folder name.)
 _DEFAULTS: dict[str, Any] = {
     "apps": [],
     "region": "",
@@ -38,24 +43,8 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
-def profiles_dir() -> Path:
-    return config.CONFIG_DIR / "profiles"
-
-
-def runtime_dir() -> Path:
-    return config.CONFIG_DIR / "runtime"
-
-
-def profile_path(name: str) -> Path:
-    return profiles_dir() / f"{name}.toml"
-
-
-def runtime_path(name: str) -> Path:
-    return runtime_dir() / f"{name}.json"
-
-
 def secrets_file() -> Path:
-    """Path to the optional shared secrets file (KEY=VALUE lines, e.g. CIVITAI_TOKEN).
+    """Path to the shared secrets file (KEY=VALUE lines, e.g. CIVITAI_TOKEN).
 
     If present it's transferred to the instance and sourced into the provision script's
     environment, so scripts can reference $CIVITAI_TOKEN etc. without hardcoding values.
@@ -64,50 +53,52 @@ def secrets_file() -> Path:
     return config.CONFIG_DIR / "secrets.env"
 
 
-def provision_dir(name: str) -> Path:
-    """Directory of optional provisioning assets for a profile, run on every ``up``.
+# --- locating + loading a profile -----------------------------------------
 
-    If ``profiles/<name>.provision/`` exists, the whole directory is rsynced to the
-    instance and its entry point (``provision.py`` preferred, else ``provision.sh``) is
-    executed from inside it (so it can reference sibling files like ``comfylib.py``). It
-    should be idempotent (e.g. download a model only if missing) and write persistent data
-    under the filesystem so it survives termination.
+
+def find_profile_dir(explicit: str | Path | None = None) -> Path:
+    """Resolve the profile directory: ``explicit`` (``--profile``) or the current dir.
+
+    CWD-only — no walking up to parents. Raises ConfigError if the resolved directory has
+    no ``cloudgpu.toml``.
     """
-    return profiles_dir() / f"{name}.provision"
-
-
-def list_profiles() -> list[str]:
-    """Return profile names (sorted), or [] if none exist."""
-    d = profiles_dir()
-    if not d.is_dir():
-        return []
-    return sorted(p.stem for p in d.glob("*.toml"))
-
-
-def load_profile(name: str) -> dict[str, Any]:
-    """Load and validate a profile, applying defaults and injecting ``name``.
-
-    Raises:
-        config.ConfigError: if the profile is missing, unparseable, or invalid.
-    """
-    path = profile_path(name)
-    if not path.exists():
+    d = (Path(explicit).expanduser() if explicit else Path.cwd()).resolve()
+    if not (d / PROFILE_FILE).exists():
+        where = f"'{d}'" if explicit else "the current directory"
         raise config.ConfigError(
-            f"No profile named '{name}'. Create one with "
-            f"'cloudgpu profile create {name} --filesystem <fs> --gpu gh200,a100'."
+            f"No {PROFILE_FILE} in {where}. Run 'cloudgpu init' here, or pass --profile <dir>."
         )
+    return d
+
+
+def has_profile(d: str | Path) -> bool:
+    """True if directory ``d`` contains a cloudgpu.toml."""
+    return (Path(d).expanduser() / PROFILE_FILE).exists()
+
+
+def load_profile(profile_dir: str | Path) -> dict[str, Any]:
+    """Load and validate the profile in ``profile_dir``.
+
+    Injects ``name`` (the folder name) and ``dir`` (the Path). Raises ConfigError if the
+    profile is missing, unparseable, or invalid.
+    """
+    profile_dir = Path(profile_dir).expanduser().resolve()
+    path = profile_dir / PROFILE_FILE
+    name = profile_dir.name
+    if not path.exists():
+        raise config.ConfigError(f"No {PROFILE_FILE} in '{profile_dir}'.")
     try:
         raw = tomllib.loads(path.read_text())
     except (tomllib.TOMLDecodeError, OSError) as e:
-        raise config.ConfigError(f"Could not read profile '{name}': {e}") from e
+        raise config.ConfigError(f"Could not read {path}: {e}") from e
 
-    profile = {**_DEFAULTS, **raw, "name": name}
+    profile = {**_DEFAULTS, **raw, "name": name, "dir": profile_dir}
 
-    # Filesystem is optional; it defaults to the profile name and is auto-created on
-    # the first `up` if it doesn't exist yet.
+    # Filesystem is optional; it defaults to the folder name and is auto-created on the
+    # first `up` if it doesn't exist yet.
     filesystem = profile.get("filesystem") or name
     if not isinstance(filesystem, str):
-        raise config.ConfigError(f"Profile '{name}': 'filesystem' must be a string.")
+        raise config.ConfigError(f"{path}: 'filesystem' must be a string.")
     profile["filesystem"] = filesystem
 
     gpu = profile.get("gpu")
@@ -115,15 +106,15 @@ def load_profile(name: str) -> dict[str, Any]:
         gpu = [gpu]
     if not gpu or not isinstance(gpu, list):
         raise config.ConfigError(
-            f"Profile '{name}' must set 'gpu' to a non-empty list, e.g. [\"gh200\", \"a100\"]."
+            f"{path} must set 'gpu' to a non-empty list, e.g. [\"gh200\", \"a100\"]."
         )
     profile["gpu"] = gpu
 
     ssh_key = profile.get("ssh_key")
     if not ssh_key or not isinstance(ssh_key, str):
         raise config.ConfigError(
-            f"Profile '{name}' must set 'ssh_key' to the Lambda SSH key name to launch "
-            "with (a private key matching it must be in ~/.ssh)."
+            f"{path} must set 'ssh_key' to the Lambda SSH key name to launch with "
+            "(a private key matching it must be in ~/.ssh)."
         )
 
     if isinstance(profile.get("apps"), str):
@@ -132,105 +123,16 @@ def load_profile(name: str) -> dict[str, Any]:
     return profile
 
 
-def profile_template(
-    name: str,
-    *,
-    filesystem: str | None = None,
-    gpu: list[str],
-    apps: list[str],
-    ssh_key: str | None = None,
-) -> str:
-    """Render a profile TOML document (we never use a TOML writer dependency)."""
-    def arr(items: list[str]) -> str:
-        return "[" + ", ".join(f'"{i}"' for i in items) + "]"
-
-    fs_line = f'filesystem = "{filesystem}"' if filesystem else f'# filesystem = "{name}"'
-    lines = [
-        f"# cloudgpu profile: {name}",
-        f"{fs_line}     # persistent storage; defaults to the profile name, auto-created on first 'up'",
-        f"gpu = {arr(gpu)}                # GPU preference order (alias or full type name)",
-        f"apps = {arr(apps)}              # apps to keep installed",
-    ]
-    ssh_line = f'ssh_key = "{ssh_key}"' if ssh_key else 'ssh_key = ""'
-    lines += [
-        f"{ssh_line}                      # required: Lambda SSH key name (matching key in ~/.ssh)",
-        f'instance_name = "{name}"        # optional; Lambda instance name',
-        '# region = "us-east-3"           # optional; defaults to the filesystem\'s region',
-        "poll_seconds = 20                # capacity poll interval",
-        "max_hours = 12                   # give up after this long",
-    ]
-    return "\n".join(lines) + "\n"
+# --- runtime state (tool-written, in the profile folder) ------------------
 
 
-def create_profile(
-    name: str,
-    *,
-    filesystem: str | None = None,
-    gpu: list[str],
-    apps: list[str],
-    ssh_key: str | None = None,
-    overwrite: bool = False,
-) -> Path:
-    """Scaffold profiles/<name>.toml. Raises ConfigError if it exists (unless overwrite)."""
-    path = profile_path(name)
-    if path.exists() and not overwrite:
-        raise config.ConfigError(
-            f"Profile '{name}' already exists at {path}. "
-            "Edit it with 'cloudgpu profile edit', or pass --force to overwrite."
-        )
-    profiles_dir().mkdir(parents=True, exist_ok=True)
-    path.write_text(profile_template(
-        name, filesystem=filesystem, gpu=gpu, apps=apps, ssh_key=ssh_key
-    ))
-    return path
+def state_path(profile_dir: str | Path) -> Path:
+    return Path(profile_dir).expanduser().resolve() / STATE_FILE
 
 
-def delete_profile(name: str) -> None:
-    """Remove a profile's TOML, provisioning dir, runtime state, and clear it as active."""
-    profile_path(name).unlink(missing_ok=True)
-    shutil.rmtree(provision_dir(name), ignore_errors=True)
-    clear_runtime(name)
-    if get_active() == name:
-        cfg = config.load_config()
-        cfg.pop("active_profile", None)
-        config.save_config(cfg)
-
-
-# --- active profile pointer (stored in config.json) -----------------------
-
-
-def get_active() -> str | None:
-    return config.load_config().get("active_profile")
-
-
-def set_active(name: str) -> None:
-    """Mark a profile active. Raises ConfigError if it doesn't exist."""
-    if not profile_path(name).exists():
-        raise config.ConfigError(f"No profile named '{name}'.")
-    cfg = config.load_config()
-    cfg["active_profile"] = name
-    config.save_config(cfg)
-
-
-def require_profile(name: str | None = None) -> str:
-    """Resolve a profile name: explicit arg, else the active profile."""
-    if name:
-        return name
-    active = get_active()
-    if active:
-        return active
-    raise config.ConfigError(
-        "No profile selected. Create one with 'cloudgpu profile create ...' "
-        "and select it with 'cloudgpu profile use <name>', or pass --profile."
-    )
-
-
-# --- runtime state (tool-written JSON) ------------------------------------
-
-
-def load_runtime(name: str) -> dict[str, Any]:
-    """Return the profile's runtime state, or {} if the instance isn't tracked."""
-    path = runtime_path(name)
+def load_state(profile_dir: str | Path) -> dict[str, Any]:
+    """Return the profile's runtime state, or {} if no instance is tracked."""
+    path = state_path(profile_dir)
     if not path.exists():
         return {}
     try:
@@ -239,10 +141,69 @@ def load_runtime(name: str) -> dict[str, Any]:
         return {}
 
 
-def save_runtime(name: str, data: dict[str, Any]) -> None:
-    runtime_dir().mkdir(parents=True, exist_ok=True)
-    runtime_path(name).write_text(json.dumps({**data, "profile": name}, indent=2) + "\n")
+def save_state(profile_dir: str | Path, data: dict[str, Any]) -> None:
+    state_path(profile_dir).write_text(json.dumps(data, indent=2) + "\n")
 
 
-def clear_runtime(name: str) -> None:
-    runtime_path(name).unlink(missing_ok=True)
+def clear_state(profile_dir: str | Path) -> None:
+    state_path(profile_dir).unlink(missing_ok=True)
+
+
+# --- scaffolding (`cloudgpu init`) ----------------------------------------
+
+
+def _toml_template(name: str, *, filesystem: str | None, gpu: list[str],
+                   apps: list[str], ssh_key: str) -> str:
+    def arr(items: list[str]) -> str:
+        return "[" + ", ".join(f'"{i}"' for i in items) + "]"
+
+    fs_line = f'filesystem = "{filesystem}"' if filesystem else f'# filesystem = "{name}"'
+    return "\n".join([
+        f"# cloudgpu profile: {name}",
+        f"{fs_line}     # persistent storage; defaults to the folder name, auto-created on first 'up'",
+        f"gpu = {arr(gpu)}                # GPU preference order (alias or full type name)",
+        f"apps = {arr(apps)}              # apps to keep installed",
+        f'ssh_key = "{ssh_key}"                      # required: Lambda SSH key name (matching key in ~/.ssh)',
+        '# region = "us-east-3"           # optional; defaults to the filesystem\'s region',
+        "poll_seconds = 20                # capacity poll interval",
+        "max_hours = 12                   # give up after this long",
+        "provision_timeout = 3600         # seconds; cap on the provision script",
+    ]) + "\n"
+
+
+def _read_template(filename: str) -> str:
+    return resources.files("cloudgpu.templates").joinpath(filename).read_text()
+
+
+def scaffold(
+    profile_dir: str | Path,
+    *,
+    ssh_key: str,
+    gpu: list[str],
+    apps: list[str],
+    filesystem: str | None = None,
+    force: bool = False,
+) -> Path:
+    """Create a profile folder: cloudgpu.toml + vendored comfylib.py + starter provision.py.
+
+    Raises ConfigError if a cloudgpu.toml already exists (unless ``force``).
+    """
+    profile_dir = Path(profile_dir).expanduser().resolve()
+    toml_path = profile_dir / PROFILE_FILE
+    if toml_path.exists() and not force:
+        raise config.ConfigError(
+            f"{toml_path} already exists. Edit it, or pass --force to overwrite."
+        )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    toml_path.write_text(_toml_template(
+        profile_dir.name, filesystem=filesystem, gpu=gpu, apps=apps, ssh_key=ssh_key
+    ))
+    # Vendor the helper lib + a starter provision script (don't clobber an edited one).
+    (profile_dir / "comfylib.py").write_text(_read_template("comfylib.py"))
+    provision = profile_dir / "provision.py"
+    if force or not provision.exists():
+        provision.write_text(_read_template("provision.py"))
+    gitignore = profile_dir / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(f"{STATE_FILE}\n")
+    return toml_path

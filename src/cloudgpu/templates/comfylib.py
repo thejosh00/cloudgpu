@@ -1,7 +1,7 @@
 """comfylib — helpers for ComfyUI cloudgpu provision scripts.
 
-Copy this file into your profile's ``<name>.provision/`` directory next to ``provision.py``
-and import it:
+`cloudgpu init` vendors this file into your profile folder next to ``provision.py``; import
+it from there:
 
     import comfylib as cl
 

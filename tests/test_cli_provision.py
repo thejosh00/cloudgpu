@@ -1,4 +1,4 @@
-"""Tests for the per-profile provisioning directory hook (mocked SSH/rsync)."""
+"""Tests for provisioning (the profile folder is the payload). Mocked SSH/rsync."""
 
 from __future__ import annotations
 
@@ -8,58 +8,61 @@ from cloudgpu import cli
 from cloudgpu.local import profiles, ssh
 
 
-def _make_profile(name="p"):
-    profiles.create_profile(name, gpu=["gh200"], apps=[], ssh_key="mini")
-    return profiles.load_profile(name)
+@pytest.fixture(autouse=True)
+def _isolate_config(tmp_config_dir):
+    """Point CONFIG_DIR at a temp dir so tests never see the real secrets.env."""
+    return tmp_config_dir
 
 
-def _write_provision(name="p", script="#!/bin/bash\necho hi\n"):
-    d = profiles.provision_dir(name)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "provision.sh").write_text(script)
-    return d
+def _profile(tmp_path, *, entry="py"):
+    d = tmp_path / "prof"
+    d.mkdir()
+    (d / "cloudgpu.toml").write_text('gpu = ["gh200"]\nssh_key = "mini"\n')
+    if entry == "py":
+        (d / "provision.py").write_text("print('hi')\n")
+    elif entry == "sh":
+        (d / "provision.sh").write_text("echo hi\n")
+    elif entry == "both":
+        (d / "provision.py").write_text("print('hi')\n")
+        (d / "provision.sh").write_text("echo hi\n")
+    return profiles.load_profile(d)
 
 
-def test_no_provision_dir_is_noop(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
+def test_no_entry_is_noop(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, entry=None)
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: pytest.fail("must not copy"))
     monkeypatch.setattr(cli.ssh, "ssh_run", lambda *a, **k: pytest.fail("must not run"))
-    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")  # returns silently
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
 
 
-def test_runs_dir_with_env_and_streams(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    _write_provision("p")
-
+def test_runs_python_entry_with_excludes(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, entry="py")
     copied = {}
-    monkeypatch.setattr(cli.sync, "copy_dir",
-                        lambda local, host, remote: copied.update(local=local, host=host, remote=remote))
+    def fake_copy(local, host, remote, exclude=None):
+        copied.update(local=local, host=host, remote=remote, exclude=exclude)
+    monkeypatch.setattr(cli.sync, "copy_dir", fake_copy)
     captured = {}
     def fake_run(host, command, *, capture=True, check=False, timeout=300):
-        captured.update(host=host, command=command, capture=capture, timeout=timeout)
+        captured.update(command=command, capture=capture, timeout=timeout)
         return ssh.SSHResult(0, "", "")
     monkeypatch.setattr(cli.ssh, "ssh_run", fake_run)
 
     cli._run_provision(profile, "ubuntu@1.2.3.4", "/lambda/nfs/p")
 
-    assert copied["local"] == str(profiles.provision_dir("p"))
+    assert copied["local"] == str(profile["dir"])
     assert copied["remote"] == "/lambda/nfs/p/cloudgpu/provision"
-    assert captured["host"] == "ubuntu@1.2.3.4"
-    assert captured["capture"] is False                        # streams live
-    assert captured["timeout"] == 3600                         # provision_timeout default
+    # state + secrets must never be rsynced onto the persistent filesystem
+    assert "cloudgpu.state.json" in copied["exclude"]
+    assert "secrets.env" in copied["exclude"]
+    assert captured["capture"] is False
+    assert captured["timeout"] == 3600
     assert "CLOUDGPU_PROVISION_DIR=/lambda/nfs/p/cloudgpu/provision" in captured["command"]
-    assert "CLOUDGPU_APPS_DIR=/lambda/nfs/p/apps" in captured["command"]
     assert "cd /lambda/nfs/p/cloudgpu/provision" in captured["command"]
-    assert "bash provision.sh" in captured["command"]
+    assert "python3 provision.py" in captured["command"]
 
 
-def test_python_entrypoint_preferred(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    d = profiles.provision_dir("p")
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "provision.py").write_text("print('hi')\n")
-    (d / "provision.sh").write_text("echo hi\n")  # both present -> .py wins
-
+def test_python_preferred_over_sh(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, entry="both")
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
     captured = {}
     monkeypatch.setattr(cli.ssh, "ssh_run",
@@ -69,29 +72,41 @@ def test_python_entrypoint_preferred(tmp_config_dir, monkeypatch):
     assert "bash provision.sh" not in captured["command"]
 
 
-def test_dir_without_entrypoint_errors(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    profiles.provision_dir("p").mkdir(parents=True, exist_ok=True)  # no provision.sh inside
-    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: pytest.fail("must not copy"))
-    with pytest.raises(SystemExit):
-        cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+def test_sh_entry(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, entry="sh")
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    assert "bash provision.sh" in captured["command"]
 
 
-def test_failure_exits_nonzero(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    _write_provision("p", "exit 1\n")
+def test_failure_exits_nonzero(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, entry="py")
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
     monkeypatch.setattr(cli.ssh, "ssh_run", lambda *a, **k: ssh.SSHResult(1, "", ""))
     with pytest.raises(SystemExit):
         cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
 
 
-def test_secrets_transferred_and_sourced_not_inlined(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    _write_provision("p")
-    # Secret value must never end up in the command string.
-    profiles.secrets_file().write_text("CIVITAI_TOKEN=SECRET123\n")
+def test_provision_timeout_override(tmp_path, monkeypatch):
+    d = tmp_path / "prof"
+    d.mkdir()
+    (d / "cloudgpu.toml").write_text('gpu=["gh200"]\nssh_key="mini"\nprovision_timeout=7200\n')
+    (d / "provision.py").write_text("print('hi')\n")
+    profile = profiles.load_profile(d)
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(k) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    assert captured["timeout"] == 7200
 
+
+def test_secrets_transferred_sourced_not_inlined(tmp_path, tmp_config_dir, monkeypatch):
+    profile = _profile(tmp_path, entry="py")
+    profiles.secrets_file().write_text("CIVITAI_TOKEN=SECRET123\n")  # under tmp_config_dir
     copied = []
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
     monkeypatch.setattr(cli.sync, "copy_file",
@@ -99,22 +114,14 @@ def test_secrets_transferred_and_sourced_not_inlined(tmp_config_dir, monkeypatch
     captured = {}
     monkeypatch.setattr(cli.ssh, "ssh_run",
                         lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
-
     cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
-
-    # The secrets file is transferred to an ephemeral home path...
     assert copied == [(str(profiles.secrets_file()), ".cloudgpu-secrets.env")]
-    # ...sourced and cleaned up on the instance...
     assert 'set -a; . "$S"' in captured["command"]
-    assert "trap" in captured["command"]
-    # ...but the value never appears in the command we send.
     assert "SECRET123" not in captured["command"]
 
 
-def test_no_secrets_means_no_secret_handling(tmp_config_dir, monkeypatch):
-    profile = _make_profile()
-    _write_provision("p")
-    # no secrets.env created
+def test_no_secrets_no_copy_file(tmp_path, tmp_config_dir, monkeypatch):
+    profile = _profile(tmp_path, entry="py")
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
     monkeypatch.setattr(cli.sync, "copy_file", lambda *a, **k: pytest.fail("no secrets to copy"))
     captured = {}
@@ -122,18 +129,3 @@ def test_no_secrets_means_no_secret_handling(tmp_config_dir, monkeypatch):
                         lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
     cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
     assert ".cloudgpu-secrets.env" not in captured["command"]
-
-
-def test_provision_timeout_is_overridable(tmp_config_dir, monkeypatch):
-    profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
-    profiles.profile_path("p").write_text(
-        'gpu = ["gh200"]\nssh_key = "mini"\nprovision_timeout = 7200\n'
-    )
-    _write_provision("p")
-    profile = profiles.load_profile("p")
-    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
-    captured = {}
-    monkeypatch.setattr(cli.ssh, "ssh_run",
-                        lambda host, command, **k: captured.update(k) or ssh.SSHResult(0, "", ""))
-    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
-    assert captured["timeout"] == 7200

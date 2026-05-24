@@ -59,15 +59,18 @@ def copy_file(local_path: str, host: str, remote_path: str) -> None:
     )
 
 
-def copy_dir(local_dir: str, host: str, remote_dir: str) -> None:
-    """Mirror a local directory's contents to ``remote_dir`` on the instance (rsync)."""
+def copy_dir(local_dir: str, host: str, remote_dir: str, exclude: list[str] | None = None) -> None:
+    """Mirror a local directory's contents to ``remote_dir`` on the instance (rsync).
+
+    ``exclude`` is a list of rsync patterns to omit (e.g. tool state, secrets, VCS).
+    """
     subprocess.run(
         ["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {remote_dir}"],
         check=True,
         timeout=15,
     )
-    subprocess.run(
-        ["rsync", "-az", "--delete", local_dir.rstrip("/") + "/", f"{host}:{remote_dir}/"],
-        check=True,
-        timeout=300,
-    )
+    cmd = ["rsync", "-az", "--delete"]
+    for pat in exclude or []:
+        cmd += ["--exclude", pat]
+    cmd += [local_dir.rstrip("/") + "/", f"{host}:{remote_dir}/"]
+    subprocess.run(cmd, check=True, timeout=300)

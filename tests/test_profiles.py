@@ -1,4 +1,4 @@
-"""Tests for the profile store (desired-state TOML + runtime JSON + active pointer)."""
+"""Tests for the directory-as-profile store."""
 
 from __future__ import annotations
 
@@ -7,122 +7,107 @@ import pytest
 from cloudgpu.local import config, profiles
 
 
-@pytest.fixture
-def store(tmp_config_dir):
-    """Use the temp config dir (monkeypatched by tmp_config_dir) for profiles too."""
-    return tmp_config_dir
+def _write_toml(d, body='gpu = ["gh200"]\nssh_key = "mini"\n'):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / profiles.PROFILE_FILE).write_text(body)
+    return d
 
 
-class TestCreateAndLoad:
-    def test_create_then_load_roundtrip_with_defaults(self, store):
-        profiles.create_profile(
-            "wash", filesystem="washington", gpu=["gh200", "a100"],
-            apps=["comfyui"], ssh_key="mini",
-        )
-        p = profiles.load_profile("wash")
-        assert p["name"] == "wash"
-        assert p["filesystem"] == "washington"
-        assert p["gpu"] == ["gh200", "a100"]
-        assert p["apps"] == ["comfyui"]
+class TestFindProfileDir:
+    def test_finds_cwd(self, tmp_path, monkeypatch):
+        _write_toml(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        assert profiles.find_profile_dir() == tmp_path.resolve()
+
+    def test_explicit_dir(self, tmp_path):
+        d = _write_toml(tmp_path / "proj")
+        assert profiles.find_profile_dir(str(d)) == d.resolve()
+
+    def test_missing_toml_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(config.ConfigError, match="No cloudgpu.toml"):
+            profiles.find_profile_dir()
+
+    def test_has_profile(self, tmp_path):
+        assert not profiles.has_profile(tmp_path)
+        _write_toml(tmp_path)
+        assert profiles.has_profile(tmp_path)
+
+
+class TestLoadProfile:
+    def test_defaults(self, tmp_path):
+        d = _write_toml(tmp_path / "my-comfy")
+        p = profiles.load_profile(d)
+        assert p["name"] == "my-comfy"
+        assert p["dir"] == d.resolve()
+        assert p["filesystem"] == "my-comfy"   # defaults to folder name
+        assert p["gpu"] == ["gh200"]
         assert p["ssh_key"] == "mini"
-        # defaults
-        assert p["poll_seconds"] == 20
-        assert p["max_hours"] == 12
-        assert p["instance_name"] == "wash"
+        assert p["apps"] == []
+        assert p["instance_name"] == "my-comfy"
+        assert p["poll_seconds"] == 20 and p["max_hours"] == 12
+        assert p["provision_timeout"] == 3600
 
-    def test_load_missing_raises(self, store):
-        with pytest.raises(config.ConfigError, match="No profile named 'nope'"):
-            profiles.load_profile("nope")
+    def test_explicit_filesystem_kept(self, tmp_path):
+        d = _write_toml(tmp_path / "p", 'gpu=["gh200"]\nssh_key="mini"\nfilesystem="shared"\n')
+        assert profiles.load_profile(d)["filesystem"] == "shared"
 
-    def test_create_existing_raises_without_force(self, store):
-        profiles.create_profile("p", filesystem="fs", gpu=["a10"], apps=[])
-        with pytest.raises(config.ConfigError, match="already exists"):
-            profiles.create_profile("p", filesystem="fs2", gpu=["a10"], apps=[])
+    def test_gpu_string_coerced(self, tmp_path):
+        d = _write_toml(tmp_path / "p", 'gpu="gh200"\nssh_key="mini"\n')
+        assert profiles.load_profile(d)["gpu"] == ["gh200"]
 
-    def test_create_overwrite(self, store):
-        profiles.create_profile("p", filesystem="fs", gpu=["a10"], apps=[], ssh_key="mini")
-        profiles.create_profile(
-            "p", filesystem="fs2", gpu=["gh200"], apps=[], ssh_key="mini", overwrite=True
-        )
-        assert profiles.load_profile("p")["filesystem"] == "fs2"
-
-    def test_gpu_string_is_coerced_to_list(self, store):
-        profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
-        profiles.profile_path("p").write_text(
-            'filesystem = "fs"\ngpu = "gh200"\nssh_key = "mini"\n'
-        )
-        assert profiles.load_profile("p")["gpu"] == ["gh200"]
-
-    def test_filesystem_defaults_to_profile_name(self, store):
-        profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
-        profiles.profile_path("p").write_text('gpu = ["gh200"]\nssh_key = "mini"\n')
-        assert profiles.load_profile("p")["filesystem"] == "p"
-
-    def test_explicit_filesystem_is_kept(self, store):
-        profiles.create_profile(
-            "p", filesystem="shared", gpu=["a10"], apps=[], ssh_key="mini"
-        )
-        assert profiles.load_profile("p")["filesystem"] == "shared"
-
-    def test_empty_gpu_is_invalid(self, store):
-        profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
-        profiles.profile_path("p").write_text(
-            'filesystem = "fs"\ngpu = []\nssh_key = "mini"\n'
-        )
+    def test_missing_gpu_invalid(self, tmp_path):
+        d = _write_toml(tmp_path / "p", 'ssh_key="mini"\n')
         with pytest.raises(config.ConfigError, match="gpu"):
-            profiles.load_profile("p")
+            profiles.load_profile(d)
 
-    def test_missing_ssh_key_is_invalid(self, store):
-        profiles.profiles_dir().mkdir(parents=True, exist_ok=True)
-        profiles.profile_path("p").write_text('filesystem = "fs"\ngpu = ["gh200"]\n')
+    def test_missing_ssh_key_invalid(self, tmp_path):
+        d = _write_toml(tmp_path / "p", 'gpu=["gh200"]\n')
         with pytest.raises(config.ConfigError, match="ssh_key"):
-            profiles.load_profile("p")
+            profiles.load_profile(d)
 
-
-class TestActivePointer:
-    def test_set_and_get_active(self, store):
-        profiles.create_profile("p", filesystem="fs", gpu=["a10"], apps=[])
-        profiles.set_active("p")
-        assert profiles.get_active() == "p"
-
-    def test_set_active_unknown_raises(self, store):
+    def test_missing_toml_invalid(self, tmp_path):
         with pytest.raises(config.ConfigError):
-            profiles.set_active("ghost")
-
-    def test_require_profile_prefers_explicit(self, store):
-        profiles.create_profile("a", filesystem="fs", gpu=["a10"], apps=[])
-        profiles.set_active("a")
-        assert profiles.require_profile("explicit") == "explicit"
-
-    def test_require_profile_falls_back_to_active(self, store):
-        profiles.create_profile("a", filesystem="fs", gpu=["a10"], apps=[])
-        profiles.set_active("a")
-        assert profiles.require_profile(None) == "a"
-
-    def test_require_profile_none_raises(self, store):
-        with pytest.raises(config.ConfigError, match="No profile selected"):
-            profiles.require_profile(None)
+            profiles.load_profile(tmp_path)
 
 
-class TestRuntime:
-    def test_save_load_clear(self, store):
-        profiles.save_runtime("p", {"host": "ubuntu@1.2.3.4", "ip": "1.2.3.4"})
-        rt = profiles.load_runtime("p")
-        assert rt["host"] == "ubuntu@1.2.3.4"
-        assert rt["profile"] == "p"  # injected
-        profiles.clear_runtime("p")
-        assert profiles.load_runtime("p") == {}
+class TestState:
+    def test_save_load_clear(self, tmp_path):
+        _write_toml(tmp_path)
+        profiles.save_state(tmp_path, {"instance_id": "i-1", "host": "ubuntu@1.2.3.4"})
+        assert profiles.state_path(tmp_path).name == "cloudgpu.state.json"
+        st = profiles.load_state(tmp_path)
+        assert st["instance_id"] == "i-1"
+        profiles.clear_state(tmp_path)
+        assert profiles.load_state(tmp_path) == {}
 
-    def test_load_missing_runtime_is_empty(self, store):
-        assert profiles.load_runtime("nobody") == {}
+    def test_missing_state_is_empty(self, tmp_path):
+        assert profiles.load_state(tmp_path) == {}
 
 
-class TestDelete:
-    def test_delete_removes_toml_runtime_and_active(self, store):
-        profiles.create_profile("p", filesystem="fs", gpu=["a10"], apps=[])
-        profiles.save_runtime("p", {"host": "h"})
-        profiles.set_active("p")
-        profiles.delete_profile("p")
-        assert not profiles.profile_path("p").exists()
-        assert profiles.load_runtime("p") == {}
-        assert profiles.get_active() is None
+class TestScaffold:
+    def test_writes_all_files_and_loads(self, tmp_path):
+        d = tmp_path / "new"
+        profiles.scaffold(d, ssh_key="mini", gpu=["gh200", "a100"], apps=["comfyui"])
+        assert (d / "cloudgpu.toml").exists()
+        assert (d / "comfylib.py").exists()
+        assert (d / "provision.py").exists()
+        assert (d / ".gitignore").read_text().strip() == "cloudgpu.state.json"
+        p = profiles.load_profile(d)
+        assert p["gpu"] == ["gh200", "a100"] and p["ssh_key"] == "mini"
+
+    def test_refuses_existing_without_force(self, tmp_path):
+        profiles.scaffold(tmp_path / "x", ssh_key="mini", gpu=["gh200"], apps=[])
+        with pytest.raises(config.ConfigError, match="already exists"):
+            profiles.scaffold(tmp_path / "x", ssh_key="mini", gpu=["a10"], apps=[])
+
+    def test_force_overwrites(self, tmp_path):
+        d = tmp_path / "x"
+        profiles.scaffold(d, ssh_key="mini", gpu=["gh200"], apps=[])
+        profiles.scaffold(d, ssh_key="mini", gpu=["a10"], apps=[], force=True)
+        assert profiles.load_profile(d)["gpu"] == ["a10"]
+
+    def test_explicit_filesystem(self, tmp_path):
+        d = tmp_path / "x"
+        profiles.scaffold(d, ssh_key="mini", gpu=["gh200"], apps=[], filesystem="shared")
+        assert profiles.load_profile(d)["filesystem"] == "shared"
