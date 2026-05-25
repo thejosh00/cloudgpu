@@ -37,3 +37,11 @@ class AppInstaller(abc.ABC):
     def get_status(self) -> dict:
         """Get current status of the app."""
         ...
+
+    def service_spec(self) -> dict | None:
+        """Return a systemd service spec for a long-running server app, or None.
+
+        Apps that should run as a managed service override this to return
+        {"name", "exec_start", "workdir", "port"}. Default: not a service.
+        """
+        return None

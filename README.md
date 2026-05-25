@@ -1,6 +1,6 @@
 # CloudGPU
 
-Declaratively manage GPU machines on Lambda Cloud. Describe the machine you want in a profile — GPU preference order, a persistent filesystem, and the apps to run — and `cloudgpu up` finds capacity, launches it, sets it up, and installs (or recovers) your apps. Because apps and data live on the persistent filesystem, a terminated instance is routine: re-run `cloudgpu up` and everything comes back on a fresh GPU.
+Declaratively manage GPU machines on Lambda Cloud. Describe the machine you want in a profile — GPU preference order, a persistent filesystem, and optionally some apps — and `cloudgpu up` finds capacity, launches it, sets it up, and installs (or recovers) your apps. Because data lives on the persistent filesystem, a terminated instance is routine: re-run `cloudgpu up` and everything comes back on a fresh GPU.
 
 ## Install
 
@@ -19,7 +19,7 @@ A **profile is a folder** anywhere on disk. It holds the machine definition
 # 0. Export your Lambda Cloud API key (create one at https://cloud.lambda.ai/api-keys)
 export LAMBDA_API_KEY=secret_...
 
-# 1. Scaffold a profile folder (cloudgpu.toml + vendored comfylib.py + starter provision.py)
+# 1. Scaffold a profile folder.
 mkdir my-comfy && cd my-comfy
 cloudgpu init --ssh-key my-key --gpu gh200,a100 --apps comfyui
 
@@ -28,8 +28,8 @@ cloudgpu init --ssh-key my-key --gpu gh200,a100 --apps comfyui
 #    Idempotent — re-run after a termination to recover onto a fresh instance.
 cloudgpu up
 
-# 3. Reach the UI: start ComfyUI and tunnel it in one command
-cloudgpu forward --run comfyui
+# 3. Reach the UI. ComfyUI runs as a service on the instance, so just open a tunnel:
+cloudgpu forward     # forwards the profile's app ports (8188 for comfyui)
 # then open http://localhost:8188
 
 # 4. Done for now? Terminate the instance (data is kept on the filesystem):
@@ -47,13 +47,19 @@ at once, as long as each uses its own filesystem (a filesystem backs one instanc
 (named after the folder, in whichever region first has GPU capacity) and reuses it on every
 later `up`. Set `filesystem` in `cloudgpu.toml` to name it yourself or reuse an existing one.
 
+Apps can run as **systemd services** on the instance. ComfyUI does: it binds `127.0.0.1:8188`,
+auto-starts on boot, and restarts on crash — no need to launch it by hand. `cloudgpu forward`
+opens a tunnel to each of the profile's app ports; `cloudgpu status` shows whether services
+are active. Access a terminal with `cloudgpu ssh`.
+
 ### Provisioning (extra setup, e.g. model downloads)
 
-`cloudgpu init` drops a `provision.py` and `comfylib.py` in the profile folder. On every
-`up`, the **whole folder** is rsynced to the instance (excluding `cloudgpu.state.json`,
-`secrets.env`, and VCS/cache files) and `provision.py` (or `provision.sh`) runs from inside
-it. Use it to download models, install custom nodes, etc. — make it **idempotent** (download
-a model only if missing; `comfylib` does this for you) and write data **under the filesystem**
+Apps that need extra setup drop a `provision.py` (and helpers like `comfylib.py`) into the
+profile folder at `cloudgpu init` time. On every `up`, the **whole folder** is rsynced to the
+instance (excluding `cloudgpu.state.json`, `secrets.env`, and VCS/cache files) and
+`provision.py` (or `provision.sh`) runs from inside it. Use it to download models, install
+custom nodes, etc. — make it **idempotent** (download a model only if missing; `comfylib`
+does this for you) and write data **under the filesystem**
 so it persists across terminations. A profile with no provision script just skips this step.
 
 ```
@@ -141,17 +147,13 @@ The individual steps `up` orchestrates are also available on their own:
 # 1. Set up a new instance (tests SSH, detects persistent storage, syncs tool)
 cloudgpu setup ubuntu@<instance-ip>
 
-# 2. Install ComfyUI
+# 2. Install ComfyUI (also sets up + starts the systemd service)
 cloudgpu install --app comfyui
 
-# 3. Launch it (SSH in and run the launch script)
-cloudgpu ssh -- comfyui
-# ComfyUI starts on 127.0.0.1:8188 (loopback only, on the instance)
-
-# 3b. Reach the UI from your machine over an SSH tunnel
+# 3. Reach the UI over an SSH tunnel (the service is already running on 127.0.0.1:8188)
 cloudgpu forward --port 8188
 # then open http://localhost:8188
-# (or skip step 3 and run `cloudgpu forward --run comfyui` to start ComfyUI AND tunnel it)
+# (to run it in the foreground for debugging instead: cloudgpu ssh -- comfyui)
 
 # 4. Instance terminated? Start a new one with the same storage, then:
 cloudgpu recover <new-ip>
@@ -170,7 +172,7 @@ Profile commands (`up`, `down`, `install`, `recover`, `status`, `ssh`, `forward`
 
 | Command | Description |
 |---|---|
-| `cloudgpu init [dir] --ssh-key <key> [--gpu gh200,a100] [--apps comfyui] [--filesystem <fs>]` | Scaffold a profile folder: cloudgpu.toml + comfylib.py + starter provision.py |
+| `cloudgpu init [dir] --ssh-key <key> [--gpu gh200,a100] [--apps comfyui] [--filesystem <fs>]` | Scaffold a profile folder (cloudgpu.toml + .gitignore); each `--app` also vendors its files (comfyui → comfylib.py + provision.py). No `--apps` = bare machine |
 | `cloudgpu up [-P dir]` | Converge the profile's machine: find the GPU, create the filesystem if needed, launch, set up, install/recover apps, provision. Idempotent — re-run to recover after a termination |
 | `cloudgpu down [-P dir] [--delete-filesystem] [-y]` | Terminate the profile's instance (data kept); `--delete-filesystem` also deletes the filesystem and its data |
 | `cloudgpu setup <host>` | Test SSH, detect persistent dir, sync tool, save config (manual flow) |
@@ -178,7 +180,7 @@ Profile commands (`up`, `down`, `install`, `recover`, `status`, `ssh`, `forward`
 | `cloudgpu recover [host] [-P dir]` | Restore everything on a new instance |
 | `cloudgpu status [host] [-P dir]` | Show installed apps and their health |
 | `cloudgpu ssh [-H host] [-P dir] [-- command]` | SSH wrapper with launch scripts on PATH |
-| `cloudgpu forward [-H host] [-P dir] [-p port] [--local-port n] [--run [cmd]]` | Tunnel a remote port (default 8188/ComfyUI) to localhost; `--run` also starts the app over the same connection |
+| `cloudgpu forward [-P dir] [-p port] [--run [cmd]]` | Tunnel the profile's app port(s) to localhost (e.g. 8188 for ComfyUI); `-p` forwards a specific port; `--run` runs a command over the tunnel |
 | `cloudgpu lambda ...` | Manage Lambda Cloud resources via the API (see below) |
 
 ## Lambda Cloud API

@@ -32,7 +32,7 @@ def test_no_entry_is_noop(tmp_path, monkeypatch):
     profile = _profile(tmp_path, entry=None)
     monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: pytest.fail("must not copy"))
     monkeypatch.setattr(cli.ssh, "ssh_run", lambda *a, **k: pytest.fail("must not run"))
-    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    assert cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p") is False
 
 
 def test_runs_python_entry_with_excludes(tmp_path, monkeypatch):
@@ -47,7 +47,7 @@ def test_runs_python_entry_with_excludes(tmp_path, monkeypatch):
         return ssh.SSHResult(0, "", "")
     monkeypatch.setattr(cli.ssh, "ssh_run", fake_run)
 
-    cli._run_provision(profile, "ubuntu@1.2.3.4", "/lambda/nfs/p")
+    assert cli._run_provision(profile, "ubuntu@1.2.3.4", "/lambda/nfs/p") is True
 
     assert copied["local"] == str(profile["dir"])
     assert copied["remote"] == "/lambda/nfs/p/cloudgpu/provision"

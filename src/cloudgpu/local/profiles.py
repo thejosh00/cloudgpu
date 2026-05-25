@@ -14,7 +14,6 @@ Secrets stay in the shared ``~/.config/cloudgpu/secrets.env`` (see ``secrets_fil
 from __future__ import annotations
 
 import json
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -171,10 +170,6 @@ def _toml_template(name: str, *, filesystem: str | None, gpu: list[str],
     ]) + "\n"
 
 
-def _read_template(filename: str) -> str:
-    return resources.files("cloudgpu.templates").joinpath(filename).read_text()
-
-
 def scaffold(
     profile_dir: str | Path,
     *,
@@ -184,9 +179,11 @@ def scaffold(
     filesystem: str | None = None,
     force: bool = False,
 ) -> Path:
-    """Create a profile folder: cloudgpu.toml + vendored comfylib.py + starter provision.py.
+    """Create a profile folder: cloudgpu.toml + .gitignore (app-agnostic).
 
-    Raises ConfigError if a cloudgpu.toml already exists (unless ``force``).
+    Any app-specific files (e.g. comfyui's comfylib.py / provision.py) are vendored
+    separately by the app registry (``local.apps.scaffold_apps``). Raises ConfigError if a
+    cloudgpu.toml already exists (unless ``force``).
     """
     profile_dir = Path(profile_dir).expanduser().resolve()
     toml_path = profile_dir / PROFILE_FILE
@@ -198,11 +195,6 @@ def scaffold(
     toml_path.write_text(_toml_template(
         profile_dir.name, filesystem=filesystem, gpu=gpu, apps=apps, ssh_key=ssh_key
     ))
-    # Vendor the helper lib + a starter provision script (don't clobber an edited one).
-    (profile_dir / "comfylib.py").write_text(_read_template("comfylib.py"))
-    provision = profile_dir / "provision.py"
-    if force or not provision.exists():
-        provision.write_text(_read_template("provision.py"))
     gitignore = profile_dir / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text(f"{STATE_FILE}\n")

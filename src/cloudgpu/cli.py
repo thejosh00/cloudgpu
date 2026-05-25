@@ -10,11 +10,12 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from cloudgpu.local import config, display, lambda_api, orchestration, profiles, ssh, sync
+from cloudgpu.local import apps, config, display, lambda_api, orchestration, profiles, ssh, sync
 
 console = Console()
 
-AVAILABLE_APPS = ["comfyui"]
+# Installable apps come from the app registry (cloudgpu.local.apps); core stays generic.
+AVAILABLE_APPS = apps.AVAILABLE_APPS
 
 
 def _remote_cmd(persistent_dir: str, command: str, extra_args: list[str] | None = None) -> str:
@@ -288,47 +289,71 @@ def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> 
     sys.exit(exit_code)
 
 
+def _profile_ports(profile_dir: str | None) -> list[int]:
+    """Ports to forward for the profile's apps (deduped, in order)."""
+    try:
+        profile = profiles.load_profile(profiles.find_profile_dir(profile_dir))
+    except config.ConfigError:
+        return []
+    return apps.app_ports(profile.get("apps", []))
+
+
 @cli.command(name="forward")
-@click.option("--host", "-H", default=None, help="SSH host (uses saved host if omitted)")
-@click.option("--port", "-p", default=8188, type=int, help="Remote port to forward (default 8188, ComfyUI)")
-@click.option("--local-port", "local_port", default=None, type=int, help="Local port (defaults to --port)")
+@click.option("--host", "-H", default=None, help="SSH host (bypasses the profile; requires --port)")
+@click.option("--port", "-p", "port", default=None, type=int, help="Forward a specific remote port (default: the profile's app ports)")
+@click.option("--local-port", "local_port", default=None, type=int, help="Local port (single-port mode; defaults to --port)")
 @click.option(
-    "--run", "run_cmd", is_flag=False, flag_value="comfyui",
-    help="Start a command on the instance over the same tunnel (default: comfyui). "
-         "The tunnel lives as long as the command; Ctrl-C stops both. "
-         "Omitting --run holds the tunnel only.",
+    "--run", "run_cmd", default=None,
+    help="Run a command on the instance over the tunnel (single port). Tunnel lives as "
+         "long as the command; Ctrl-C stops both.",
 )
 @click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
-def forward(host: str | None, port: int, local_port: int | None, run_cmd: str | None, profile: str | None) -> None:
-    """Forward a remote port to localhost over SSH (default: ComfyUI on 8188).
+def forward(host: str | None, port: int | None, local_port: int | None, run_cmd: str | None, profile: str | None) -> None:
+    """Forward the profile's app port(s) to localhost over SSH.
 
-    By default this just holds the tunnel (Ctrl-C to close); start the server
-    separately with `cloudgpu ssh -- comfyui`. With --run, a single command both
-    starts the server and tunnels it.
+    With no --port, the ports come from the profile's apps (services run on the instance,
+    so just `cloudgpu forward` then open the URL). Use --port for an explicit port, or
+    --run to start a command over the tunnel.
 
     Examples:
-        cloudgpu forward                    # hold localhost:8188 -> instance:8188
-        cloudgpu forward --run              # start comfyui AND tunnel it
-        cloudgpu forward --run nvidia-smi   # run something else over the tunnel
-        cloudgpu forward -p 8888            # forward a different port
-        cloudgpu forward --local-port 9000  # serve locally on 9000
+        cloudgpu forward                    # forward the profile's app ports
+        cloudgpu forward -p 8888            # forward a specific port
+        cloudgpu forward --run nvidia-smi   # run a command over the tunnel
     """
     host, persistent_dir = _resolve_target(host, profile)
-    local_port = local_port or port
-    spec = f"{local_port}:localhost:{port}"
 
-    display.info(f"Forwarding http://localhost:{local_port} -> {host} port {port}")
-    if run_cmd:
-        # Run the command over the forwarded connection: PATH includes the
-        # generated launch scripts (comfyui, etc.). Tunnel == command lifetime.
-        bin_dir = f"{persistent_dir}/cloudgpu/bin"
-        command = f"export PATH={bin_dir}:$PATH && {run_cmd}"
-        display.info(f"Starting '{run_cmd}' on the instance (Ctrl-C stops it and closes the tunnel)...")
-        exit_code = ssh.ssh_interactive(host, command, ssh_args=["-L", spec])
-    else:
+    # Single-port mode: explicit --port, or --run (a command needs one port).
+    if port is not None or run_cmd:
+        if port is None:
+            derived = _profile_ports(profile)
+            if not derived:
+                raise click.UsageError("Pass --port <n> (no app port to infer from this profile).")
+            port = derived[0]
+        local_port = local_port or port
+        spec = f"{local_port}:localhost:{port}"
+        display.info(f"Forwarding http://localhost:{local_port} -> {host} port {port}")
+        if run_cmd:
+            bin_dir = f"{persistent_dir}/cloudgpu/bin"
+            command = f"export PATH={bin_dir}:$PATH && {run_cmd}"
+            display.info(f"Starting '{run_cmd}' (Ctrl-C stops it and closes the tunnel)...")
+            sys.exit(ssh.ssh_interactive(host, command, ssh_args=["-L", spec]))
         display.info("Holding the tunnel; press Ctrl-C to close it.")
-        exit_code = ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"])
-    sys.exit(exit_code)
+        sys.exit(ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"]))
+
+    # Profile mode: forward every app port in one tunnel.
+    ports = _profile_ports(profile)
+    if not ports:
+        raise click.UsageError(
+            "No app ports to forward for this profile. Pass --port <n>, or add an app "
+            f"with a known port ({', '.join(AVAILABLE_APPS)}) to cloudgpu.toml."
+        )
+    ssh_args: list[str] = []
+    for p in ports:
+        ssh_args += ["-L", f"{p}:localhost:{p}"]
+        display.info(f"Forwarding http://localhost:{p} -> {host} port {p}")
+    ssh_args.append("-N")
+    display.info("Holding the tunnel; press Ctrl-C to close it.")
+    sys.exit(ssh.ssh_interactive(host, ssh_args=ssh_args))
 
 
 # --- profile-driven machine management ------------------------------------
@@ -376,9 +401,9 @@ def _runtime_from_instance(inst: dict, filesystem: str) -> dict:
     }
 
 
-def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
+def _ensure_apps(host: str, persistent_dir: str, app_list: list[str]) -> None:
     """Converge installed apps to the profile: recover what exists, install what's missing."""
-    if not apps:
+    if not app_list:
         return
     output = _remote_run(host, persistent_dir, "status")
     known = json.loads(output).get("apps", {})
@@ -392,7 +417,7 @@ def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
             sys.exit(1)
 
     # Install any profile app not yet present in state.json.
-    for app in [a for a in apps if a not in known]:
+    for app in [a for a in app_list if a not in known]:
         if app not in AVAILABLE_APPS:
             display.warn(f"Unknown app '{app}' in profile; skipping. Known: {', '.join(AVAILABLE_APPS)}")
             continue
@@ -406,7 +431,7 @@ def _ensure_apps(host: str, persistent_dir: str, apps: list[str]) -> None:
             sys.exit(1)
 
 
-def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
+def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
     """Run the profile's provisioning (if any) on the instance.
 
     The profile folder itself is the payload: it's rsynced to the instance (excluding
@@ -421,7 +446,7 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
     elif (pdir / "provision.sh").exists():
         entry = "chmod +x provision.sh && bash provision.sh"
     else:
-        return  # no provisioning in this profile
+        return False  # no provisioning in this profile
 
     display.info("Provisioning...")
     bin_dir = f"{persistent_dir}/cloudgpu/bin"
@@ -455,9 +480,22 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> None:
         display.error(f"Provision failed (exit code {result.returncode})")
         sys.exit(1)
     display.success("Provision complete.")
+    return True
 
 
-def _report_up(name: str, runtime: dict, persistent_dir: str) -> None:
+def _restart_services(host: str, app_list: list[str]) -> None:
+    """Restart the profile's service apps (so provision changes take effect)."""
+    services = apps.service_apps(app_list)
+    if not services:
+        return
+    display.info(f"Restarting service(s): {', '.join(services)} ...")
+    cmd = " && ".join(f"sudo systemctl restart {s}" for s in services)
+    result = ssh.ssh_run(host, cmd, capture=False, timeout=120)
+    if not result.ok:
+        display.warn(f"Could not restart services (exit {result.returncode}); they may still be starting.")
+
+
+def _report_up(name: str, profile: dict, runtime: dict, persistent_dir: str) -> None:
     """Print final status + how to reach the machine + billing reminder."""
     output = _remote_run(runtime["host"], persistent_dir, "status")
     data = json.loads(output)
@@ -470,7 +508,13 @@ def _report_up(name: str, runtime: dict, persistent_dir: str) -> None:
         f"   IP: {runtime.get('ip') or '?'}   Price: {display.price(runtime.get('price_cents_per_hour'))}"
     )
     display.info(f"  Instance: {runtime.get('instance_id') or '?'}   Filesystem: {runtime.get('filesystem')}")
-    display.info("Reach a UI app over SSH, e.g.:  cloudgpu forward --run comfyui  (then open http://localhost:8188)")
+    ports = apps.app_ports(profile.get("apps", []))
+    if ports:
+        display.info("Apps run as services on the instance. Reach them:  cloudgpu forward")
+        for p in ports:
+            display.info(f"  http://localhost:{p}")
+    else:
+        display.info("Bare machine (no apps). SSH in with:  cloudgpu ssh")
     if runtime.get("instance_id"):
         display.warn(
             "Billing per hour while running. Tear down with 'cloudgpu down' (keeps the "
@@ -540,8 +584,10 @@ def up(profile_dir: str | None) -> None:
 
     # Ensure the profile's apps are present, run provisioning, then report.
     _ensure_apps(state["host"], persistent_dir, profile.get("apps", []))
-    _run_provision(profile, state["host"], persistent_dir)
-    _report_up(name, state, persistent_dir)
+    if _run_provision(profile, state["host"], persistent_dir):
+        # Restart services so provisioning changes (e.g. custom nodes) take effect.
+        _restart_services(state["host"], profile.get("apps", []))
+    _report_up(name, profile, state, persistent_dir)
 
 
 def _find_filesystem(name: str) -> dict | None:
@@ -651,17 +697,23 @@ def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
 @click.argument("directory", required=False, default=".")
 @click.option("--ssh-key", "ssh_key", required=True, help="Lambda SSH key name (a matching private key must be in ~/.ssh)")
 @click.option("--gpu", default="gh200,a100", help="GPU preference order, comma-separated (e.g. gh200,a100)")
-@click.option("--apps", default="comfyui", help="Comma-separated apps to keep installed")
+@click.option("--apps", "apps_csv", default="", help=f"Comma-separated apps to install (default: none). Known: {', '.join(AVAILABLE_APPS)}")
 @click.option("--filesystem", default=None, help="Persistent filesystem name (default: the folder name)")
 @click.option("--force", is_flag=True, help="Overwrite an existing cloudgpu.toml")
-def init(directory: str, ssh_key: str, gpu: str, apps: str, filesystem: str | None, force: bool) -> None:
+def init(directory: str, ssh_key: str, gpu: str, apps_csv: str, filesystem: str | None, force: bool) -> None:
     """Scaffold a profile in DIRECTORY (default: current dir).
 
-    Writes cloudgpu.toml, vendors comfylib.py, and drops a starter provision.py. Then
-    `cd` into the folder, edit the files, and run `cloudgpu up`.
+    Writes cloudgpu.toml + .gitignore. With --apps, also vendors each app's files (e.g.
+    comfyui drops comfylib.py + a starter provision.py). With no --apps you get a bare GPU
+    machine. Then `cd` into the folder, edit the files, and run `cloudgpu up`.
     """
     gpu_list = [g.strip() for g in gpu.split(",") if g.strip()]
-    apps_list = [a.strip() for a in apps.split(",") if a.strip()]
+    apps_list = [a.strip() for a in apps_csv.split(",") if a.strip()]
+    unknown = [a for a in apps_list if a not in AVAILABLE_APPS]
+    if unknown:
+        raise click.UsageError(
+            f"Unknown app(s): {', '.join(unknown)}. Known: {', '.join(AVAILABLE_APPS)}"
+        )
     try:
         toml_path = profiles.scaffold(
             directory, ssh_key=ssh_key, gpu=gpu_list, apps=apps_list,
@@ -671,11 +723,13 @@ def init(directory: str, ssh_key: str, gpu: str, apps: str, filesystem: str | No
         raise click.UsageError(str(e)) from e
 
     d = toml_path.parent
+    vendored = apps.scaffold_apps(d, apps_list)
     display.success(f"Initialized cloudgpu profile in {d}")
-    display.info("  cloudgpu.toml   — edit GPU / apps / filesystem")
-    display.info("  provision.py    — extra setup (model downloads); uses comfylib.py")
-    here = directory in (".", "")
-    cd_hint = "" if here else f"cd {d} && "
+    written = ["cloudgpu.toml", ".gitignore", *vendored]
+    display.info("  " + ", ".join(written))
+    if not apps_list:
+        display.info("  (bare machine — no apps; edit cloudgpu.toml to add some)")
+    cd_hint = "" if directory in (".", "") else f"cd {d} && "
     display.info(f"Next: {cd_hint}cloudgpu up")
 
 

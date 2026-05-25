@@ -86,13 +86,15 @@ class TestState:
 
 
 class TestScaffold:
-    def test_writes_all_files_and_loads(self, tmp_path):
+    def test_writes_toml_and_gitignore_only(self, tmp_path):
+        # scaffold is app-agnostic: just cloudgpu.toml + .gitignore (app files come from
+        # the app registry, see test_apps).
         d = tmp_path / "new"
         profiles.scaffold(d, ssh_key="mini", gpu=["gh200", "a100"], apps=["comfyui"])
         assert (d / "cloudgpu.toml").exists()
-        assert (d / "comfylib.py").exists()
-        assert (d / "provision.py").exists()
         assert (d / ".gitignore").read_text().strip() == "cloudgpu.state.json"
+        assert not (d / "comfylib.py").exists()
+        assert not (d / "provision.py").exists()
         p = profiles.load_profile(d)
         assert p["gpu"] == ["gh200", "a100"] and p["ssh_key"] == "mini"
 

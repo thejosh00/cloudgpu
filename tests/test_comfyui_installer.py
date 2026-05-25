@@ -30,15 +30,26 @@ class TestComfyUIInstaller:
             tmp_persistent_dir, "cloudgpu", "bin", "comfyui"
         )
 
-    def test_get_status_not_installed(self, installer):
+    def test_service_spec(self, installer):
+        spec = installer.service_spec()
+        assert spec["name"] == "comfyui"
+        assert spec["exec_start"] == installer.launch_script
+        assert spec["workdir"] == installer.app_dir
+        assert spec["port"] == 8188
+
+    @patch("cloudgpu.remote.apps.comfyui.service_active", return_value="inactive")
+    def test_get_status_not_installed(self, mock_active, installer):
         status = installer.get_status()
         assert status["status"] == "broken"
         assert status["torch_cuda"] is False
+        assert status["service"] == "inactive"
+        assert status["port"] == 8188
 
+    @patch("cloudgpu.remote.apps.comfyui.install_service")
     @patch("cloudgpu.remote.apps.comfyui.run")
     @patch("cloudgpu.remote.apps.comfyui.pip_install")
     @patch("cloudgpu.remote.apps.comfyui.check_torch_cuda", return_value=True)
-    def test_install_clones_and_creates_venv(self, mock_torch, mock_pip, mock_run, installer, state):
+    def test_install_clones_and_creates_venv(self, mock_torch, mock_pip, mock_run, mock_service, installer, state):
         """Test that install calls git clone and creates venv."""
         # Mock _get_version
         mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n")

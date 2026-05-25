@@ -7,7 +7,10 @@ import stat
 import time
 
 from ..installer import AppInstaller
+from ..service import install_service, service_active
 from ..utils import run, pip_install, pip_install_torch, venv_python, check_torch_cuda, log
+
+COMFYUI_PORT = 8188
 
 COMFYUI_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 MANAGER_REPO = "https://github.com/ltdrdata/ComfyUI-Manager.git"
@@ -91,8 +94,9 @@ class ComfyUIInstaller(AppInstaller):
         if os.path.exists(manager_requirements):
             pip_install(self.venv_dir, "-r", manager_requirements, timeout=120)
 
-        # 6. Create launch script
+        # 6. Create launch script + systemd service
         self._create_launch_script()
+        self._setup_service()
 
         # 7. Update state
         self.state.set_app(self.name, {
@@ -145,8 +149,9 @@ class ComfyUIInstaller(AppInstaller):
             if os.path.exists(requirements):
                 pip_install(self.venv_dir, "-r", requirements, timeout=600)
 
-        # Regenerate launch script (points to transient paths need refreshing)
+        # Regenerate launch script (transient paths need refreshing) + service
         self._create_launch_script()
+        self._setup_service()
 
         # Update state
         self.state.set_app(self.name, {
@@ -174,8 +179,27 @@ class ComfyUIInstaller(AppInstaller):
             "venv_dir": self.venv_dir,
             "version": self._get_version() if app_exists else None,
             "torch_cuda": torch_ok,
+            "service": service_active(self.name),
+            "port": COMFYUI_PORT,
             **{k: v for k, v in saved.items() if k not in ("status", "app_dir", "venv_dir", "version")},
         }
+
+    def service_spec(self) -> dict:
+        """systemd service: run ComfyUI (loopback) as a managed, auto-restarting server."""
+        return {
+            "name": self.name,
+            "exec_start": self.launch_script,
+            "workdir": self.app_dir,
+            "port": COMFYUI_PORT,
+        }
+
+    def _setup_service(self) -> None:
+        """Install/enable the systemd service (best-effort: warn rather than abort)."""
+        try:
+            install_service(self.service_spec())
+        except Exception as e:
+            log(f"Could not set up systemd service (run 'cloudgpu ssh -- comfyui' "
+                f"manually instead): {e}", "warn")
 
     def _create_launch_script(self) -> None:
         """Create the launch script at cloudgpu/bin/comfyui."""

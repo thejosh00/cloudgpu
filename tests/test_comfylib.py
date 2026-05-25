@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cloudgpu.templates import comfylib
+from cloudgpu.templates.comfyui import comfylib
 
 
 @pytest.fixture
