@@ -116,11 +116,38 @@ def cli() -> None:
     pass
 
 
-def _setup_host(host: str) -> tuple[str, dict]:
+def _pick_persistent_dir(mounts: list[str], filesystem: str | None) -> str:
+    """Choose the persistent dir from the filesystems mounted under /lambda/nfs.
+
+    With ``filesystem`` (the profile flow) the matching mount is required — installing
+    onto any other filesystem would silently strand the profile's data. Without it (the
+    manual ``setup`` flow) a single mount is unambiguous; anything else needs
+    --filesystem. Exits with a clear message when no safe choice exists.
+    """
+    if filesystem:
+        if filesystem in mounts:
+            return f"/lambda/nfs/{filesystem}"
+        display.error(f"Filesystem '{filesystem}' is not mounted on this instance.")
+        display.info(f"Mounted under /lambda/nfs: {', '.join(mounts) or '(none)'}")
+        sys.exit(1)
+    if not mounts:
+        display.error("No persistent directory found at /lambda/nfs/")
+        display.info("Make sure a filesystem is attached to this instance.")
+        sys.exit(1)
+    if len(mounts) > 1:
+        display.error(f"Multiple filesystems mounted: {', '.join(mounts)}.")
+        display.info("Pass --filesystem <name> to pick the one to use.")
+        sys.exit(1)
+    return f"/lambda/nfs/{mounts[0]}"
+
+
+def _setup_host(host: str, filesystem: str | None = None) -> tuple[str, dict]:
     """SSH-test, detect the persistent dir, sync the remote tool, run full detection.
 
-    Returns (persistent_dir, detection). Exits the process with a clear message on
-    SSH failure or a missing persistent directory. Shared by `setup` and `up`.
+    ``filesystem`` (when known, e.g. from the profile) names the mount that must back
+    the persistent dir. Returns (persistent_dir, detection). Exits the process with a
+    clear message on SSH failure or a missing persistent directory. Shared by `setup`
+    and `up`.
     """
     # 1. Test SSH
     with console.status("Testing SSH connection..."):
@@ -130,25 +157,20 @@ def _setup_host(host: str) -> tuple[str, dict]:
             sys.exit(1)
     display.success(f"SSH connection to {host} OK")
 
-    # 2. Detect persistent dir (standalone one-liner, before the tool is synced)
+    # 2. List mounted filesystems (standalone one-liner, before the tool is synced)
     with console.status("Detecting instance environment..."):
         detect_cmd = "python3 -c \"" + (
-            "import os, subprocess, json; "
+            "import os, json; "
             "nfs='/lambda/nfs'; "
-            "pd=None; "
-            "[pd:=os.path.join(nfs,e) for e in sorted(os.listdir(nfs)) "
-            "if os.path.isdir(os.path.join(nfs,e)) and not e.startswith('.')] "
-            "if os.path.isdir(nfs) else None; "
-            "print(json.dumps({'persistent_dir': pd}))"
+            "m=sorted(e for e in os.listdir(nfs) "
+            "if os.path.isdir(os.path.join(nfs,e)) and not e.startswith('.')) "
+            "if os.path.isdir(nfs) else []; "
+            "print(json.dumps({'mounts': m}))"
         ) + "\""
         result = ssh.ssh_run(host, detect_cmd, check=True)
-        quick_detect = json.loads(result.stdout)
+        mounts = json.loads(result.stdout).get("mounts") or []
 
-    persistent_dir = quick_detect.get("persistent_dir")
-    if not persistent_dir:
-        display.error("No persistent directory found at /lambda/nfs/")
-        display.info("Make sure a filesystem is attached to this instance.")
-        sys.exit(1)
+    persistent_dir = _pick_persistent_dir(mounts, filesystem)
     display.success(f"Persistent directory: {persistent_dir}")
 
     # 3. Sync remote tool
@@ -167,9 +189,11 @@ def _setup_host(host: str) -> tuple[str, dict]:
 
 @cli.command()
 @click.argument("host")
-def setup(host: str) -> None:
+@click.option("--filesystem", default=None,
+              help="Filesystem to use (required if the instance mounts more than one)")
+def setup(host: str, filesystem: str | None) -> None:
     """Test SSH, detect persistent dir, sync tool, save config."""
-    persistent_dir, _ = _setup_host(host)
+    persistent_dir, _ = _setup_host(host, filesystem)
 
     # Save config
     config.save_host(host, persistent_dir)
@@ -577,8 +601,9 @@ def up(profile_dir: str | None) -> None:
                 f"({display.price(state.get('price_cents_per_hour'))})."
             )
 
-    # Set up the host (SSH, detect, sync) and persist where it landed.
-    persistent_dir, _ = _setup_host(state["host"])
+    # Set up the host (SSH, detect, sync) and persist where it landed. The profile's
+    # filesystem must back the persistent dir — never whatever else happens to be mounted.
+    persistent_dir, _ = _setup_host(state["host"], filesystem)
     state["persistent_dir"] = persistent_dir
     profiles.save_state(d, state)
 

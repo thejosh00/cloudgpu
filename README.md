@@ -175,7 +175,7 @@ Profile commands (`up`, `down`, `install`, `recover`, `status`, `ssh`, `forward`
 | `cloudgpu init [dir] --ssh-key <key> [--gpu gh200,a100] [--apps comfyui] [--filesystem <fs>]` | Scaffold a profile folder (cloudgpu.toml + .gitignore); each `--app` also vendors its files (comfyui → comfylib.py + provision.py). No `--apps` = bare machine |
 | `cloudgpu up [-P dir]` | Converge the profile's machine: find the GPU, create the filesystem if needed, launch, set up, install/recover apps, provision. Idempotent — re-run to recover after a termination |
 | `cloudgpu down [-P dir] [--delete-filesystem] [-y]` | Terminate the profile's instance (data kept); `--delete-filesystem` also deletes the filesystem and its data |
-| `cloudgpu setup <host>` | Test SSH, detect persistent dir, sync tool, save config (manual flow) |
+| `cloudgpu setup <host> [--filesystem <name>]` | Test SSH, detect persistent dir, sync tool, save config (manual flow); `--filesystem` picks the mount when the instance has several |
 | `cloudgpu install [host] [-P dir] [--app comfyui]` | Install an app (interactive selection if no `--app`) |
 | `cloudgpu recover [host] [-P dir]` | Restore everything on a new instance |
 | `cloudgpu status [host] [-P dir]` | Show installed apps and their health |
