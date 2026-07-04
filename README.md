@@ -121,6 +121,22 @@ curl -fL -C - -H "Authorization: Bearer $CIVITAI_TOKEN" \
 Claude not to read it, so you can have Claude edit provision scripts without exposing the
 value.
 
+### Auto-terminate (billing safety cap)
+
+Instances bill per hour until terminated — a forgotten `cloudgpu down` is the most
+expensive mistake this tool can make. Set `auto_terminate_hours` in `cloudgpu.toml` and
+the instance caps itself: on every `up`, cloudgpu installs a root-only systemd timer on
+the instance that terminates it via the Lambda API once the deadline passes. The guard
+runs *on the instance*, so it holds even if your laptop is off. Since data lives on the
+persistent filesystem, an auto-terminated instance is routine — the next `cloudgpu up`
+brings everything back.
+
+Each `up` re-arms the timer, so the deadline is always `auto_terminate_hours` after the
+latest `up` (re-run `up` to extend a session). Setting it to `0` (or removing it)
+disarms on the next `up`. The API key is transferred as file content (never on a
+command line) and stored root-only on the instance's ephemeral disk, not the shared
+filesystem.
+
 A second profile is just another folder (with its own filesystem); it runs concurrently:
 
 ```bash
@@ -137,6 +153,7 @@ ssh_key = "my-key"            # required: Lambda SSH key name (matching key in ~
 # filesystem = "my-comfy"     # optional; defaults to the folder name, auto-created on first up
 poll_seconds = 20             # capacity poll interval
 max_hours = 12                # give up after this long
+# auto_terminate_hours = 8    # optional billing cap: self-terminate this long after the last 'up'
 ```
 
 ## Manual workflow (low-level)

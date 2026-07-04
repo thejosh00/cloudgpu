@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -507,6 +509,55 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
     return True
 
 
+def _configure_auto_terminate(profile: dict, host: str, instance_id: str | None, persistent_dir: str) -> int | None:
+    """Converge the instance's self-terminate timer to the profile's auto_terminate_hours.
+
+    With hours > 0 the instance gets a root-only systemd timer that terminates it via
+    the Lambda API once the deadline passes — a billing cap that holds even if this
+    machine never runs 'cloudgpu down'. Each 'up' re-arms, so the deadline is always
+    auto_terminate_hours after the latest 'up'; hours <= 0 disarms. Returns the deadline
+    epoch when armed, else None. A failure fails 'up' loudly: a cap the user asked for
+    must never be silently absent.
+    """
+    hours = float(profile.get("auto_terminate_hours") or 0)
+    try:
+        if hours <= 0:
+            _remote_run(host, persistent_dir, "autoterminate", ["--hours 0"])
+            return None
+        if not instance_id:
+            display.warn(
+                "auto_terminate_hours is set but this instance's id is unknown; "
+                "skipping the auto-terminate guard."
+            )
+            return None
+        api_key = os.environ.get(lambda_api.API_KEY_ENV)
+        if not api_key:
+            display.warn(
+                f"auto_terminate_hours is set but {lambda_api.API_KEY_ENV} is not; "
+                "skipping the auto-terminate guard."
+            )
+            return None
+        # The key travels as file content (over the rsync stream), never on a command
+        # line; the remote side moves it to root-only storage and deletes this copy.
+        fd, tmp = tempfile.mkstemp(prefix="cloudgpu-lambda-", suffix=".env")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"LAMBDA_API_KEY={api_key}\n")
+            sync.copy_file(tmp, host, ".cloudgpu-lambda.env")
+        finally:
+            os.remove(tmp)
+        display.info(f"Arming auto-terminate ({hours:g}h)...")
+        _remote_run(
+            host, persistent_dir, "autoterminate",
+            [f"--hours {hours:g}", f"--instance-id {instance_id}",
+             "--key-file .cloudgpu-lambda.env"],
+        )
+        return int(time.time() + hours * 3600)
+    except ssh.SSHError as e:
+        display.error(f"Could not configure auto-terminate: {e}")
+        sys.exit(1)
+
+
 def _restart_services(host: str, app_list: list[str]) -> None:
     """Restart the profile's service apps (so provision changes take effect)."""
     services = apps.service_apps(app_list)
@@ -545,6 +596,14 @@ def _report_up(name: str, profile: dict, runtime: dict, persistent_dir: str) -> 
             "filesystem; 'cloudgpu up' brings it back), or 'cloudgpu down --delete-filesystem' "
             "to remove the data too."
         )
+        if runtime.get("auto_terminate_at"):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(runtime["auto_terminate_at"]))
+            display.info(f"  Auto-terminate: {when} (re-run 'cloudgpu up' to extend)")
+        else:
+            display.info(
+                "  Tip: set auto_terminate_hours in cloudgpu.toml to cap billing "
+                "if you forget 'cloudgpu down'."
+            )
 
 
 @cli.command()
@@ -605,6 +664,14 @@ def up(profile_dir: str | None) -> None:
     # filesystem must back the persistent dir — never whatever else happens to be mounted.
     persistent_dir, _ = _setup_host(state["host"], filesystem)
     state["persistent_dir"] = persistent_dir
+    profiles.save_state(d, state)
+
+    # Arm the billing cap before the slow steps, so it holds even if install/provision hang.
+    deadline = _configure_auto_terminate(profile, state["host"], state.get("instance_id"), persistent_dir)
+    if deadline is not None:
+        state["auto_terminate_at"] = deadline
+    else:
+        state.pop("auto_terminate_at", None)
     profiles.save_state(d, state)
 
     # Ensure the profile's apps are present, run provisioning, then report.

@@ -39,6 +39,7 @@ _DEFAULTS: dict[str, Any] = {
     "poll_seconds": 20,
     "max_hours": 12,
     "provision_timeout": 3600,  # seconds; cap on the provision script (big downloads)
+    "auto_terminate_hours": 0,  # > 0: instance self-terminates this long after each `up`
 }
 
 
@@ -119,6 +120,13 @@ def load_profile(profile_dir: str | Path) -> dict[str, Any]:
     if isinstance(profile.get("apps"), str):
         profile["apps"] = [profile["apps"]]
     profile.setdefault("instance_name", name)
+
+    try:
+        profile["auto_terminate_hours"] = float(profile.get("auto_terminate_hours") or 0)
+    except (TypeError, ValueError):
+        raise config.ConfigError(
+            f"{path}: 'auto_terminate_hours' must be a number (hours; 0 disables)."
+        ) from None
     return profile
 
 
@@ -167,6 +175,7 @@ def _toml_template(name: str, *, filesystem: str | None, gpu: list[str],
         "poll_seconds = 20                # capacity poll interval",
         "max_hours = 12                   # give up after this long",
         "provision_timeout = 3600         # seconds; cap on the provision script",
+        "# auto_terminate_hours = 8       # billing cap: instance self-terminates this long after the last 'up'",
     ]) + "\n"
 
 

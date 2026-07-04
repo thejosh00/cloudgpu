@@ -45,6 +45,18 @@ def cmd_recover(state: State, args: argparse.Namespace) -> None:
     recover_all(state, APP_INSTALLERS)
 
 
+def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:
+    """Arm (hours > 0) or disarm (hours <= 0) the instance lifetime cap."""
+    from . import autoterminate
+    if args.hours > 0:
+        if not args.instance_id or not args.key_file:
+            print("--instance-id and --key-file are required to arm", file=sys.stderr)
+            sys.exit(2)
+        autoterminate.arm(args.hours, args.instance_id, args.key_file)
+    else:
+        autoterminate.disarm()
+
+
 def cmd_status(state: State, args: argparse.Namespace) -> None:
     """Show status of all installed apps."""
     detection = detect_all()
@@ -73,6 +85,12 @@ def main() -> None:
     subparsers.add_parser("recover", help="Recover all installed apps")
     subparsers.add_parser("status", help="Show status")
 
+    at_parser = subparsers.add_parser("autoterminate", help="Arm/disarm the instance lifetime cap")
+    at_parser.add_argument("--hours", type=float, required=True, help="Cap in hours; <= 0 disarms")
+    at_parser.add_argument("--instance-id", default=None, help="This instance's Lambda id")
+    at_parser.add_argument("--key-file", default=None,
+                           help="File with a LAMBDA_API_KEY=... line (deleted after reading)")
+
     args = parser.parse_args()
     state = State(args.persistent_dir)
 
@@ -81,6 +99,7 @@ def main() -> None:
         "install": cmd_install,
         "recover": cmd_recover,
         "status": cmd_status,
+        "autoterminate": cmd_autoterminate,
     }
 
     commands[args.command](state, args)
