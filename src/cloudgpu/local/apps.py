@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
+from ..remote.apps.aitoolkit import AITOOLKIT_PORT
 from ..remote.apps.comfyui import COMFYUI_PORT
 
 
@@ -51,6 +52,13 @@ APPS: dict[str, AppSpec] = {
         is_service=True,
         template_pkg="cloudgpu.templates.comfyui",
         templates=("comfylib.py", "provision.py"),
+    ),
+    # LoRA trainer with a web UI; manages its own datasets/configs, so nothing
+    # to vendor into profile folders.
+    "ai-toolkit": AppSpec(
+        name="ai-toolkit",
+        ports=(AITOOLKIT_PORT,),
+        is_service=True,
     ),
 }
 

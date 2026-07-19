@@ -13,9 +13,11 @@ from .state import State
 from .detect import detect_all
 from .recovery import setup_path
 from .apps.comfyui import ComfyUIInstaller
+from .apps.aitoolkit import AIToolkitInstaller
 
 APP_INSTALLERS = {
     "comfyui": ComfyUIInstaller,
+    "ai-toolkit": AIToolkitInstaller,
 }
 
 

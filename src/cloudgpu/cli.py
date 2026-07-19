@@ -1,4 +1,4 @@
-"""Click CLI: init, up, down, setup, install, recover, status, ssh, forward."""
+"""Click CLI: init, up, down, setup, install, recover, status, ssh, forward, autoterminate."""
 
 from __future__ import annotations
 
@@ -437,7 +437,7 @@ def _ensure_apps(host: str, persistent_dir: str, app_list: list[str]) -> None:
     # Recover restores everything already recorded on the filesystem (no re-download).
     if known:
         display.info("Recovering existing apps from persistent storage...")
-        result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "recover"), capture=False, timeout=1200)
+        result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "recover"), capture=False, timeout=3600)
         if not result.ok:
             display.error(f"Recovery failed (exit code {result.returncode})")
             sys.exit(1)
@@ -450,7 +450,7 @@ def _ensure_apps(host: str, persistent_dir: str, app_list: list[str]) -> None:
         display.info(f"Installing {app}...")
         result = ssh.ssh_run(
             host, _remote_cmd(persistent_dir, "install", [f"--app {app}"]),
-            capture=False, timeout=1200,
+            capture=False, timeout=3600,
         )
         if not result.ok:
             display.error(f"Installing {app} failed (exit code {result.returncode})")
@@ -598,7 +598,7 @@ def _report_up(name: str, profile: dict, runtime: dict, persistent_dir: str) -> 
         )
         if runtime.get("auto_terminate_at"):
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(runtime["auto_terminate_at"]))
-            display.info(f"  Auto-terminate: {when} (re-run 'cloudgpu up' to extend)")
+            display.info(f"  Auto-terminate: {when} ('cloudgpu autoterminate' to reset/extend)")
         else:
             display.info(
                 "  Tip: set auto_terminate_hours in cloudgpu.toml to cap billing "
@@ -680,6 +680,63 @@ def up(profile_dir: str | None) -> None:
         # Restart services so provisioning changes (e.g. custom nodes) take effect.
         _restart_services(state["host"], profile.get("apps", []))
     _report_up(name, profile, state, persistent_dir)
+
+
+@cli.command()
+@click.argument("hours", required=False, default=None, type=float)
+@click.option("--off", is_flag=True, help="Disarm the timer entirely")
+@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
+def autoterminate(hours: float | None, off: bool, profile_dir: str | None) -> None:
+    """Reset the instance's auto-terminate timer without a full 'up'.
+
+    With no HOURS, re-arms to the profile's auto_terminate_hours from now — a quick
+    way to buy more time before the deadline (e.g. mid LoRA training). Pass HOURS
+    to override this once, or --off to disarm the cap.
+
+    \b
+    Examples:
+        cloudgpu autoterminate            # reset: profile hours from now
+        cloudgpu autoterminate 6          # 6 hours from now, just this once
+        cloudgpu autoterminate --off      # disarm the cap
+    """
+    if off and hours is not None:
+        raise click.UsageError("Pass either HOURS or --off, not both.")
+    try:
+        d = profiles.find_profile_dir(profile_dir)
+        profile = profiles.load_profile(d)
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+    state = profiles.load_state(d)
+    if not state.get("host") or not state.get("persistent_dir"):
+        raise click.UsageError("No tracked instance for this profile; run 'cloudgpu up' first.")
+
+    if off:
+        hours = 0.0
+    elif hours is None:
+        hours = float(profile.get("auto_terminate_hours") or 0)
+        if hours <= 0:
+            raise click.UsageError(
+                "auto_terminate_hours is not set in cloudgpu.toml; pass HOURS "
+                "explicitly (or --off to disarm)."
+            )
+
+    deadline = _configure_auto_terminate(
+        {**profile, "auto_terminate_hours": hours},
+        state["host"], state.get("instance_id"), state["persistent_dir"],
+    )
+    if deadline is not None:
+        state["auto_terminate_at"] = deadline
+        profiles.save_state(d, state)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(deadline))
+        display.success(f"Auto-terminate armed: instance terminates at {when} ({hours:g}h from now).")
+    elif hours > 0:
+        # _configure_auto_terminate already explained why arming was skipped
+        # (missing instance id or API key); an asked-for cap must not fail quietly.
+        sys.exit(1)
+    else:
+        state.pop("auto_terminate_at", None)
+        profiles.save_state(d, state)
+        display.success("Auto-terminate disarmed.")
 
 
 def _find_filesystem(name: str) -> dict | None:

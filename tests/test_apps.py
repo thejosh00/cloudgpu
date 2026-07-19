@@ -9,8 +9,14 @@ def test_available_apps_includes_comfyui():
     assert "comfyui" in apps.AVAILABLE_APPS
 
 
+def test_available_apps_includes_aitoolkit():
+    assert "ai-toolkit" in apps.AVAILABLE_APPS
+
+
 def test_app_ports():
     assert apps.app_ports(["comfyui"]) == [8188]
+    assert apps.app_ports(["ai-toolkit"]) == [8675]
+    assert apps.app_ports(["comfyui", "ai-toolkit"]) == [8188, 8675]
     assert apps.app_ports([]) == []
     assert apps.app_ports(["unknown"]) == []
 
@@ -26,6 +32,7 @@ def test_app_ports_deduped_in_order(monkeypatch):
 
 def test_service_apps():
     assert apps.service_apps(["comfyui"]) == ["comfyui"]
+    assert apps.service_apps(["ai-toolkit"]) == ["ai-toolkit"]
     assert apps.service_apps([]) == []
     assert apps.service_apps(["unknown"]) == []
 
@@ -39,6 +46,11 @@ def test_scaffold_apps_comfyui(tmp_path):
 
 def test_scaffold_apps_bare(tmp_path):
     assert apps.scaffold_apps(tmp_path, []) == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_scaffold_apps_aitoolkit_writes_nothing(tmp_path):
+    assert apps.scaffold_apps(tmp_path, ["ai-toolkit"]) == []
     assert list(tmp_path.iterdir()) == []
 
 
