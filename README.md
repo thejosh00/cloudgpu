@@ -19,61 +19,68 @@ A **profile is a folder** anywhere on disk. It holds the machine definition
 # 0. Export your Lambda Cloud API key (create one at https://cloud.lambda.ai/api-keys)
 export LAMBDA_API_KEY=secret_...
 
-# 1. Scaffold a profile folder.
-mkdir my-comfy && cd my-comfy
-cloudgpu init --ssh-key my-key --gpu gh200,a100 --apps comfyui
+# 1. Scaffold a config (hardware) and a profile (what to install).
+cloudgpu init --config my-box --ssh-key my-key --gpu gh200,a100   # configs/my-box.toml
+cloudgpu init my-comfy --apps comfyui                             # profiles/my-comfy/
 
 # 2. Bring it up: poll for a GH200 (fallback A100), create the filesystem if needed,
-#    launch, set up, install/recover comfyui, run provisioning.
+#    launch, set up, install/recover comfyui, run the profile's provisioning.
 #    Idempotent — re-run after a termination to recover onto a fresh instance.
-cloudgpu up
+cloudgpu up --config my-box --profile my-comfy
 
 # 3. Reach the UI. ComfyUI runs as a service on the instance, so just open a tunnel:
-cloudgpu forward     # forwards the profile's app ports (8188 for comfyui)
+cloudgpu forward -C my-box     # forwards the config's app ports (8188 for comfyui)
 # then open http://localhost:8188
 
-# 4. Done for now? Terminate the instance (data is kept on the filesystem):
-cloudgpu down
+# 4. Add another profile to the running box later (or re-run provisioning):
+cloudgpu provision -C my-box -P my-other-profile
+
+# 5. Done for now? Terminate the instance (data is kept on the filesystem):
+cloudgpu down -C my-box
 #    ...or tear down everything including the filesystem and its data:
-cloudgpu down --delete-filesystem
+cloudgpu down -C my-box --delete-filesystem
 ```
 
-Commands act on the profile in the **current directory** (the one with a `cloudgpu.toml`);
-pass `--profile <dir>` to point elsewhere. Runtime state lives in `cloudgpu.state.json` in
-the folder (gitignored). Keep several profiles as separate folders — more than one can run
-at once, as long as each uses its own filesystem (a filesystem backs one instance at a time).
+A run is composed of a **config** (hardware — which machine to launch; `configs/<name>.toml`)
+and zero or more **profiles** (provisioning — what to install; `profiles/<name>/`). `up`
+requires `--config` and takes an optional comma-separated `--profile` list (none = a bare
+instance). The config owns the instance; runtime state lives beside it in
+`configs/<name>.state.json` (gitignored). Each config uses its own filesystem (a filesystem
+backs one instance at a time), so different configs can run at once.
 
 `cloudgpu` manages the persistent filesystem for you: on the first `up` it creates one
-(named after the folder, in whichever region first has GPU capacity) and reuses it on every
-later `up`. Set `filesystem` in `cloudgpu.toml` to name it yourself or reuse an existing one.
+(named after the config, in whichever region first has GPU capacity) and reuses it on every
+later `up`. Set `filesystem` in the config to name it yourself or reuse an existing one.
 
 Apps can run as **systemd services** on the instance. ComfyUI does: it binds `127.0.0.1:8188`,
-auto-starts on boot, and restarts on crash — no need to launch it by hand. `cloudgpu forward`
-opens a tunnel to each of the profile's app ports; `cloudgpu status` shows whether services
-are active. Access a terminal with `cloudgpu ssh`.
+auto-starts on boot, and restarts on crash — no need to launch it by hand. `cloudgpu forward
+-C <config>` opens a tunnel to each provisioned app's port; `cloudgpu status -C <config>` shows
+whether services are active. Access a terminal with `cloudgpu ssh -C <config>`.
 
 ### Provisioning (extra setup, e.g. model downloads)
 
 Apps that need extra setup drop a `provision.py` (and helpers like `comfylib.py`) into the
-profile folder at `cloudgpu init` time. On every `up`, the **whole folder** is rsynced to the
-instance (excluding `cloudgpu.state.json`, `secrets.env`, and VCS/cache files) and
+profile folder at `cloudgpu init` time. On every `up` (and on `cloudgpu provision`), the
+**whole profile folder** is rsynced to the instance — into its own
+`cloudgpu/provision/<profile>` dir, excluding state, `secrets.env`, and VCS/cache files — and
 `provision.py` (or `provision.sh`) runs from inside it. Use it to download models, install
 custom nodes, etc. — make it **idempotent** (download a model only if missing; `comfylib`
-does this for you) and write data **under the filesystem**
-so it persists across terminations. A profile with no provision script just skips this step.
+does this for you) and write data **under the filesystem** so it persists across
+terminations. A profile with no provision script just skips this step.
 
 ```
-my-comfy/
-├── cloudgpu.toml         # the machine definition
+profiles/my-comfy/
+├── cloudgpu.toml         # provisioning: apps + provision_timeout
 ├── provision.py          # entry point (or provision.sh); runs every `up`
-├── comfylib.py           # reusable helpers, vendored by `init`
-└── cloudgpu.state.json   # tool-written state (gitignored, never rsynced)
+└── comfylib.py           # reusable helpers, vendored by `init`
+configs/my-box.toml       # hardware: gpu, ssh_key, filesystem, auto_terminate
+configs/my-box.state.json # tool-written state (gitignored, never rsynced)
 ```
 
 The entry point runs with the folder as CWD and these env vars (plus `cloudgpu/bin` on
 `PATH`): `CLOUDGPU_PROVISION_DIR` (where the files landed), `CLOUDGPU_PERSISTENT_DIR`,
 `CLOUDGPU_APPS_DIR`, `CLOUDGPU_VENVS_DIR`, `CLOUDGPU_BIN_DIR`. Raise the time budget with
-`provision_timeout = 7200` (seconds) in `cloudgpu.toml`.
+`provision_timeout = 7200` (seconds) in the profile's `cloudgpu.toml`.
 
 Example `provision.py` using `comfylib` — fetch SDXL and (optionally) a Civitai model:
 
@@ -137,23 +144,29 @@ disarms on the next `up`. The API key is transferred as file content (never on a
 command line) and stored root-only on the instance's ephemeral disk, not the shared
 filesystem.
 
-A second profile is just another folder (with its own filesystem); it runs concurrently:
+A second machine is just another config (with its own filesystem); it runs concurrently:
 
 ```bash
-mkdir ~/sd && cd ~/sd && cloudgpu init --ssh-key my-key --gpu a10 --apps comfyui
-cloudgpu up
+cloudgpu init --config sd-box --ssh-key my-key --gpu a10
+cloudgpu up --config sd-box --profile my-comfy
 ```
 
-`cloudgpu.toml` looks like:
+A **config** (`configs/<name>.toml`) is the hardware:
 
 ```toml
 gpu = ["gh200", "a100"]       # GPU preference order (alias or full type name)
-apps = ["comfyui"]            # apps to keep installed
 ssh_key = "my-key"            # required: Lambda SSH key name (matching key in ~/.ssh)
-# filesystem = "my-comfy"     # optional; defaults to the folder name, auto-created on first up
+# filesystem = "my-box"       # optional; defaults to the config name, auto-created on first up
 poll_seconds = 20             # capacity poll interval
 max_hours = 12                # give up after this long
 # auto_terminate_hours = 8    # optional billing cap: self-terminate this long after the last 'up'
+```
+
+A **profile** (`profiles/<name>/cloudgpu.toml`) is the provisioning:
+
+```toml
+apps = ["comfyui"]            # apps to install on the instance
+provision_timeout = 3600      # seconds; cap on the provision script
 ```
 
 ## Manual workflow (low-level)
@@ -183,21 +196,24 @@ After `setup`, the host is saved locally so subsequent commands can omit it.
 
 ## Commands
 
-Profile commands (`up`, `down`, `install`, `recover`, `status`, `ssh`, `forward`) act on the
-`cloudgpu.toml` in the current directory; pass `--profile <dir>` to target another folder, or
-(for the manual flow) an explicit host.
+Instance commands (`up`, `provision`, `down`, `install`, `recover`, `status`, `ssh`,
+`forward`, `autoterminate`) act on a **config** via `-C/--config <name>` (resolved under
+`./configs/`); the manual flow accepts an explicit host instead.
 
 | Command | Description |
 |---|---|
-| `cloudgpu init [dir] --ssh-key <key> [--gpu gh200,a100] [--apps comfyui] [--filesystem <fs>]` | Scaffold a profile folder (cloudgpu.toml + .gitignore); each `--app` also vendors its files (comfyui → comfylib.py + provision.py). No `--apps` = bare machine |
-| `cloudgpu up [-P dir]` | Converge the profile's machine: find the GPU, create the filesystem if needed, launch, set up, install/recover apps, provision. Idempotent — re-run to recover after a termination |
-| `cloudgpu down [-P dir] [--delete-filesystem] [-y]` | Terminate the profile's instance (data kept); `--delete-filesystem` also deletes the filesystem and its data |
+| `cloudgpu init --config <name> --ssh-key <key> [--gpu gh200,a100] [--filesystem <fs>]` | Scaffold a hardware config (`configs/<name>.toml`) |
+| `cloudgpu init <name> [--apps comfyui]` | Scaffold a provisioning profile (`profiles/<name>/`); each `--app` also vendors its files (comfyui → comfylib.py + provision.py) |
+| `cloudgpu up -C <config> [-P a,b]` | Launch/recover the config's machine, then provision the profile(s). `-P` is optional and comma-separated (none = bare instance). Idempotent — re-run to recover after a termination |
+| `cloudgpu provision -C <config> -P a,b` | Provision profile(s) onto the config's already-running instance (add a profile, or re-run provisioning) |
+| `cloudgpu down -C <config> [--delete-filesystem] [-y]` | Terminate the config's instance (data kept); `--delete-filesystem` also deletes the filesystem and its data |
+| `cloudgpu autoterminate [HOURS] [--off] -C <config>` | Reset the billing cap without a full `up` (e.g. extend mid-training) |
 | `cloudgpu setup <host> [--filesystem <name>]` | Test SSH, detect persistent dir, sync tool, save config (manual flow); `--filesystem` picks the mount when the instance has several |
-| `cloudgpu install [host] [-P dir] [--app comfyui]` | Install an app (interactive selection if no `--app`) |
-| `cloudgpu recover [host] [-P dir]` | Restore everything on a new instance |
-| `cloudgpu status [host] [-P dir]` | Show installed apps and their health |
-| `cloudgpu ssh [-H host] [-P dir] [-- command]` | SSH wrapper with launch scripts on PATH |
-| `cloudgpu forward [-P dir] [-p port] [--run [cmd]]` | Tunnel the profile's app port(s) to localhost (e.g. 8188 for ComfyUI); `-p` forwards a specific port; `--run` runs a command over the tunnel |
+| `cloudgpu install [host] [-C config] [--app comfyui]` | Install an app (interactive selection if no `--app`) |
+| `cloudgpu recover [host] [-C config]` | Restore everything on a new instance |
+| `cloudgpu status [host] [-C config]` | Show installed apps and their health |
+| `cloudgpu ssh [-H host] [-C config] [-- command]` | SSH wrapper with launch scripts on PATH |
+| `cloudgpu forward [-C config] [-p port] [--run [cmd]]` | Tunnel the config's app port(s) to localhost (e.g. 8188 for ComfyUI); `-p` forwards a specific port; `--run` runs a command over the tunnel |
 | `cloudgpu lambda ...` | Manage Lambda Cloud resources via the API (see below) |
 
 ## Lambda Cloud API

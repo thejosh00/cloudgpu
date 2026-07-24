@@ -1,4 +1,10 @@
-"""Click CLI: init, up, down, setup, install, recover, status, ssh, forward, autoterminate."""
+"""Click CLI: init, up, provision, down, setup, install, recover, status, ssh, forward, autoterminate.
+
+A run is composed of a *config* (hardware — which machine to launch; ``configs/<name>.toml``,
+loaded via ``cloudgpu.local.configs``) and zero or more *profiles* (provisioning — what to
+install; ``profiles/<name>/``, loaded via ``cloudgpu.local.profiles``). The config owns the
+instance and its state; profiles are provisioned onto it.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from cloudgpu.local import apps, config, display, lambda_api, orchestration, profiles, ssh, sync
+from cloudgpu.local import apps, config, configs, display, lambda_api, orchestration, profiles, ssh, sync
 
 console = Console()
 
@@ -41,31 +47,25 @@ def _remote_run(host: str, persistent_dir: str, command: str, extra_args: list[s
     return result.stdout
 
 
-def _resolve_target(host: str | None = None, profile_dir: str | None = None) -> tuple[str, str]:
+def _resolve_target(host: str | None = None, config_name: str | None = None) -> tuple[str, str]:
     """Resolve the (host, persistent_dir) to operate on.
 
     Precedence:
       1. An explicit ``host`` argument/flag (persistent_dir from config.json).
-      2. A profile directory (``--profile``, else the current dir if it has a
-         cloudgpu.toml) — uses its cloudgpu.state.json.
+      2. A config (``--config``) — uses its configs/<name>.state.json.
       3. The global single-host config saved by ``cloudgpu setup``.
     """
-    if not host:
-        d = None
-        if profile_dir:
-            try:
-                d = profiles.find_profile_dir(profile_dir)
-            except config.ConfigError as e:
-                raise click.UsageError(str(e)) from e
-        elif profiles.has_profile(Path.cwd()):
-            d = Path.cwd()
-        if d is not None:
-            state = profiles.load_state(d)
-            if state.get("host") and state.get("persistent_dir"):
-                return state["host"], state["persistent_dir"]
-            raise click.UsageError(
-                f"Profile at '{d}' has no running instance yet. Run 'cloudgpu up' first."
-            )
+    if not host and config_name:
+        try:
+            configs.find_config(config_name)  # validate it exists
+        except config.ConfigError as e:
+            raise click.UsageError(str(e)) from e
+        state = configs.load_state(config_name)
+        if state.get("host") and state.get("persistent_dir"):
+            return state["host"], state["persistent_dir"]
+        raise click.UsageError(
+            f"Config '{config_name}' has no running instance yet. Run 'cloudgpu up --config {config_name}' first."
+        )
     try:
         host = config.get_host(host)
         persistent_dir = config.get_persistent_dir()
@@ -211,10 +211,10 @@ def setup(host: str, filesystem: str | None) -> None:
 @cli.command()
 @click.argument("host", required=False)
 @click.option("--app", type=click.Choice(AVAILABLE_APPS), help="App to install")
-@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
-def install(host: str | None, app: str | None, profile: str | None) -> None:
+@click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance to act on)")
+def install(host: str | None, app: str | None, config_name: str | None) -> None:
     """Install a GPU app on the instance."""
-    host, persistent_dir = _resolve_target(host, profile)
+    host, persistent_dir = _resolve_target(host, config_name)
 
     # If no app specified, prompt interactively
     if not app:
@@ -245,10 +245,10 @@ def install(host: str | None, app: str | None, profile: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
-def recover(host: str | None, profile: str | None) -> None:
+@click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance to act on)")
+def recover(host: str | None, config_name: str | None) -> None:
     """Restore everything on a new instance from persistent storage."""
-    host, persistent_dir = _resolve_target(host, profile)
+    host, persistent_dir = _resolve_target(host, config_name)
 
     # Sync remote tool
     with console.status("Syncing remote tool..."):
@@ -275,10 +275,10 @@ def recover(host: str | None, profile: str | None) -> None:
 
 @cli.command()
 @click.argument("host", required=False)
-@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
-def status(host: str | None, profile: str | None) -> None:
+@click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance to act on)")
+def status(host: str | None, config_name: str | None) -> None:
     """Show what's installed and their health."""
-    host, persistent_dir = _resolve_target(host, profile)
+    host, persistent_dir = _resolve_target(host, config_name)
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
@@ -293,17 +293,17 @@ def status(host: str | None, profile: str | None) -> None:
 
 @cli.command(name="ssh", context_settings={"ignore_unknown_options": True})
 @click.option("--host", "-H", default=None, help="SSH host (uses saved host if omitted)")
-@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
+@click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance to act on)")
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
-def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> None:
+def ssh_cmd(host: str | None, config_name: str | None, command: tuple[str, ...]) -> None:
     """Open SSH to instance, optionally running a command.
 
     Examples:
-        cloudgpu ssh
-        cloudgpu ssh -- comfyui
+        cloudgpu ssh -C qwen-image
+        cloudgpu ssh -C qwen-image -- comfyui
         cloudgpu ssh -H my-host -- nvidia-smi
     """
-    host, persistent_dir = _resolve_target(host, profile)
+    host, persistent_dir = _resolve_target(host, config_name)
 
     cmd = None
     if command:
@@ -315,45 +315,57 @@ def ssh_cmd(host: str | None, profile: str | None, command: tuple[str, ...]) -> 
     sys.exit(exit_code)
 
 
-def _profile_ports(profile_dir: str | None) -> list[int]:
-    """Ports to forward for the profile's apps (deduped, in order)."""
-    try:
-        profile = profiles.load_profile(profiles.find_profile_dir(profile_dir))
-    except config.ConfigError:
+def _apps_for_config(config_name: str | None) -> list[str]:
+    """Union of apps across the profiles provisioned onto this config's instance."""
+    if not config_name:
         return []
-    return apps.app_ports(profile.get("apps", []))
+    state = configs.load_state(config_name)
+    result: list[str] = []
+    for pname in state.get("provisioned_profiles", []):
+        try:
+            for a in profiles.load_profile(pname).get("apps", []):
+                if a not in result:
+                    result.append(a)
+        except config.ConfigError:
+            continue
+    return result
+
+
+def _config_ports(config_name: str | None) -> list[int]:
+    """Ports to forward for the config's provisioned apps (deduped, in order)."""
+    return apps.app_ports(_apps_for_config(config_name))
 
 
 @cli.command(name="forward")
-@click.option("--host", "-H", default=None, help="SSH host (bypasses the profile; requires --port)")
-@click.option("--port", "-p", "port", default=None, type=int, help="Forward a specific remote port (default: the profile's app ports)")
+@click.option("--host", "-H", default=None, help="SSH host (bypasses the config; requires --port)")
+@click.option("--port", "-p", "port", default=None, type=int, help="Forward a specific remote port (default: the config's app ports)")
 @click.option("--local-port", "local_port", default=None, type=int, help="Local port (single-port mode; defaults to --port)")
 @click.option(
     "--run", "run_cmd", default=None,
     help="Run a command on the instance over the tunnel (single port). Tunnel lives as "
          "long as the command; Ctrl-C stops both.",
 )
-@click.option("--profile", "-P", "profile", default=None, help="Profile directory (default: current dir)")
-def forward(host: str | None, port: int | None, local_port: int | None, run_cmd: str | None, profile: str | None) -> None:
-    """Forward the profile's app port(s) to localhost over SSH.
+@click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance + app ports)")
+def forward(host: str | None, port: int | None, local_port: int | None, run_cmd: str | None, config_name: str | None) -> None:
+    """Forward the config's app port(s) to localhost over SSH.
 
-    With no --port, the ports come from the profile's apps (services run on the instance,
-    so just `cloudgpu forward` then open the URL). Use --port for an explicit port, or
-    --run to start a command over the tunnel.
+    With no --port, the ports come from the apps provisioned onto the config's instance
+    (services run on the instance, so just `cloudgpu forward -C <config>` then open the
+    URL). Use --port for an explicit port, or --run to start a command over the tunnel.
 
     Examples:
-        cloudgpu forward                    # forward the profile's app ports
-        cloudgpu forward -p 8888            # forward a specific port
-        cloudgpu forward --run nvidia-smi   # run a command over the tunnel
+        cloudgpu forward -C qwen-image      # forward the config's app ports
+        cloudgpu forward -C qwen-image -p 8888
+        cloudgpu forward -C qwen-image --run nvidia-smi
     """
-    host, persistent_dir = _resolve_target(host, profile)
+    host, persistent_dir = _resolve_target(host, config_name)
 
     # Single-port mode: explicit --port, or --run (a command needs one port).
     if port is not None or run_cmd:
         if port is None:
-            derived = _profile_ports(profile)
+            derived = _config_ports(config_name)
             if not derived:
-                raise click.UsageError("Pass --port <n> (no app port to infer from this profile).")
+                raise click.UsageError("Pass --port <n> (no app port to infer from this config).")
             port = derived[0]
         local_port = local_port or port
         spec = f"{local_port}:localhost:{port}"
@@ -366,12 +378,12 @@ def forward(host: str | None, port: int | None, local_port: int | None, run_cmd:
         display.info("Holding the tunnel; press Ctrl-C to close it.")
         sys.exit(ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"]))
 
-    # Profile mode: forward every app port in one tunnel.
-    ports = _profile_ports(profile)
+    # Config mode: forward every app port in one tunnel.
+    ports = _config_ports(config_name)
     if not ports:
         raise click.UsageError(
-            "No app ports to forward for this profile. Pass --port <n>, or add an app "
-            f"with a known port ({', '.join(AVAILABLE_APPS)}) to cloudgpu.toml."
+            "No app ports to forward for this config. Pass --port <n>, or provision a "
+            f"profile with a known-port app ({', '.join(AVAILABLE_APPS)}) via 'cloudgpu up'."
         )
     ssh_args: list[str] = []
     for p in ports:
@@ -474,9 +486,10 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
     else:
         return False  # no provisioning in this profile
 
-    display.info("Provisioning...")
+    display.info(f"Provisioning '{profile['name']}'...")
     bin_dir = f"{persistent_dir}/cloudgpu/bin"
-    remote_dir = f"{persistent_dir}/cloudgpu/provision"
+    # Per-profile remote dir so multiple profiles on one instance don't collide.
+    remote_dir = f"{persistent_dir}/cloudgpu/provision/{profile['name']}"
     sync.copy_dir(str(pdir), host, remote_dir, exclude=profiles.PROVISION_EXCLUDES)
 
     # Secrets (e.g. CIVITAI_TOKEN): transfer the file as content (never on the command
@@ -509,8 +522,8 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
     return True
 
 
-def _configure_auto_terminate(profile: dict, host: str, instance_id: str | None, persistent_dir: str) -> int | None:
-    """Converge the instance's self-terminate timer to the profile's auto_terminate_hours.
+def _configure_auto_terminate(cfg: dict, host: str, instance_id: str | None, persistent_dir: str) -> int | None:
+    """Converge the instance's self-terminate timer to the config's auto_terminate_hours.
 
     With hours > 0 the instance gets a root-only systemd timer that terminates it via
     the Lambda API once the deadline passes — a billing cap that holds even if this
@@ -519,7 +532,7 @@ def _configure_auto_terminate(profile: dict, host: str, instance_id: str | None,
     epoch when armed, else None. A failure fails 'up' loudly: a cap the user asked for
     must never be silently absent.
     """
-    hours = float(profile.get("auto_terminate_hours") or 0)
+    hours = float(cfg.get("auto_terminate_hours") or 0)
     try:
         if hours <= 0:
             _remote_run(host, persistent_dir, "autoterminate", ["--hours 0"])
@@ -570,26 +583,28 @@ def _restart_services(host: str, app_list: list[str]) -> None:
         display.warn(f"Could not restart services (exit {result.returncode}); they may still be starting.")
 
 
-def _report_up(name: str, profile: dict, runtime: dict, persistent_dir: str) -> None:
+def _report_up(config_name: str, runtime: dict, persistent_dir: str, app_list: list[str]) -> None:
     """Print final status + how to reach the machine + billing reminder."""
     output = _remote_run(runtime["host"], persistent_dir, "status")
     data = json.loads(output)
     display.show_detection(data.get("detection", {}))
     display.show_status(data.get("apps", {}))
 
-    display.success(f"Profile '{name}' is up.")
+    provisioned = runtime.get("provisioned_profiles") or []
+    prof_note = f" (profiles: {', '.join(provisioned)})" if provisioned else ""
+    display.success(f"Config '{config_name}' is up{prof_note}.")
     display.info(
         f"  GPU: {runtime.get('instance_type') or '?'}   Region: {runtime.get('region') or '?'}"
         f"   IP: {runtime.get('ip') or '?'}   Price: {display.price(runtime.get('price_cents_per_hour'))}"
     )
     display.info(f"  Instance: {runtime.get('instance_id') or '?'}   Filesystem: {runtime.get('filesystem')}")
-    ports = apps.app_ports(profile.get("apps", []))
+    ports = apps.app_ports(app_list)
     if ports:
-        display.info("Apps run as services on the instance. Reach them:  cloudgpu forward")
+        display.info(f"Apps run as services on the instance. Reach them:  cloudgpu forward -C {config_name}")
         for p in ports:
             display.info(f"  http://localhost:{p}")
     else:
-        display.info("Bare machine (no apps). SSH in with:  cloudgpu ssh")
+        display.info(f"Bare machine (no apps). SSH in with:  cloudgpu ssh -C {config_name}")
     if runtime.get("instance_id"):
         display.warn(
             "Billing per hour while running. Tear down with 'cloudgpu down' (keeps the "
@@ -598,46 +613,88 @@ def _report_up(name: str, profile: dict, runtime: dict, persistent_dir: str) -> 
         )
         if runtime.get("auto_terminate_at"):
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(runtime["auto_terminate_at"]))
-            display.info(f"  Auto-terminate: {when} ('cloudgpu autoterminate' to reset/extend)")
+            display.info(f"  Auto-terminate: {when} ('cloudgpu autoterminate -C {config_name}' to reset/extend)")
         else:
             display.info(
-                "  Tip: set auto_terminate_hours in cloudgpu.toml to cap billing "
+                "  Tip: set auto_terminate_hours in the config to cap billing "
                 "if you forget 'cloudgpu down'."
             )
 
 
-@cli.command()
-@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
-def up(profile_dir: str | None) -> None:
-    """Converge a profile's machine to its desired state (launch/recover + apps).
+def _parse_profiles(profile_csv: str | None) -> list[dict]:
+    """Load each profile in a comma-separated list; UsageError on any bad name."""
+    names = [p.strip() for p in (profile_csv or "").split(",") if p.strip()]
+    loaded = []
+    for n in names:
+        try:
+            loaded.append(profiles.load_profile(n))
+        except config.ConfigError as e:
+            raise click.UsageError(str(e)) from e
+    return loaded
 
-    Run from inside a profile folder (one with a cloudgpu.toml). Idempotent: reuses a
-    running instance if one exists, otherwise polls for GPU capacity, launches
-    (auto-creating the filesystem if needed), sets up, ensures the profile's apps are
-    installed, and runs provisioning. Re-run after a termination to recover.
+
+def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir: str,
+                        profile_list: list[dict]) -> list[str]:
+    """Ensure apps + run provisioning for each profile, record them in state.
+
+    Returns the union of the profiles' apps (for reporting / port forwarding). The union
+    is installed once (so `recover` runs a single time), then each profile's payload is
+    provisioned into its own remote dir. Profile names are merged into
+    state['provisioned_profiles'].
+    """
+    app_union: list[str] = []
+    for prof in profile_list:
+        for a in prof.get("apps", []):
+            if a not in app_union:
+                app_union.append(a)
+
+    _ensure_apps(host, persistent_dir, app_union)
+    for prof in profile_list:
+        _run_provision(prof, host, persistent_dir)
+    _restart_services(host, app_union)
+
+    provisioned = list(state.get("provisioned_profiles") or [])
+    for prof in profile_list:
+        if prof["name"] not in provisioned:
+            provisioned.append(prof["name"])
+    state["provisioned_profiles"] = provisioned
+    configs.save_state(config_name, state)
+    return app_union
+
+
+@cli.command()
+@click.option("--config", "-C", "config_name", required=True, help="Config name (hardware: configs/<name>.toml)")
+@click.option("--profile", "-P", "profile_csv", default=None, help="Profile(s) to provision (comma-separated; optional)")
+def up(config_name: str, profile_csv: str | None) -> None:
+    """Launch/recover the config's machine, then provision the given profile(s).
+
+    The config (hardware) is required; profiles (provisioning) are optional and
+    comma-separated — with none you get a bare instance. Idempotent: reuses a running
+    instance if one exists, otherwise polls for GPU capacity, launches (auto-creating the
+    filesystem if needed), sets up, and provisions. Re-run after a termination to recover.
     """
     try:
-        d = profiles.find_profile_dir(profile_dir)
-        profile = profiles.load_profile(d)
+        cfg = configs.load_config(config_name)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
+    profile_list = _parse_profiles(profile_csv)
 
-    name = profile["name"]
-    filesystem = profile["filesystem"]
+    filesystem = cfg["filesystem"]
 
-    # Reuse a live instance if we already track one for this profile.
-    state = profiles.load_state(d)
+    # Reuse a live instance if we already track one for this config.
+    state = configs.load_state(config_name)
     inst = _live_instance(state.get("instance_id"))
     if inst:
         display.info(f"Reusing running instance {state['instance_id']} ({inst.get('ip')}).")
         state["host"] = f"ubuntu@{inst.get('ip')}"
         state["ip"] = inst.get("ip")
     else:
+        provisioned = state.get("provisioned_profiles")
         if state.get("instance_id"):
             display.info("Tracked instance is gone; reconciling...")
-            profiles.clear_state(d)
+            configs.clear_state(config_name)
         # Adopt an instance already mounting this filesystem (recovery / lost state).
-        # The filesystem is the profile's identity, so it's ours.
+        # The filesystem is the config's identity, so it's ours.
         existing = _instance_mounting(filesystem)
         if existing and existing.get("ip"):
             display.info(
@@ -645,88 +702,124 @@ def up(profile_dir: str | None) -> None:
                 f"already mounting '{filesystem}'."
             )
             state = _runtime_from_instance(existing, filesystem)
-            profiles.save_state(d, state)
         else:
             try:
-                state = orchestration.acquire_instance(profile)
+                state = orchestration.acquire_instance(cfg)
             except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:
                 display.error(str(e))
                 sys.exit(1)
-            profiles.save_state(d, state)
             if state.get("created_filesystem"):
                 display.success(f"Created filesystem '{filesystem}' in {state['region']}.")
             display.success(
                 f"Launched {state['instance_type']} in {state['region']} at {state['ip']} "
                 f"({display.price(state.get('price_cents_per_hour'))})."
             )
+        # Carry forward the set of profiles provisioned onto this filesystem.
+        if provisioned:
+            state["provisioned_profiles"] = provisioned
+        configs.save_state(config_name, state)
 
-    # Set up the host (SSH, detect, sync) and persist where it landed. The profile's
+    # Set up the host (SSH, detect, sync) and persist where it landed. The config's
     # filesystem must back the persistent dir — never whatever else happens to be mounted.
     persistent_dir, _ = _setup_host(state["host"], filesystem)
     state["persistent_dir"] = persistent_dir
-    profiles.save_state(d, state)
+    configs.save_state(config_name, state)
 
     # Arm the billing cap before the slow steps, so it holds even if install/provision hang.
-    deadline = _configure_auto_terminate(profile, state["host"], state.get("instance_id"), persistent_dir)
+    deadline = _configure_auto_terminate(cfg, state["host"], state.get("instance_id"), persistent_dir)
     if deadline is not None:
         state["auto_terminate_at"] = deadline
     else:
         state.pop("auto_terminate_at", None)
-    profiles.save_state(d, state)
+    configs.save_state(config_name, state)
 
-    # Ensure the profile's apps are present, run provisioning, then report.
-    _ensure_apps(state["host"], persistent_dir, profile.get("apps", []))
-    if _run_provision(profile, state["host"], persistent_dir):
-        # Restart services so provisioning changes (e.g. custom nodes) take effect.
-        _restart_services(state["host"], profile.get("apps", []))
-    _report_up(name, profile, state, persistent_dir)
+    # Provision the requested profiles (if any), then report.
+    if profile_list:
+        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list)
+    app_list = _apps_for_config(config_name)
+    _report_up(config_name, state, persistent_dir, app_list)
+
+
+@cli.command()
+@click.option("--config", "-C", "config_name", required=True, help="Config name (the running instance to provision)")
+@click.option("--profile", "-P", "profile_csv", required=True, help="Profile(s) to provision (comma-separated)")
+def provision(config_name: str, profile_csv: str) -> None:
+    """Provision profile(s) onto a config's already-running instance.
+
+    Installs each profile's apps (recovering existing ones first) and runs its
+    provisioning payload, without relaunching the machine. Use this to add a profile to
+    a box that's already up, or to re-run a profile's provisioning.
+    """
+    try:
+        configs.load_config(config_name)  # validate the config exists
+    except config.ConfigError as e:
+        raise click.UsageError(str(e)) from e
+    profile_list = _parse_profiles(profile_csv)
+    if not profile_list:
+        raise click.UsageError("Pass at least one profile with --profile.")
+
+    state = configs.load_state(config_name)
+    host, persistent_dir = state.get("host"), state.get("persistent_dir")
+    if not host or not persistent_dir:
+        raise click.UsageError(
+            f"Config '{config_name}' has no running instance. Run "
+            f"'cloudgpu up --config {config_name}' first."
+        )
+
+    with console.status("Syncing remote tool..."):
+        sync.sync_remote(host, persistent_dir)
+    app_list = _provision_profiles(config_name, state, host, persistent_dir, profile_list)
+    names = ", ".join(p["name"] for p in profile_list)
+    display.success(f"Provisioned {names} onto '{config_name}'.")
+    ports = apps.app_ports(app_list)
+    for p in ports:
+        display.info(f"  http://localhost:{p}   (cloudgpu forward -C {config_name})")
 
 
 @cli.command()
 @click.argument("hours", required=False, default=None, type=float)
 @click.option("--off", is_flag=True, help="Disarm the timer entirely")
-@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
-def autoterminate(hours: float | None, off: bool, profile_dir: str | None) -> None:
+@click.option("--config", "-C", "config_name", required=True, help="Config name (the running instance to re-arm)")
+def autoterminate(hours: float | None, off: bool, config_name: str) -> None:
     """Reset the instance's auto-terminate timer without a full 'up'.
 
-    With no HOURS, re-arms to the profile's auto_terminate_hours from now — a quick
+    With no HOURS, re-arms to the config's auto_terminate_hours from now — a quick
     way to buy more time before the deadline (e.g. mid LoRA training). Pass HOURS
     to override this once, or --off to disarm the cap.
 
     \b
     Examples:
-        cloudgpu autoterminate            # reset: profile hours from now
-        cloudgpu autoterminate 6          # 6 hours from now, just this once
-        cloudgpu autoterminate --off      # disarm the cap
+        cloudgpu autoterminate -C qwen-lora        # reset: config hours from now
+        cloudgpu autoterminate 6 -C qwen-lora      # 6 hours from now, just this once
+        cloudgpu autoterminate --off -C qwen-lora  # disarm the cap
     """
     if off and hours is not None:
         raise click.UsageError("Pass either HOURS or --off, not both.")
     try:
-        d = profiles.find_profile_dir(profile_dir)
-        profile = profiles.load_profile(d)
+        cfg = configs.load_config(config_name)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
-    state = profiles.load_state(d)
+    state = configs.load_state(config_name)
     if not state.get("host") or not state.get("persistent_dir"):
-        raise click.UsageError("No tracked instance for this profile; run 'cloudgpu up' first.")
+        raise click.UsageError(f"No tracked instance for config '{config_name}'; run 'cloudgpu up' first.")
 
     if off:
         hours = 0.0
     elif hours is None:
-        hours = float(profile.get("auto_terminate_hours") or 0)
+        hours = float(cfg.get("auto_terminate_hours") or 0)
         if hours <= 0:
             raise click.UsageError(
-                "auto_terminate_hours is not set in cloudgpu.toml; pass HOURS "
+                "auto_terminate_hours is not set in the config; pass HOURS "
                 "explicitly (or --off to disarm)."
             )
 
     deadline = _configure_auto_terminate(
-        {**profile, "auto_terminate_hours": hours},
+        {**cfg, "auto_terminate_hours": hours},
         state["host"], state.get("instance_id"), state["persistent_dir"],
     )
     if deadline is not None:
         state["auto_terminate_at"] = deadline
-        profiles.save_state(d, state)
+        configs.save_state(config_name, state)
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(deadline))
         display.success(f"Auto-terminate armed: instance terminates at {when} ({hours:g}h from now).")
     elif hours > 0:
@@ -735,7 +828,7 @@ def autoterminate(hours: float | None, off: bool, profile_dir: str | None) -> No
         sys.exit(1)
     else:
         state.pop("auto_terminate_at", None)
-        profiles.save_state(d, state)
+        configs.save_state(config_name, state)
         display.success("Auto-terminate disarmed.")
 
 
@@ -765,25 +858,24 @@ def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bo
 
 
 @cli.command()
-@click.option("--profile", "-P", "profile_dir", default=None, help="Profile directory (default: current dir)")
+@click.option("--config", "-C", "config_name", required=True, help="Config name (the instance to tear down)")
 @click.option("--delete-filesystem", is_flag=True, help="Also delete the persistent filesystem (DESTROYS its data)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
-    """Terminate a profile's instance. Keeps the filesystem unless --delete-filesystem.
+def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
+    """Terminate a config's instance. Keeps the filesystem unless --delete-filesystem.
 
-    Run from inside a profile folder. Without --delete-filesystem the data persists, so
-    'cloudgpu up' brings the machine back later. With it, the instance is terminated and
-    the filesystem (and all its data) is permanently deleted.
+    Without --delete-filesystem the data persists, so 'cloudgpu up' brings the machine
+    back later. With it, the instance is terminated and the filesystem (and all its data)
+    is permanently deleted.
     """
     try:
-        d = profiles.find_profile_dir(profile_dir)
-        profile = profiles.load_profile(d)
+        cfg = configs.load_config(config_name)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
 
-    name = profile["name"]
-    filesystem = profile["filesystem"]
-    state = profiles.load_state(d)
+    name = cfg["name"]
+    filesystem = cfg["filesystem"]
+    state = configs.load_state(config_name)
 
     # Find the instance: tracked id, or whatever is mounting the filesystem.
     instance_id = state.get("instance_id")
@@ -795,13 +887,13 @@ def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
     if not yes:
         if delete_filesystem:
             click.confirm(
-                f"Terminate profile '{name}' AND permanently delete filesystem "
+                f"Terminate config '{name}' AND permanently delete filesystem "
                 f"'{filesystem}' and all its data?",
                 abort=True,
             )
         elif instance_id:
             click.confirm(
-                f"Terminate instance {instance_id} for profile '{name}'? "
+                f"Terminate instance {instance_id} for config '{name}'? "
                 f"(filesystem '{filesystem}' is kept)",
                 abort=True,
             )
@@ -810,8 +902,8 @@ def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
         _api_call(lambda_api.terminate_instances, [instance_id])
         display.success(f"Termination requested for {instance_id}.")
     else:
-        display.info("No running instance for this profile.")
-    profiles.clear_state(d)
+        display.info("No running instance for this config.")
+    configs.clear_state(config_name)
 
     if not delete_filesystem:
         return
@@ -843,43 +935,58 @@ def down(profile_dir: str | None, delete_filesystem: bool, yes: bool) -> None:
 
 
 @cli.command()
-@click.argument("directory", required=False, default=".")
-@click.option("--ssh-key", "ssh_key", required=True, help="Lambda SSH key name (a matching private key must be in ~/.ssh)")
-@click.option("--gpu", default="gh200,a100", help="GPU preference order, comma-separated (e.g. gh200,a100)")
-@click.option("--apps", "apps_csv", default="", help=f"Comma-separated apps to install (default: none). Known: {', '.join(AVAILABLE_APPS)}")
-@click.option("--filesystem", default=None, help="Persistent filesystem name (default: the folder name)")
-@click.option("--force", is_flag=True, help="Overwrite an existing cloudgpu.toml")
-def init(directory: str, ssh_key: str, gpu: str, apps_csv: str, filesystem: str | None, force: bool) -> None:
-    """Scaffold a profile in DIRECTORY (default: current dir).
+@click.argument("name")
+@click.option("--config", "as_config", is_flag=True, help="Scaffold a hardware config (configs/<name>.toml) instead of a profile")
+@click.option("--ssh-key", "ssh_key", default=None, help="[config] Lambda SSH key name (a matching private key must be in ~/.ssh)")
+@click.option("--gpu", default="gh200,a100", help="[config] GPU preference order, comma-separated (e.g. gh200,a100)")
+@click.option("--filesystem", default=None, help="[config] Persistent filesystem name (default: the config name)")
+@click.option("--apps", "apps_csv", default="", help=f"[profile] Comma-separated apps to install. Known: {', '.join(AVAILABLE_APPS)}")
+@click.option("--force", is_flag=True, help="Overwrite an existing file")
+def init(name: str, as_config: bool, ssh_key: str | None, gpu: str, filesystem: str | None,
+         apps_csv: str, force: bool) -> None:
+    """Scaffold a config (hardware) or a profile (provisioning).
 
-    Writes cloudgpu.toml + .gitignore. With --apps, also vendors each app's files (e.g.
-    comfyui drops comfylib.py + a starter provision.py). With no --apps you get a bare GPU
-    machine. Then `cd` into the folder, edit the files, and run `cloudgpu up`.
+    \b
+    Config:   cloudgpu init --config qwen-image --ssh-key mini --gpu gh200,a100
+    Profile:  cloudgpu init generate --apps comfyui
+
+    A config writes configs/<name>.toml (the machine to launch). A profile writes
+    profiles/<name>/cloudgpu.toml (+ vendored app files, e.g. comfyui's comfylib.py).
+    Then: cloudgpu up --config <config> --profile <profile>.
     """
-    gpu_list = [g.strip() for g in gpu.split(",") if g.strip()]
+    if as_config:
+        if not ssh_key:
+            raise click.UsageError("--ssh-key is required for --config.")
+        gpu_list = [g.strip() for g in gpu.split(",") if g.strip()]
+        try:
+            toml_path = configs.scaffold(
+                name, ssh_key=ssh_key, gpu=gpu_list, filesystem=filesystem, force=force,
+            )
+        except config.ConfigError as e:
+            raise click.UsageError(str(e)) from e
+        display.success(f"Initialized cloudgpu config: {toml_path}")
+        display.info(f"Next: cloudgpu up --config {name} --profile <profile>")
+        return
+
     apps_list = [a.strip() for a in apps_csv.split(",") if a.strip()]
     unknown = [a for a in apps_list if a not in AVAILABLE_APPS]
     if unknown:
         raise click.UsageError(
             f"Unknown app(s): {', '.join(unknown)}. Known: {', '.join(AVAILABLE_APPS)}"
         )
+    d = profiles.profile_dir(name)
     try:
-        toml_path = profiles.scaffold(
-            directory, ssh_key=ssh_key, gpu=gpu_list, apps=apps_list,
-            filesystem=filesystem, force=force,
-        )
+        profiles.scaffold(d, apps=apps_list, force=force)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
 
-    d = toml_path.parent
     vendored = apps.scaffold_apps(d, apps_list)
     display.success(f"Initialized cloudgpu profile in {d}")
     written = ["cloudgpu.toml", ".gitignore", *vendored]
     display.info("  " + ", ".join(written))
     if not apps_list:
-        display.info("  (bare machine — no apps; edit cloudgpu.toml to add some)")
-    cd_hint = "" if directory in (".", "") else f"cd {d} && "
-    display.info(f"Next: {cd_hint}cloudgpu up")
+        display.info("  (no apps; edit cloudgpu.toml to add some)")
+    display.info(f"Next: cloudgpu up --config <config> --profile {name}")
 
 
 def _api_call(fn, *args, **kwargs):

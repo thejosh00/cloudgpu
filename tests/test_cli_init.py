@@ -1,53 +1,63 @@
-"""Tests for `cloudgpu init` (scaffolding a profile folder)."""
+"""Tests for `cloudgpu init` (scaffolding a config or a profile)."""
 
 from __future__ import annotations
 
 from click.testing import CliRunner
 
 from cloudgpu import cli
-from cloudgpu.local import profiles
+from cloudgpu.local import configs, profiles
 
 
-def test_init_bare_no_apps(tmp_path):
+# --- profile scaffolding (default) ---------------------------------------------
+
+def test_init_profile_no_apps(tmp_path):
     d = tmp_path / "bare"
-    r = CliRunner().invoke(cli.init, [str(d), "--ssh-key", "mini"])
+    r = CliRunner().invoke(cli.init, [str(d)])
     assert r.exit_code == 0, r.output
     assert (d / "cloudgpu.toml").exists()
     assert (d / ".gitignore").exists()
-    # bare machine: no app-specific files
+    # no app-specific files
     assert not (d / "comfylib.py").exists()
     assert not (d / "provision.py").exists()
     assert profiles.load_profile(d)["apps"] == []
 
 
-def test_init_with_comfyui_vendors_files(tmp_path):
-    d = tmp_path / "newprof"
-    r = CliRunner().invoke(
-        cli.init, [str(d), "--ssh-key", "mini", "--gpu", "gh200,a100", "--apps", "comfyui"]
-    )
+def test_init_profile_with_comfyui_vendors_files(tmp_path):
+    d = tmp_path / "generate"
+    r = CliRunner().invoke(cli.init, [str(d), "--apps", "comfyui"])
     assert r.exit_code == 0, r.output
     assert (d / "cloudgpu.toml").exists()
     assert (d / "comfylib.py").exists()
     assert (d / "provision.py").exists()
-    p = profiles.load_profile(d)
-    assert p["gpu"] == ["gh200", "a100"] and p["apps"] == ["comfyui"]
+    assert profiles.load_profile(d)["apps"] == ["comfyui"]
 
 
-def test_init_unknown_app_errors(tmp_path):
-    r = CliRunner().invoke(cli.init, [str(tmp_path / "x"), "--ssh-key", "mini", "--apps", "nope"])
+def test_init_profile_unknown_app_errors(tmp_path):
+    r = CliRunner().invoke(cli.init, [str(tmp_path / "x"), "--apps", "nope"])
     assert r.exit_code != 0
     assert "Unknown app" in r.output
 
 
-def test_init_requires_ssh_key(tmp_path):
-    r = CliRunner().invoke(cli.init, [str(tmp_path / "x")])
-    assert r.exit_code != 0
-    assert "ssh-key" in r.output.lower()
-
-
-def test_init_refuses_existing(tmp_path):
+def test_init_profile_refuses_existing(tmp_path):
     d = tmp_path / "x"
-    CliRunner().invoke(cli.init, [str(d), "--ssh-key", "mini"])
-    r = CliRunner().invoke(cli.init, [str(d), "--ssh-key", "mini"])
+    CliRunner().invoke(cli.init, [str(d)])
+    r = CliRunner().invoke(cli.init, [str(d)])
     assert r.exit_code != 0
     assert "already exists" in r.output
+
+
+# --- config scaffolding (--config) ---------------------------------------------
+
+def test_init_config_writes_toml(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(cli.init, ["--config", "qwen-image", "--ssh-key", "mini", "--gpu", "gh200,a100"])
+    assert r.exit_code == 0, r.output
+    c = configs.load_config("qwen-image")
+    assert c["gpu"] == ["gh200", "a100"] and c["ssh_key"] == "mini"
+
+
+def test_init_config_requires_ssh_key(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(cli.init, ["--config", "c"])
+    assert r.exit_code != 0
+    assert "ssh-key" in r.output.lower()

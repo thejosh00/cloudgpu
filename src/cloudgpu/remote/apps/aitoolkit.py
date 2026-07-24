@@ -288,12 +288,39 @@ class AIToolkitInstaller(AppInstaller):
         }
         log("Installing UI dependencies (npm install)...")
         run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        self._ensure_sqlite3(npm, env)
         log("Setting up UI database (prisma)...")
         run([npm, "run", "update_db"], cwd=self.ui_dir, env=env, timeout=600)
         log("Building UI (next build)...")
         # next build can exhaust the default Node heap
         build_env = {**env, "NODE_OPTIONS": "--max-old-space-size=4096"}
         run([npm, "run", "build"], cwd=self.ui_dir, env=build_env, timeout=1800)
+
+    def _sqlite3_loads(self, env: dict) -> bool:
+        node = os.path.join(self.node_bin, "node")
+        result = run([node, "-e", "require('sqlite3')"], cwd=self.ui_dir,
+                     env=env, check=False, capture=True, timeout=120)
+        return result.returncode == 0
+
+    def _ensure_sqlite3(self, npm: str, env: dict) -> None:
+        """Rebuild sqlite3 from source when its prebuilt binary won't load.
+
+        sqlite3 6.x ships napi prebuilds linked against glibc 2.38, but Lambda
+        instances run Ubuntu 22.04 (glibc 2.35), so 'next build' dies with
+        ERR_DLOPEN_FAILED while collecting page data. Compiling locally against
+        the system glibc fixes it (needs g++/make, present on the image).
+        """
+        if self._sqlite3_loads(env):
+            return
+        log("sqlite3 prebuilt binary is incompatible with this system's glibc; "
+            "rebuilding from source...", "warn")
+        run([npm, "rebuild", "sqlite3", "--build-from-source"],
+            cwd=self.ui_dir,
+            env={**env, "npm_config_build_from_source": "true"},
+            timeout=1800)
+        if not self._sqlite3_loads(env):
+            raise RuntimeError("sqlite3 still fails to load after a source rebuild")
+        log("sqlite3 rebuilt from source")
 
     def _ui_built(self) -> bool:
         return (os.path.isdir(os.path.join(self.ui_dir, ".next"))

@@ -146,5 +146,37 @@ class TestAIToolkitInstaller:
 
         mock_build.assert_not_called()
 
+    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    def test_ensure_sqlite3_skips_rebuild_when_loadable(self, mock_run, installer):
+        mock_run.return_value = MagicMock(returncode=0)
+
+        installer._ensure_sqlite3("npm", {"PATH": "/bin"})
+
+        # Only the probe ran, no rebuild
+        assert mock_run.call_count == 1
+        assert "-e" in mock_run.call_args[0][0]
+
+    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    def test_ensure_sqlite3_rebuilds_from_source(self, mock_run, installer):
+        """glibc-incompatible prebuild is recompiled locally, then re-probed."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1),  # probe fails
+            MagicMock(returncode=0),  # npm rebuild
+            MagicMock(returncode=0),  # probe passes
+        ]
+
+        installer._ensure_sqlite3("npm", {"PATH": "/bin"})
+
+        rebuild = mock_run.call_args_list[1]
+        assert rebuild[0][0] == ["npm", "rebuild", "sqlite3", "--build-from-source"]
+        assert rebuild[1]["env"]["npm_config_build_from_source"] == "true"
+
+    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    def test_ensure_sqlite3_raises_if_still_broken(self, mock_run, installer):
+        mock_run.return_value = MagicMock(returncode=1)
+
+        with pytest.raises(RuntimeError, match="sqlite3"):
+            installer._ensure_sqlite3("npm", {"PATH": "/bin"})
+
     def test_verify_not_installed(self, installer):
         assert installer.verify() is False
