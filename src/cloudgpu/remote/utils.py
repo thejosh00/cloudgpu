@@ -123,12 +123,18 @@ def detect_cuda_version() -> str | None:
     return "cu124"
 
 
+def torch_index_url() -> str | None:
+    """PyTorch wheel index for the system CUDA, or None if undetectable."""
+    cuda_tag = detect_cuda_version()
+    return f"https://download.pytorch.org/whl/{cuda_tag}" if cuda_tag else None
+
+
 def pip_install_torch(venv_dir: str, timeout: int = 600) -> None:
     """Install PyTorch with CUDA support into a venv."""
-    cuda_tag = detect_cuda_version()
-    if cuda_tag:
-        log(f"Detected CUDA: {cuda_tag}, installing PyTorch from CUDA index...")
-        index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+    index_url = torch_index_url()
+    if index_url:
+        log(f"Detected CUDA: {index_url.rsplit('/', 1)[1]}, "
+            f"installing PyTorch from CUDA index...")
         pip_install(
             venv_dir,
             "--force-reinstall",

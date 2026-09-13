@@ -1,4 +1,9 @@
-# CloudGPU
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark-488.png">
+    <img src="assets/logo-488.png" alt="CloudGPU" width="360">
+  </picture>
+</p>
 
 Declaratively manage GPU machines on Lambda Cloud. Describe the machine you want in a profile — GPU preference order, a persistent filesystem, and optionally some apps — and `cloudgpu up` finds capacity, launches it, sets it up, and installs (or recovers) your apps. Because data lives on the persistent filesystem, a terminated instance is routine: re-run `cloudgpu up` and everything comes back on a fresh GPU.
 

@@ -50,6 +50,22 @@ class TestLoadProfile:
         assert p["apps"] == ["comfyui", "ai-toolkit"]
         assert p["provision_timeout"] == 9000
 
+    def test_ports_default_empty(self, tmp_path):
+        assert profiles.load_profile(_write_toml(tmp_path / "p", ""))["ports"] == []
+
+    def test_ports_parsed(self, tmp_path):
+        d = _write_toml(tmp_path / "p", "apps = []\nports = [8080, 3000]\n")
+        assert profiles.load_profile(d)["ports"] == [8080, 3000]
+
+    def test_ports_int_coerced(self, tmp_path):
+        d = _write_toml(tmp_path / "p", "apps = []\nports = 8080\n")
+        assert profiles.load_profile(d)["ports"] == [8080]
+
+    def test_ports_must_be_numbers(self, tmp_path):
+        d = _write_toml(tmp_path / "p", 'apps = []\nports = ["8080"]\n')
+        with pytest.raises(config.ConfigError, match="ports"):
+            profiles.load_profile(d)
+
     def test_apps_string_coerced(self, tmp_path):
         d = _write_toml(tmp_path / "p", 'apps = "comfyui"\n')
         assert profiles.load_profile(d)["apps"] == ["comfyui"]

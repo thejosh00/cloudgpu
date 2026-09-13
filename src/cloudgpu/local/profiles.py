@@ -35,6 +35,9 @@ PROVISION_EXCLUDES = ["*.state.json", "secrets.env", ".git", "__pycache__", "*.p
 _DEFAULTS: dict[str, Any] = {
     "apps": [],
     "provision_timeout": 3600,  # seconds; cap on the provision script (big downloads)
+    # Extra ports `cloudgpu forward` opens, on top of the ones the profile's apps
+    # declare — for servers a provision script installs itself (see profiles/imgv).
+    "ports": [],
 }
 
 
@@ -100,6 +103,12 @@ def load_profile(name_or_path: str | Path) -> dict[str, Any]:
         profile["apps"] = [profile["apps"]]
     if not isinstance(profile["apps"], list):
         raise config.ConfigError(f"{path}: 'apps' must be a list of app names.")
+
+    if isinstance(profile.get("ports"), int):
+        profile["ports"] = [profile["ports"]]
+    if (not isinstance(profile["ports"], list)
+            or not all(isinstance(p, int) for p in profile["ports"])):
+        raise config.ConfigError(f"{path}: 'ports' must be a list of port numbers.")
     return profile
 
 
@@ -114,6 +123,7 @@ def _toml_template(name: str, *, apps: list[str]) -> str:
         f"# cloudgpu profile: {name}  (provisioning)",
         f"apps = {arr(apps)}              # apps to install on the instance",
         "provision_timeout = 3600         # seconds; cap on the provision script",
+        "ports = []                       # extra 'cloudgpu forward' ports (apps' own are automatic)",
     ]) + "\n"
 
 

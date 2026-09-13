@@ -315,25 +315,43 @@ def ssh_cmd(host: str | None, config_name: str | None, command: tuple[str, ...])
     sys.exit(exit_code)
 
 
-def _apps_for_config(config_name: str | None) -> list[str]:
-    """Union of apps across the profiles provisioned onto this config's instance."""
+def _provisioned_profiles(config_name: str | None) -> list[dict]:
+    """The profiles provisioned onto this config's instance (unloadable ones skipped)."""
     if not config_name:
         return []
     state = configs.load_state(config_name)
-    result: list[str] = []
+    loaded: list[dict] = []
     for pname in state.get("provisioned_profiles", []):
         try:
-            for a in profiles.load_profile(pname).get("apps", []):
-                if a not in result:
-                    result.append(a)
+            loaded.append(profiles.load_profile(pname))
         except config.ConfigError:
             continue
+    return loaded
+
+
+def _apps_for_config(config_name: str | None) -> list[str]:
+    """Union of apps across the profiles provisioned onto this config's instance."""
+    result: list[str] = []
+    for profile in _provisioned_profiles(config_name):
+        for a in profile.get("apps", []):
+            if a not in result:
+                result.append(a)
     return result
 
 
 def _config_ports(config_name: str | None) -> list[int]:
-    """Ports to forward for the config's provisioned apps (deduped, in order)."""
-    return apps.app_ports(_apps_for_config(config_name))
+    """Ports to forward for the config: its apps' ports, plus profile-declared ones.
+
+    A profile can serve something its provision script installed rather than an app
+    (imgv, say), so its 'ports' are forwarded alongside the app ports.
+    """
+    provisioned = _provisioned_profiles(config_name)
+    ports = apps.app_ports([a for p in provisioned for a in p.get("apps", [])])
+    for profile in provisioned:
+        for port in profile.get("ports", []):
+            if port not in ports:
+                ports.append(port)
+    return ports
 
 
 @cli.command(name="forward")
@@ -382,8 +400,9 @@ def forward(host: str | None, port: int | None, local_port: int | None, run_cmd:
     ports = _config_ports(config_name)
     if not ports:
         raise click.UsageError(
-            "No app ports to forward for this config. Pass --port <n>, or provision a "
-            f"profile with a known-port app ({', '.join(AVAILABLE_APPS)}) via 'cloudgpu up'."
+            "No ports to forward for this config. Pass --port <n>, provision a profile "
+            f"with a known-port app ({', '.join(AVAILABLE_APPS)}) via 'cloudgpu up', or "
+            "declare 'ports' in the profile's cloudgpu.toml."
         )
     ssh_args: list[str] = []
     for p in ports:
@@ -605,6 +624,14 @@ def _report_up(config_name: str, runtime: dict, persistent_dir: str, app_list: l
             display.info(f"  http://localhost:{p}")
     else:
         display.info(f"Bare machine (no apps). SSH in with:  cloudgpu ssh -C {config_name}")
+    # Profile-declared ports have no service behind them — they're forwarded for
+    # whatever the profile installs and you start yourself (e.g. imgv).
+    extra = [p for p in _config_ports(config_name) if p not in ports]
+    if extra:
+        display.info(
+            f"Profile ports forwarded on demand ({', '.join(str(p) for p in extra)}):  "
+            f"cloudgpu forward -C {config_name}"
+        )
     if runtime.get("instance_id"):
         display.warn(
             "Billing per hour while running. Tear down with 'cloudgpu down' (keeps the "

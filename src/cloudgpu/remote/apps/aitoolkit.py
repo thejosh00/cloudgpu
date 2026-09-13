@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import stat
 import time
 
 from ..installer import AppInstaller
 from ..service import install_service, service_active
-from ..utils import run, pip_install, pip_install_torch, check_torch_cuda, log
+from ..utils import (run, pip_install, pip_install_torch, check_torch_cuda,
+                     torch_index_url, venv_python, log)
 
 AITOOLKIT_PORT = 8675
 
@@ -70,31 +72,15 @@ class AIToolkitInstaller(AppInstaller):
         # 2. Create venv
         if not os.path.exists(self.venv_dir):
             log("Creating venv (for PyTorch)...")
-            os.makedirs(self.state.venvs_dir, exist_ok=True)
-            run(["python3", "-m", "venv", self.venv_dir])
+            self._create_venv()
         else:
             log("Venv already exists")
 
         # 3. Verify PyTorch CUDA and install torchvision/torchaudio in venv
-        log("Checking PyTorch CUDA availability...")
-        if not check_torch_cuda(self.venv_dir):
-            log("PyTorch CUDA not available via system packages, installing...", "warn")
-            pip_install_torch(self.venv_dir, timeout=600)
-            if not check_torch_cuda(self.venv_dir):
-                log("PyTorch CUDA still not working after install!", "error")
-                raise RuntimeError("Failed to get PyTorch with CUDA support")
-        else:
-            log("PyTorch with CUDA is available via system packages")
-
-        log("Installing matching torchvision and torchaudio in venv...")
-        pip_install(self.venv_dir, "--no-deps",
-                    "torchvision", "torchaudio", timeout=600)
+        self._ensure_torch()
 
         # 4. Install requirements (large dep set; aarch64 may compile sdists)
-        log("Installing AI Toolkit requirements...")
-        requirements = os.path.join(self.app_dir, "requirements.txt")
-        if os.path.exists(requirements):
-            pip_install(self.venv_dir, "-r", requirements, timeout=1800)
+        self._install_requirements()
 
         # 5. Wire the UI's training-python resolution to our venv
         self._ensure_venv_symlink()
@@ -146,21 +132,20 @@ class AIToolkitInstaller(AppInstaller):
             self.install()
             return
 
-        requirements = os.path.join(self.app_dir, "requirements.txt")
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
-            run(["python3", "-m", "venv", self.venv_dir])
-            if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=1800)
+            self._create_venv()
+            self._ensure_torch()
+            self._install_requirements()
 
         # Verify PyTorch CUDA (system packages may differ on new instance;
         # also catches an arch switch, where every .so in the venv is wrong)
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
             shutil.rmtree(self.venv_dir, ignore_errors=True)
-            run(["python3", "-m", "venv", self.venv_dir])
-            if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=1800)
+            self._create_venv()
+            self._ensure_torch()
+            self._install_requirements()
 
         self._ensure_venv_symlink()
         self._ensure_node()
@@ -231,6 +216,106 @@ class AIToolkitInstaller(AppInstaller):
             log(f"Could not set up systemd service (run 'cloudgpu ssh -- ai-toolkit' "
                 f"manually instead): {e}", "warn")
 
+    def _create_venv(self) -> None:
+        """Create the venv and bring its pip up to date.
+
+        Ubuntu 22.04 seeds fresh venvs with pip 22.0.2, which predates enough
+        resolver and wheel-tag work that this dependency set is best installed
+        with a current pip.
+        """
+        os.makedirs(self.state.venvs_dir, exist_ok=True)
+        run(["python3", "-m", "venv", self.venv_dir])
+        pip_install(self.venv_dir, "--upgrade", "pip", timeout=300)
+
+    def _ensure_torch(self) -> None:
+        """Make sure the venv has a working CUDA PyTorch, plus vision/audio."""
+        log("Checking PyTorch CUDA availability...")
+        if not check_torch_cuda(self.venv_dir):
+            log("PyTorch CUDA not available via system packages, installing...", "warn")
+            pip_install_torch(self.venv_dir, timeout=600)
+            if not check_torch_cuda(self.venv_dir):
+                log("PyTorch CUDA still not working after install!", "error")
+                raise RuntimeError("Failed to get PyTorch with CUDA support")
+        else:
+            log("PyTorch with CUDA is available via system packages")
+
+        log("Installing matching torchvision and torchaudio in venv...")
+        pip_install(self.venv_dir, "--no-deps",
+                    "torchvision", "torchaudio", timeout=600)
+
+    def _install_requirements(self) -> None:
+        """Install ai-toolkit's requirements, then torchcodec separately."""
+        requirements = os.path.join(self.app_dir, "requirements.txt")
+        if not os.path.exists(requirements):
+            return
+        log("Installing AI Toolkit requirements...")
+        pip_install(self.venv_dir, "-r", self._patched_requirements(requirements),
+                    timeout=1800)
+        self._install_torchcodec()
+
+    def _patched_requirements(self, requirements: str) -> str:
+        """Flatten the requirements into one file with the torchcodec pin gone.
+
+        Upstream pins torchcodec to the release built for *its* pinned torch
+        (0.9.1 / torch 2.9) and then upgrades it out of the way in its own
+        installer. We install the newest torch the instance's driver supports,
+        so that pin is wrong for our torch — and on aarch64 (GH200) it is
+        unobtainable: torchcodec publishes no Linux arm64 wheel before 0.10, so
+        the whole requirements pass dies on it. Flattening is needed because
+        the pin lives in requirements_base.txt, pulled in via '-r'.
+        """
+        lines: list[str] = []
+
+        def inline(path: str) -> None:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    include = None
+                    for flag in ("-r ", "--requirement "):
+                        if line.startswith(flag):
+                            include = line[len(flag):].strip()
+                    if include:
+                        inline(os.path.join(os.path.dirname(path), include))
+                    elif re.match(r"torchcodec\b", line):
+                        lines.append(f"# {line}  (pin dropped by cloudgpu)")
+                    else:
+                        lines.append(raw.rstrip("\n"))
+
+        inline(requirements)
+        patched = os.path.join(self.app_dir, ".cloudgpu-requirements.txt")
+        with open(patched, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        return patched
+
+    def _install_torchcodec(self) -> None:
+        """Install torchcodec from the same wheel index as torch.
+
+        The PyPI wheels are CUDA 13 builds that fail to dlopen libnvrtc.so.13
+        against a cu12x torch; download.pytorch.org publishes a build per CUDA
+        tag, and the newest torchcodec on an index pairs with the newest torch
+        on that same index — which is exactly what pip_install_torch() puts in
+        the venv. Only video/audio datasets use it (via torchaudio), so a
+        failure here warns instead of aborting the install.
+        """
+        index_url = torch_index_url()
+        args = ["--no-deps", "torchcodec"]  # its only deps are test extras
+        if index_url:
+            args += ["--index-url", index_url]
+        log("Installing torchcodec (video/audio dataset support)...")
+        try:
+            pip_install(self.venv_dir, *args, timeout=600)
+        except Exception as e:
+            log(f"torchcodec install failed ({e}); video and audio datasets "
+                f"will not work, image training is unaffected", "warn")
+            return
+        probe = run([venv_python(self.venv_dir), "-c",
+                     "from torchcodec.decoders import VideoDecoder"],
+                    check=False, capture=True, timeout=300)
+        if probe.returncode != 0:
+            log("torchcodec installed but fails to load (needs FFmpeg shared "
+                "libraries and a matching torch build); video and audio "
+                "datasets will not work, image training is unaffected", "warn")
+
     def _ensure_venv_symlink(self) -> None:
         """Symlink <app_dir>/venv -> venv_dir so the UI worker spawns training
         jobs with our venv python (ui/cron/pythonPath.ts checks that path)."""
@@ -287,7 +372,7 @@ class AIToolkitInstaller(AppInstaller):
             "NEXT_TELEMETRY_DISABLED": "1",
         }
         log("Installing UI dependencies (npm install)...")
-        run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        self._npm_install(npm, env)
         self._ensure_sqlite3(npm, env)
         log("Setting up UI database (prisma)...")
         run([npm, "run", "update_db"], cwd=self.ui_dir, env=env, timeout=600)
@@ -295,6 +380,38 @@ class AIToolkitInstaller(AppInstaller):
         # next build can exhaust the default Node heap
         build_env = {**env, "NODE_OPTIONS": "--max-old-space-size=4096"}
         run([npm, "run", "build"], cwd=self.ui_dir, env=build_env, timeout=1800)
+
+    def _npm_install(self, npm: str, env: dict) -> None:
+        """npm install, retried once if it leaves node_modules half-written.
+
+        npm downloads and extracts packages in parallel, and on this NFS with a
+        cold cache (every fresh instance starts with an empty ~/.npm) the
+        extraction races itself: files vanish mid-write with TAR_ENTRY_ERROR
+        ENOENT and packages land without their package.json. 'npm install'
+        still exits 0, so the damage only surfaces much later — a package that
+        lost its metadata reads as MODULE_NOT_FOUND during 'next build'. The
+        retry extracts from the now-warm cache, which does not race.
+        """
+        run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        if self._npm_tree_ok(npm, env):
+            return
+        log("node_modules came out incomplete (npm's parallel extraction races "
+            "on NFS); wiping and reinstalling from the warm cache...", "warn")
+        shutil.rmtree(os.path.join(self.ui_dir, "node_modules"), ignore_errors=True)
+        run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        if not self._npm_tree_ok(npm, env):
+            raise RuntimeError("npm install left an incomplete node_modules")
+
+    def _npm_tree_ok(self, npm: str, env: dict) -> bool:
+        """True when every installed package matches package.json.
+
+        'npm ls' exits non-zero for invalid or missing entries; unmet
+        *optional* deps (the per-platform swc/macstats builds) exit 0, so they
+        do not trip this.
+        """
+        result = run([npm, "ls", "--all"], cwd=self.ui_dir, env=env,
+                     check=False, capture=True, timeout=300)
+        return result.returncode == 0
 
     def _sqlite3_loads(self, env: dict) -> bool:
         node = os.path.join(self.node_bin, "node")

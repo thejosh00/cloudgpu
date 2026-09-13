@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="CloudGPU">
+  <title>CloudGPU</title>
+  <defs>
+    <linearGradient id="cg-grad" x1="14" y1="14" x2="50" y2="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <mask id="cg-cloud-knockout">
+      <rect x="0" y="0" width="64" height="64" fill="#fff"/>
+      <g fill="#000">
+        <circle cx="26.5" cy="35" r="5.5"/>
+        <circle cx="37.5" cy="35" r="5.5"/>
+        <circle cx="32" cy="30.5" r="7"/>
+        <rect x="26.5" y="35" width="11" height="5.5"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- pins -->
+  <g fill="url(#cg-grad)">
+    <rect x="7" y="22" width="7" height="4" rx="2"/>
+    <rect x="7" y="30" width="7" height="4" rx="2"/>
+    <rect x="7" y="38" width="7" height="4" rx="2"/>
+    <rect x="50" y="22" width="7" height="4" rx="2"/>
+    <rect x="50" y="30" width="7" height="4" rx="2"/>
+    <rect x="50" y="38" width="7" height="4" rx="2"/>
+    <rect x="22" y="7" width="4" height="7" rx="2"/>
+    <rect x="30" y="7" width="4" height="7" rx="2"/>
+    <rect x="38" y="7" width="4" height="7" rx="2"/>
+    <rect x="22" y="50" width="4" height="7" rx="2"/>
+    <rect x="30" y="50" width="4" height="7" rx="2"/>
+    <rect x="38" y="50" width="4" height="7" rx="2"/>
+  </g>
+
+  <!-- die, with the cloud knocked out -->
+  <rect x="14" y="14" width="36" height="36" rx="8" fill="url(#cg-grad)" mask="url(#cg-cloud-knockout)"/>
+</svg>
