@@ -18,7 +18,7 @@ class TestFindConfig:
     def test_name_resolves_under_configs(self, tmp_path, monkeypatch):
         _write_config(tmp_path, "qwen-image")
         monkeypatch.chdir(tmp_path)
-        assert configs.find_config("qwen-image") == (tmp_path / "configs" / "small.toml").resolve()
+        assert configs.find_config("qwen-image") == (tmp_path / "configs" / "qwen-image.toml").resolve()
 
     def test_explicit_path(self, tmp_path):
         p = _write_config(tmp_path, "sdxl")
