@@ -86,9 +86,13 @@ def parse_key_file(text: str) -> str:
 
 def arm(hours: float, instance_id: str, key_file: str) -> int:
     """Install the root-only config + self-copy + systemd timer. Returns the deadline epoch."""
-    with open(key_file) as f:
-        api_key = parse_key_file(f.read())
-    os.remove(key_file)  # transferred for this handoff only; the root copy is canonical
+    try:
+        with open(key_file) as f:
+            api_key = parse_key_file(f.read())
+    finally:
+        # Transferred for this handoff only (the root copy is canonical): remove it even
+        # when parsing fails, so a bad file never lingers in ubuntu's home.
+        os.remove(key_file)
 
     now = int(time.time())
     deadline = now + int(hours * 3600)

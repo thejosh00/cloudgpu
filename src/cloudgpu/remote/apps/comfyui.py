@@ -191,6 +191,8 @@ class ComfyUIInstaller(AppInstaller):
             "exec_start": self.launch_script,
             "workdir": self.app_dir,
             "port": COMFYUI_PORT,
+            # Only its own dirs are writable (models, outputs, custom nodes live under app_dir).
+            "rw_paths": [self.app_dir, self.venv_dir],
         }
 
     def _setup_service(self) -> None:

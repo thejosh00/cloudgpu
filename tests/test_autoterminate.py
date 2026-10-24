@@ -124,6 +124,17 @@ class TestArm:
             at.arm(2.0, "i-123", str(key_file))
         assert sudo_log["installs"] == {}
 
+    def test_arm_removes_key_file_even_when_parse_fails(self, tmp_path, sudo_log, monkeypatch):
+        key_file = tmp_path / "key.env"
+        key_file.write_text("LAMBDA_API_KEY=secret_abc\n")
+
+        def boom(text):
+            raise ValueError("unparseable")
+        monkeypatch.setattr(at, "parse_key_file", boom)
+        with pytest.raises(ValueError):
+            at.arm(2.0, "i-123", str(key_file))
+        assert not key_file.exists()  # never left behind in ubuntu's home
+
 
 class TestDisarm:
     def test_never_armed_is_silent_noop(self, tmp_path, monkeypatch):

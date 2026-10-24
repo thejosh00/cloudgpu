@@ -206,6 +206,8 @@ class AIToolkitInstaller(AppInstaller):
             "exec_start": self.launch_script,
             "workdir": self.ui_dir,
             "port": AITOOLKIT_PORT,
+            # Only its own dirs are writable (UI, datasets and training outputs live under app_dir).
+            "rw_paths": [self.app_dir, self.venv_dir],
         }
 
     def _setup_service(self) -> None:

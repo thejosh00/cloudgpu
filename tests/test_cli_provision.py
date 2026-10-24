@@ -170,3 +170,40 @@ def test_provision_command_requires_running_instance(tmp_path, tmp_config_dir, m
     r = CliRunner().invoke(cli.provision, ["-C", "c", "-P", "generate"])
     assert r.exit_code != 0
     assert "no running instance" in r.output.lower()
+
+
+def test_secrets_file_deleted_before_provision_entry_runs(tmp_path, tmp_config_dir, monkeypatch):
+    """R3: the secrets file is gone before provisioning (or any service start) runs."""
+    profile = _profile(tmp_path, entry="py")
+    profiles.secrets_file().write_text("CIVITAI_TOKEN=SECRET123\n")
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    monkeypatch.setattr(cli.sync, "copy_file", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    cmd = captured["command"]
+    sourced = cmd.index('. "$S"')
+    deleted = cmd.index('; rm -f "$S";')
+    entry = cmd.index("python3 provision.py")
+    assert sourced < deleted < entry
+    assert "systemctl" not in cmd[:deleted]
+
+
+def test_provision_runs_with_group_writable_umask(tmp_path, tmp_config_dir, monkeypatch):
+    profile = _profile(tmp_path, entry="py")
+    monkeypatch.setattr(cli.sync, "copy_dir", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(cli.ssh, "ssh_run",
+                        lambda host, command, **k: captured.update(command=command) or ssh.SSHResult(0, "", ""))
+    cli._run_provision(profile, "ubuntu@h", "/lambda/nfs/p")
+    cmd = captured["command"]
+    assert cmd.index("umask 002") < cmd.index("python3 provision.py")
+
+
+def test_up_provisions_before_restarting_services(monkeypatch):
+    """Services restart only after provisioning (whose secrets are already deleted)."""
+    import inspect
+    src = inspect.getsource(cli)
+    body = src[src.index("        _run_provision(prof, host, persistent_dir)"):]
+    assert body.index("_run_provision(") < body.index("_restart_services(host, app_union)")

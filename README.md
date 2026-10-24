@@ -62,6 +62,14 @@ auto-starts on boot, and restarts on crash — no need to launch it by hand. `cl
 -C <config>` opens a tunnel to each provisioned app's port; `cloudgpu status -C <config>` shows
 whether services are active. Access a terminal with `cloudgpu ssh -C <config>`.
 
+App services (and so every ComfyUI custom node) run as the unprivileged `cloudgpu-app`
+user — no login shell, no sudo — in a systemd sandbox: the OS is read-only, `/home` is
+hidden, and only the app's own dirs on the persistent filesystem (plus its private HOME
+in `/var/lib/cloudgpu-app` and `/tmp`) are writable. That keeps third-party code away
+from the root-only Lambda key used by auto-terminate. Setup and provisioning still run
+as `ubuntu`, which shares the app dirs through the `cloudgpu-app` group; existing
+filesystems are migrated to that group automatically on install/recover.
+
 ### Provisioning (extra setup, e.g. model downloads)
 
 Apps that need extra setup drop a `provision.py` (and helpers like `comfylib.py`) into the
