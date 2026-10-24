@@ -165,3 +165,11 @@ class TestAppUserAndMigration:
         chgrp = calls.index(["sudo", "chgrp", "-hR", "cloudgpu-app", str(tmp_path)])
         start = calls.index(["sudo", "systemctl", "enable", "--now", "comfyui"])
         assert chgrp < start
+
+    def test_install_restarts_so_old_unsandboxed_process_is_replaced(self, monkeypatch, tmp_path):
+        calls = []
+        monkeypatch.setattr(service, "run", lambda cmd, **k: calls.append(cmd))
+        monkeypatch.setattr(service.pwd, "getpwnam", lambda name: object())
+        service.install_service({**SPEC, "workdir": str(tmp_path)})
+        enable = calls.index(["sudo", "systemctl", "enable", "--now", "comfyui"])
+        assert calls.index(["sudo", "systemctl", "restart", "comfyui"]) > enable

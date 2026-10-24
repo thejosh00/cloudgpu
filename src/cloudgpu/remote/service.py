@@ -112,6 +112,9 @@ def install_service(spec: dict[str, Any]) -> None:
     os.remove(tmp)
     run(["sudo", "systemctl", "daemon-reload"])
     run(["sudo", "systemctl", "enable", "--now", name])
+    # enable --now leaves an already-running process alone; restart so an instance
+    # upgraded in place stops running the old (ubuntu, unsandboxed) process right away.
+    run(["sudo", "systemctl", "restart", name])
     log(f"Service '{name}' enabled and started (systemd, restarts on boot/crash).")
 
 
