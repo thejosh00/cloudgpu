@@ -20,7 +20,7 @@ class TestUnitText:
         assert "WorkingDirectory=/lambda/nfs/p/apps/comfyui" in unit
         assert "Restart=always" in unit
         assert "WantedBy=multi-user.target" in unit
-        assert "User=ubuntu" in unit
+        assert "User=cloudgpu-app" in unit
 
 
 class TestInstallService:
