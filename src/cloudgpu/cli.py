@@ -14,11 +14,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import click
 from rich.console import Console
+from rich.markup import escape
 
-from cloudgpu.local import apps, capacity, config, configs, display, lambda_api, orchestration, profiles, ssh, sync
+from cloudgpu.local import apps, capacity, config, configs, display, lambda_api, liveness, orchestration, profiles, ssh, sync
 
 console = Console()
 
@@ -421,29 +423,18 @@ def forward(host: str | None, port: int | None, local_port: int | None, run_cmd:
 # --- profile-driven machine management ------------------------------------
 
 
-def _live_instance(instance_id: str | None) -> dict | None:
-    """Return the instance dict if it's active with an IP, else None."""
-    if not instance_id:
-        return None
-    try:
-        inst = lambda_api.get_instance(instance_id)
-    except lambda_api.LambdaAPIError:
-        return None  # gone / terminated
-    if inst.get("status") == "active" and inst.get("ip"):
-        return inst
-    return None
+def _stop_unchanged(message: str) -> NoReturn:
+    """Stop without touching anything, and say where to look."""
+    display.error(
+        f"{escape(message)}\nNothing was changed. Look with 'cloudgpu lambda instances'."
+    )
+    sys.exit(1)
 
 
-def _instance_mounting(filesystem: str) -> dict | None:
-    """Find a live instance already mounting ``filesystem`` (or None)."""
-    try:
-        for inst in lambda_api.list_instances():
-            names = inst.get("file_system_names") or []
-            if filesystem in names and inst.get("status") in ("active", "booting"):
-                return inst
-    except lambda_api.LambdaAPIError:
-        pass
-    return None
+def _stop_not_ready(inst: dict) -> NoReturn:
+    """An instance exists but can't be used yet: another launch would bill twice."""
+    status = liveness.describe(inst)
+    _stop_unchanged(f"Instance {inst.get('id')} is {status}, so not launching another. Run this again once it's active.")
 
 
 def _runtime_from_instance(inst: dict, filesystem: str) -> dict:
@@ -721,22 +712,33 @@ def up(config_name: str, profile_csv: str | None) -> None:
 
     filesystem = cfg["filesystem"]
 
-    # Reuse a live instance if we already track one for this config.
+    # Reuse a live instance if we already track one for this config. The state file stays as it
+    # is until something replaces it: every way of stopping below keeps it, and what it records.
     state = configs.load_state(config_name)
-    inst = _live_instance(state.get("instance_id"))
-    if inst:
-        display.info(f"Reusing running instance {state['instance_id']} ({inst.get('ip')}).")
-        state["host"] = f"ubuntu@{inst.get('ip')}"
-        state["ip"] = inst.get("ip")
+    tracked = state.get("instance_id")
+    read = liveness.read_instance(tracked) if tracked else None
+    if read and read.kind is liveness.Kind.UNKNOWN:
+        _stop_unchanged(read.detail)
+    if read and read.kind is liveness.Kind.ALIVE:
+        if not liveness.usable(read.instance):
+            _stop_not_ready({"id": tracked, **read.instance})
+        ip = read.instance.get("ip")
+        display.info(f"Reusing running instance {tracked} ({ip}).")
+        state["host"] = f"ubuntu@{ip}"
+        state["ip"] = ip
     else:
         provisioned = state.get("provisioned_profiles")
-        if state.get("instance_id"):
+        if tracked:
             display.info("Tracked instance is gone; reconciling...")
-            configs.clear_state(config_name)
         # Adopt an instance already mounting this filesystem (recovery / lost state).
         # The filesystem is the config's identity, so it's ours.
-        existing = _instance_mounting(filesystem)
-        if existing and existing.get("ip"):
+        mounting = liveness.find_mounting(filesystem)
+        if mounting.kind is liveness.Kind.UNKNOWN:
+            _stop_unchanged(mounting.detail)
+        if mounting.kind is liveness.Kind.ALIVE:
+            existing = mounting.instance
+            if not liveness.usable(existing):
+                _stop_not_ready(existing)
             display.info(
                 f"Adopting running instance {existing.get('id')} ({existing.get('ip')}) "
                 f"already mounting '{filesystem}'."
@@ -745,6 +747,12 @@ def up(config_name: str, profile_csv: str | None) -> None:
         else:
             try:
                 state = orchestration.acquire_instance(cfg)
+            except lambda_api.LambdaReplyLost as e:
+                display.error(
+                    f"{escape(str(e))}\nNot trying again: if that was a launch, it may have gone through. "
+                    "Check 'cloudgpu lambda instances' before running this again."
+                )
+                sys.exit(1)
             except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:
                 display.error(str(e))
                 sys.exit(1)
@@ -884,15 +892,17 @@ def _find_filesystem(name: str) -> dict | None:
 
 
 def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bool:
-    """Poll until the instance is terminated/gone (so its filesystem frees up)."""
+    """Poll until the instance is terminated/gone (so its filesystem frees up).
+
+    This is the step before deleting a filesystem, so a read that can't tell keeps polling.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            inst = lambda_api.get_instance(instance_id)
-        except lambda_api.LambdaAPIError:
-            return True  # gone
-        if inst.get("status") == "terminated":
+        read = liveness.read_instance(instance_id)
+        if read.kind is liveness.Kind.GONE:
             return True
+        if read.kind is liveness.Kind.UNKNOWN:
+            display.warn(escape(read.detail))
         time.sleep(poll)
     return False
 
@@ -919,9 +929,14 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
 
     # Find the instance: tracked id, or whatever is mounting the filesystem.
     instance_id = state.get("instance_id")
+    already_terminating = False
     if not instance_id:
-        inst = _instance_mounting(filesystem)
-        instance_id = inst.get("id") if inst else None
+        mounting = liveness.find_mounting(filesystem)
+        if mounting.kind is liveness.Kind.UNKNOWN:
+            _stop_unchanged(mounting.detail)
+        if mounting.kind is liveness.Kind.ALIVE:
+            instance_id = mounting.instance.get("id")
+            already_terminating = mounting.instance.get("status") == "terminating"
 
     # Confirm (a single, appropriately-scoped prompt).
     if not yes:
@@ -931,14 +946,16 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
                 f"'{filesystem}' and all its data?",
                 abort=True,
             )
-        elif instance_id:
+        elif instance_id and not already_terminating:
             click.confirm(
                 f"Terminate instance {instance_id} for config '{name}'? "
                 f"(filesystem '{filesystem}' is kept)",
                 abort=True,
             )
 
-    if instance_id:
+    if already_terminating:
+        display.info(f"Instance {instance_id} is already terminating.")
+    elif instance_id:
         _api_call(lambda_api.terminate_instances, [instance_id])
         display.success(f"Termination requested for {instance_id}.")
     else:
@@ -1033,7 +1050,7 @@ def _api_call(fn, *args, **kwargs):
     """Run a Lambda API call, surfacing errors as a clean message and exit."""
     try:
         return fn(*args, **kwargs)
-    except lambda_api.LambdaAPIError as e:
+    except (lambda_api.LambdaAPIError, lambda_api.LambdaReplyLost) as e:
         display.error(str(e))
         sys.exit(1)
 

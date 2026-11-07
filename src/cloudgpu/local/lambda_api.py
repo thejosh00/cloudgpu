@@ -5,6 +5,7 @@ The API key is read from the LAMBDA_API_KEY env var.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import os
@@ -22,13 +23,51 @@ API_KEY_ENV = "LAMBDA_API_KEY"
 API_BASE_ENV = "CLOUDGPU_TEST_LAMBDA_API_BASE"
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# Test-only: divides request timeouts and retry delays, so a test that runs the real CLI in a
+# subprocess needn't sit through them. Ignored unless API_BASE_ENV is set too.
+PACE_ENV = "CLOUDGPU_TEST_LAMBDA_PACE"
+
+REQUEST_TIMEOUT_SECONDS = 60
+
 # cloud.lambda.ai is fronted by Cloudflare, which 403s the default
 # "Python-urllib/x.y" user agent. Send an explicit UA so requests get through.
 USER_AGENT = "cloudgpu/0.1.0"
 
 
 class LambdaAPIError(Exception):
-    """Raised when a Lambda Cloud API request fails."""
+    """Raised when a Lambda Cloud API request fails.
+
+    Attributes:
+        status: The HTTP status, or None if no HTTP answer came back.
+        code: Lambda's error code from the body (e.g. "global/object-does-not-exist"), if any.
+        retryable: False when asking again can't help: a missing key, a refused key.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None, retryable: bool = True):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.retryable = retryable
+
+
+class LambdaReplyLost(Exception):
+    """A request went out and no readable reply came back, so it may have taken effect.
+
+    Deliberately not a LambdaAPIError. Callers catch that to poll again or to carry on as if
+    nothing were found, and `acquire_instance` would launch a second billed instance after a
+    launch whose reply was lost. Only code that knows the request is safe to repeat catches this.
+    """
+
+
+def pace() -> float:
+    """What to divide timeouts and retry delays by: 1 unless a test has asked for faster."""
+    if not os.environ.get(API_BASE_ENV):
+        return 1.0
+    try:
+        value = float(os.environ.get(PACE_ENV) or 1)
+    except ValueError:
+        return 1.0
+    return value if value > 0 else 1.0
 
 
 def _api_key() -> str:
@@ -37,7 +76,8 @@ def _api_key() -> str:
         raise LambdaAPIError(
             f"{API_KEY_ENV} environment variable not set. "
             "Create an API key at https://cloud.lambda.ai/api-keys and export it, e.g.\n"
-            f"  export {API_KEY_ENV}=secret_..."
+            f"  export {API_KEY_ENV}=secret_...",
+            retryable=False,
         )
     return key
 
@@ -72,7 +112,8 @@ def api_base_override() -> str | None:
         raise LambdaAPIError(
             f"Refusing {API_BASE_ENV}={override!r}: the Lambda API key is sent to whatever it "
             "names, so it must be a loopback address such as http://127.0.0.1:8000/api/v1. "
-            "Unset it to use the real API."
+            "Unset it to use the real API.",
+            retryable=False,
         )
     return override.rstrip("/")
 
@@ -86,7 +127,8 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         body: JSON-serializable request body, or None for no body.
 
     Raises:
-        LambdaAPIError: On missing key, network failure, or non-2xx response.
+        LambdaAPIError: On missing key, failure to reach the API, or non-2xx response.
+        LambdaReplyLost: If the request went out and the reply was dropped, stalled or unreadable.
     """
     override = api_base_override()
     url = f"{override or API_BASE}{path}"
@@ -103,32 +145,43 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         open_url = _DIRECT_OPENER.open if override else urllib.request.urlopen
-        with open_url(req, timeout=60) as resp:
+        with open_url(req, timeout=REQUEST_TIMEOUT_SECONDS / pace()) as resp:
             payload = resp.read().decode()
+        parsed = json.loads(payload) if payload else None
     except urllib.error.HTTPError as e:
-        raise LambdaAPIError(_format_http_error(e)) from e
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise LambdaAPIError(f"Could not reach Lambda Cloud API: {e.reason}") from e
+    # urllib only wraps failures while sending. These came after the request went out.
+    except (OSError, http.client.HTTPException) as e:
+        raise LambdaReplyLost(f"{method} {path}: no complete reply from Lambda ({type(e).__name__})") from e
+    except ValueError as e:
+        raise LambdaReplyLost(f"{method} {path}: Lambda's reply wasn't readable JSON") from e
 
-    if not payload:
-        return None
-    parsed = json.loads(payload)
     # Successful responses are wrapped in {"data": ...}; fall back to the raw body.
     return parsed.get("data", parsed) if isinstance(parsed, dict) else parsed
 
 
-def _format_http_error(e: urllib.error.HTTPError) -> str:
-    """Extract Lambda's structured error ({code, message, suggestion}) if present."""
-    detail = ""
+def _http_error(e: urllib.error.HTTPError) -> LambdaAPIError:
+    """Build the error, with Lambda's structured {code, message, suggestion} if present."""
+    err: Any = {}
     try:
         parsed = json.loads(e.read().decode())
         err = parsed.get("error", {}) if isinstance(parsed, dict) else {}
-        parts = [err.get("code"), err.get("message"), err.get("suggestion")]
-        detail = " - ".join(p for p in parts if p)
-    except (ValueError, OSError):
+    except (ValueError, OSError, http.client.HTTPException):
         pass
+    if not isinstance(err, dict):
+        err = {}
+    code = err.get("code") if isinstance(err.get("code"), str) else None
+    parts = [code, err.get("message"), err.get("suggestion")]
+    detail = " - ".join(p for p in parts if p and isinstance(p, str))
     base = f"Lambda API request failed (HTTP {e.code})"
-    return f"{base}: {detail}" if detail else base
+    return LambdaAPIError(
+        f"{base}: {detail}" if detail else base,
+        status=e.code,
+        code=code,
+        retryable=e.code not in (400, 401, 403),
+    )
 
 
 # --- Filesystems ----------------------------------------------------------

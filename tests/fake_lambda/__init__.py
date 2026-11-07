@@ -27,16 +27,40 @@ LAUNCH_MODES = {
     "ok",
     "start_then_502",  # ASSUMPTION: a gateway error can follow a launch that took effect
     "start_then_drop",  # ASSUMPTION: as above, with the connection closed and no reply
+    "start_then_200_html",  # ASSUMPTION: as above, with a proxy's page and a 200
     "insufficient_capacity",  # published: HTTP 400, instance-operations/launch/insufficient-capacity
     "rate_limited",  # published: HTTP 429, global/rate-limited
     "bad_request",  # published: HTTP 400, global/invalid-parameters
+}
+
+# What a read of an instance or of the list can do instead of answering normally.
+READ_MODES = {
+    "ok",
+    "http_500",  # ASSUMPTION: the spec lists no 5xx for reads, but gateways answer them anyway
+    "http_502",  # ASSUMPTION: as above, with an HTML body
+    "http_503",  # ASSUMPTION: as above
+    "http_429",  # published: global/rate-limited
+    "http_401",  # published: global/invalid-api-key
+    "http_403",  # published: global/forbidden
+    "not_found",  # published: HTTP 404, global/object-does-not-exist, for GET /instances/{id}
+    "404_other_code",  # published: HTTP 404, global/not-found, a resource or route not found
+    "404_no_code",  # ASSUMPTION: a proxy's HTML 404
+    "200_html",  # ASSUMPTION: a proxy's page with a 200
+    "200_no_status",  # ASSUMPTION: an instance with no status field, or a list entry with none
+    "200_unlisted_status",  # ASSUMPTION: a status InstanceStatus doesn't list
+    "200_not_a_list",  # ASSUMPTION: a list read that answers with an object
+    "drop",  # ASSUMPTION: the connection closes with no reply
+    "stall",  # ASSUMPTION: headers and part of the body, then nothing
 }
 
 
 class FakeLambda:
     """The endpoints `up` calls. Use as a context manager; `base_url` is what to point at."""
 
-    def __init__(self, *, launches=(), then="ok", boot_polls=0, filesystem="box-fs", region="us-fake-1"):
+    def __init__(
+        self, *, launches=(), then="ok", boot_polls=0, filesystem="box-fs", region="us-fake-1",
+        instance_reads=(), instance_reads_then="ok", list_reads=(), list_reads_then="ok",
+    ):
         """
         Args:
             launches: what each launch does, in order (see LAUNCH_MODES).
@@ -44,10 +68,22 @@ class FakeLambda:
             boot_polls: how many reads a launched instance answers as booting, with no ip.
             filesystem: a filesystem that already exists, or None for none.
             region: the one region, which always has capacity for gpu_1x_a10.
+            instance_reads: what each GET /instances/{id} does, in order (see READ_MODES).
+            instance_reads_then: what every read after those does.
+            list_reads: what each GET /instances does, in order.
+            list_reads_then: what every list after those does.
         """
         unknown = {*launches, then} - LAUNCH_MODES
         if unknown:
             raise ValueError(f"unknown launch modes: {sorted(unknown)}")
+        unknown = {*instance_reads, instance_reads_then, *list_reads, list_reads_then} - READ_MODES
+        if unknown:
+            raise ValueError(f"unknown read modes: {sorted(unknown)}")
+        self.instance_read_script = list(instance_reads)
+        self.instance_reads_then = instance_reads_then
+        self.list_read_script = list(list_reads)
+        self.list_reads_then = list_reads_then
+        self._stop = threading.Event()
         self.launch_script = list(launches)
         self.then = then
         self.boot_polls = boot_polls
@@ -69,18 +105,32 @@ class FakeLambda:
         return self
 
     def __exit__(self, *exc) -> None:
+        self._stop.set()
         self._server.shutdown()
         self._server.server_close()
 
     def alive(self) -> list[str]:
-        """Ids of every instance that would be billing. The fake never terminates one."""
+        """Ids of every instance that would be billing: any not terminated."""
         with self._lock:
-            return [inst["id"] for inst in self.instances]
+            return [inst["id"] for inst in self.instances if inst["_status"] != "terminated"]
 
-    def add_instance(self, *, name="box", boot_polls=0) -> str:
-        """An instance already on the filesystem, as if an earlier `up` had launched it."""
+    def count(self, method: str, path_end: str) -> int:
+        """How many requests of this method had a path ending like this."""
         with self._lock:
-            return self._start(name, list(self.filesystems), boot_polls)
+            return sum(1 for m, p in self.requests if m == method and p.endswith(path_end))
+
+    def add_instance(self, *, name="box", boot_polls=0, status=None, ip=True) -> str:
+        """An instance already on the filesystem, as if an earlier `up` had launched it.
+
+        Args:
+            status: if set, every read answers this InstanceStatus and boot_polls doesn't apply.
+            ip: whether a read with `status` set shows an ip.
+        """
+        with self._lock:
+            inst_id = self._start(name, list(self.filesystems), boot_polls)
+            self.instances[-1]["_status"] = status
+            self.instances[-1]["_shows_ip"] = ip
+            return inst_id
 
     def _start(self, name, file_systems, boot_polls) -> str:
         n = len(self.instances) + 1
@@ -94,6 +144,8 @@ class FakeLambda:
                 "instance_type": {"name": "gpu_1x_a10", "price_cents_per_hour": 75},
                 "_ip": f"192.0.2.{n}",  # TEST-NET-1: routes nowhere, and only the shims see it
                 "_booting_for": boot_polls,
+                "_status": None,
+                "_shows_ip": True,
             }
         )
         return self.instances[-1]["id"]
@@ -101,6 +153,8 @@ class FakeLambda:
     def _read(self, inst: dict) -> dict:
         """The instance as a read sees it. Each read while booting uses up one boot poll."""
         public = {k: v for k, v in inst.items() if not k.startswith("_")}
+        if inst["_status"]:
+            return {**public, "status": inst["_status"], **({"ip": inst["_ip"]} if inst["_shows_ip"] else {})}
         if inst["_booting_for"] > 0:
             inst["_booting_for"] -= 1
             return {**public, "status": "booting"}
@@ -110,11 +164,19 @@ class FakeLambda:
         """Record a launch. Returns its mode, and the instances it started."""
         self.launches.append(body)
         mode = self.launch_script.pop(0) if self.launch_script else self.then
-        if mode in ("ok", "start_then_502", "start_then_drop"):
+        if mode in ("ok", "start_then_502", "start_then_drop", "start_then_200_html"):
             # ASSUMPTION: a launch on a filesystem already in use is accepted. The spec doesn't
             # say, and only lists filesystem-in-use for deleting one.
             return mode, [self._start(body.get("name"), body.get("file_system_names") or [], self.boot_polls)]
         return mode, []
+
+    def _read_mode(self, path: str) -> str | None:
+        """What this GET should do, using up a step of its script. None if it has no script."""
+        if path == "/api/v1/instances":
+            return self.list_read_script.pop(0) if self.list_read_script else self.list_reads_then
+        if path.startswith("/api/v1/instances/"):
+            return self.instance_read_script.pop(0) if self.instance_read_script else self.instance_reads_then
+        return None
 
 
 def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
@@ -134,9 +196,60 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
         def _error(self, status: int, code: str, message: str, headers=()) -> None:
             self._send(status, {"error": {"code": code, "message": message}}, headers=headers)
 
+        def _answer_read_mode(self, mode: str) -> None:
+            """Answer as this read mode says. Anything but ok finishes the request."""
+            if mode == "http_500":
+                self._send(500, raw=b"Internal Server Error")
+            elif mode == "http_502":
+                self._send(502, raw=b"<html>502 Bad Gateway</html>")
+            elif mode == "http_503":
+                self._error(503, "global/internal-error", "Unavailable.")
+            elif mode == "http_429":
+                self._error(429, "global/rate-limited", "Too many requests.", headers=[("Retry-After", "0")])
+            elif mode == "http_401":
+                self._error(401, "global/invalid-api-key", "API key was invalid, expired, or deleted.")
+            elif mode == "http_403":
+                self._error(403, "global/forbidden", "Forbidden.")
+            elif mode == "not_found":
+                self._error(404, "global/object-does-not-exist", "Specified instance does not exist.")
+            elif mode == "404_other_code":
+                self._error(404, "global/not-found", "Not found.")
+            elif mode == "404_no_code":
+                self._send(404, raw=b"<html>404 Not Found</html>")
+            elif mode == "200_html":
+                self._send(200, raw=b"<html>Please wait</html>")
+            elif mode == "200_no_status":
+                entry = {"id": "fake-instance-1", "file_system_names": list(fake.filesystems)}
+                self._send(200, {"data": [entry] if self.path.endswith("/instances") else entry})
+            elif mode == "200_unlisted_status":
+                entry = {"id": "fake-instance-1", "status": "hibernating", "file_system_names": list(fake.filesystems)}
+                self._send(200, {"data": [entry] if self.path.endswith("/instances") else entry})
+            elif mode == "200_not_a_list":
+                self._send(200, {"data": {"oops": True}})
+            elif mode == "drop":
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+        def _stall(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"data"')
+            self.wfile.flush()
+            fake._stop.wait(30)
+            self.close_connection = True
+
         def do_GET(self) -> None:
             with fake._lock:
                 fake.requests.append(("GET", self.path))
+                mode = fake._read_mode(self.path)
+                if mode not in (None, "ok", "stall"):
+                    self._answer_read_mode(mode)
+                    return
+            if mode == "stall":  # outside the lock, so other requests still get answers
+                self._stall()
+                return
+            with fake._lock:
                 if self.path == "/api/v1/instance-types":
                     self._send(200, {"data": {"gpu_1x_a10": {
                         "instance_type": {"name": "gpu_1x_a10", "price_cents_per_hour": 75},
@@ -173,6 +286,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                         self._send(200, {"data": {"instance_ids": started}})
                     elif mode == "start_then_502":
                         self._send(502, raw=b"<html>502 Bad Gateway</html>")
+                    elif mode == "start_then_200_html":
+                        self._send(200, raw=b"<html>Please wait</html>")
                     elif mode == "start_then_drop":
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -184,6 +299,11 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                         self._error(429, "global/rate-limited", "Too many requests.", headers=[("Retry-After", "0")])
                     else:
                         self._error(400, "global/invalid-parameters", "Invalid request.")
+                elif self.path == "/api/v1/instance-operations/terminate":
+                    for inst in fake.instances:
+                        if inst["id"] in body.get("instance_ids", []):
+                            inst["_status"] = "terminated"
+                    self._send(200, {"data": {"terminated_instances": []}})
                 else:
                     self._error(404, "global/object-does-not-exist", f"Fake has no POST {self.path}")
 
@@ -196,10 +316,21 @@ class UpResult:
     output: str
     state: dict  # the config's local state after the run; {} if none
     shim_calls: list[dict]  # every ssh and rsync call, in order
+    state_bytes: bytes | None = None  # the state file exactly as it was left; None if none
 
 
-def run_up(fake: FakeLambda, workdir: Path, *, poll_seconds=0, max_hours=1.0, timeout=60, base_url=None, state=None) -> UpResult:
-    """Run the real `cloudgpu up` in a subprocess against the fake, with ssh and rsync shimmed.
+def run_up(fake: FakeLambda, workdir: Path, **kwargs) -> UpResult:
+    """Run the real `cloudgpu up` in a subprocess against the fake. See run_cloudgpu."""
+    return run_cloudgpu(fake, workdir, ["up", "--config", "box"], **kwargs)
+
+
+def run_cloudgpu(
+    fake: FakeLambda, workdir: Path, args: list[str], *,
+    poll_seconds=0, max_hours=1.0, timeout=60, base_url=None, state=None, api_key="dummy-key-not-real", pace=None,
+) -> UpResult:
+    """Run a real `cloudgpu` command in a subprocess against the fake, with ssh and rsync shimmed.
+
+    `api_key=None` leaves the key out. `pace` divides its timeouts and retry delays.
 
     The environment is built from nothing, with a throwaway HOME, so no real key, ~/.ssh or
     secrets file is in reach. The proxy variables point at a closed port: if the override
@@ -221,15 +352,18 @@ def run_up(fake: FakeLambda, workdir: Path, *, poll_seconds=0, max_hours=1.0, ti
         "PATH": f"{SHIMS}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(workdir / "home"),
         "COLUMNS": "200",
-        "LAMBDA_API_KEY": "dummy-key-not-real",
         API_BASE_ENV: base_url or fake.base_url,
         "http_proxy": "http://127.0.0.1:9",
         "https_proxy": "http://127.0.0.1:9",
         "FAKE_SHIM_LOG": str(shim_log),
         "FAKE_SHIM_FILESYSTEM": fake.filesystems[0] if fake.filesystems else "box-fs",
     }
+    if api_key is not None:
+        env["LAMBDA_API_KEY"] = api_key
+    if pace is not None:
+        env["CLOUDGPU_TEST_LAMBDA_PACE"] = str(pace)
     proc = subprocess.run(
-        [sys.executable, "-c", "from cloudgpu.cli import cli; cli()", "up", "--config", "box"],
+        [sys.executable, "-c", "from cloudgpu.cli import cli; cli()", *args],
         cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout,
     )
     return UpResult(
@@ -237,4 +371,5 @@ def run_up(fake: FakeLambda, workdir: Path, *, poll_seconds=0, max_hours=1.0, ti
         output=proc.stdout + proc.stderr,
         state=json.loads(state_file.read_text()) if state_file.exists() else {},
         shim_calls=[json.loads(line) for line in shim_log.read_text().splitlines()] if shim_log.exists() else [],
+        state_bytes=state_file.read_bytes() if state_file.exists() else None,
     )

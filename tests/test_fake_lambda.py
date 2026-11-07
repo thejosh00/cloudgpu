@@ -44,12 +44,14 @@ def test_mode_start_then_502_leaves_two_alive_one_tracked_today(tmp_path):
     assert result.state["instance_id"] == "fake-instance-2"
 
 
-def test_mode_start_then_drop_leaves_an_untracked_instance_and_a_raw_error_today(tmp_path):
+def test_mode_start_then_drop_stops_without_a_second_launch(tmp_path):
     with FakeLambda(launches=["start_then_drop"]) as fake:
         result = run_up(fake, tmp_path)
 
     assert result.returncode != 0
-    assert "Traceback" in result.output and "RemoteDisconnected" in result.output
+    assert "Traceback" not in result.output
+    assert "it may have gone through" in result.output
+    assert len(fake.launches) == 1
     assert fake.alive() == ["fake-instance-1"]
     assert result.state == {}
 
@@ -94,14 +96,14 @@ def test_mode_boot_polls_waits_for_the_ip(tmp_path):
     assert len(fake.launches) == 1
 
 
-def test_up_during_boot_launches_a_second_instance_today(tmp_path):
+def test_up_during_boot_does_not_launch_a_second_instance(tmp_path):
     with FakeLambda() as fake:
         fake.add_instance(boot_polls=1000)
         result = run_up(fake, tmp_path)
 
-    assert result.returncode == 0, result.output
-    assert len(fake.launches) == 1
-    assert len(fake.alive()) == 2
+    assert result.returncode != 0
+    assert fake.launches == []
+    assert fake.alive() == ["fake-instance-1"]
 
 
 def test_fake_refuses_an_unknown_mode():
