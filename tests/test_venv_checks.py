@@ -29,7 +29,9 @@ GOOD_VENV = "planted-by-test"  # not pyvenv.cfg: a rebuild would recreate that
 FAKE_SUDO = """#!/bin/bash
 # Records its arguments. "sudo -u <user> -- cmd" runs cmd, marking who it was meant to run as;
 # anything else is an admin command, which is only recorded (useradd also "creates" the user).
-# sudo-refuses makes the run-as-user form fail the way sudo itself fails: exit 1.
+# sudo-refuses makes the run-as-user form fail the way sudo itself fails: exit 1, as does a user
+# that doesn't exist. SANDBOX is written in, because run_as_app gives sudo only PATH.
+SANDBOX={root}
 echo "sudo $*" >> "$SANDBOX/calls.log"
 if [ "$1" = useradd ]; then touch "$SANDBOX/user-exists"; exit 0; fi
 target=
@@ -43,7 +45,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$target" ] || exit 0
 [ -e "$SANDBOX/sudo-refuses" ] && { echo "sudo: a password is required" >&2; exit 1; }
-FAKE_SUDO_TARGET="$target" exec "$@"
+[ -e "$SANDBOX/user-exists" ] || { echo "sudo: unknown user $target" >&2; exit 1; }
+HOME="$SANDBOX" FAKE_SUDO_TARGET="$target" exec "$@"
 """
 
 PLANTED_PYTHON = """#!/bin/bash
@@ -106,7 +109,7 @@ def sandbox(tmp_path, monkeypatch):
     root.mkdir()
     box = Sandbox(root)
     box.modules.mkdir()
-    executable(root / "bin" / "sudo", FAKE_SUDO)
+    executable(root / "bin" / "sudo", FAKE_SUDO.replace("{root}", str(root)))
     monkeypatch.setenv("SANDBOX", str(root))
     monkeypatch.setenv("PATH", f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("PYTHONPATH", str(box.modules))
@@ -302,7 +305,8 @@ class TestInstallAndRecovery:
         """Bug: installing onto a filesystem with a venv fails, as the user isn't there yet."""
         installer, module = app
         sandbox.torch(cuda=True)
-        with patch(f"{module}.run", return_value=MagicMock(returncode=1, stdout="")):
+        with (patch(f"{module}.run", return_value=MagicMock(returncode=1, stdout="")),
+              patch(f"{module}.git_pull_as_app"), patch(f"{module}.app_step", create=True)):
             installer.install()
         assert sandbox.index("sudo useradd") < sandbox.index(f"-u {APP_USER} -- {installer.venv_dir}")
         assert (Path(installer.venv_dir) / GOOD_VENV).exists()

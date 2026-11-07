@@ -10,10 +10,11 @@ import stat
 import time
 
 from ..installer import AppInstaller
-from ..service import install_service, prepare_venv_checks, service_active
+from ..run_as_app import app_step
+from ..service import install_service, prepare_app_dir, prepare_venv_checks, service_active
 from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
-                     check_torch_cuda, run_venv_check, torch_cuda_status, torch_index_url,
-                     venv_python, log)
+                     check_torch_cuda, git_pull_as_app, git_version_as_app, run_venv_check,
+                     torch_cuda_status, torch_index_url, trust_repo_as_app, venv_python, log)
 
 AITOOLKIT_PORT = 8675
 
@@ -65,14 +66,19 @@ class AIToolkitInstaller(AppInstaller):
         """Install AI Toolkit from scratch."""
         log("Installing AI Toolkit...")
 
-        # 1. Clone repo
-        if not os.path.exists(self.app_dir):
+        # 1. Clone repo. The first clone stays ubuntu's: apps_dir isn't cloudgpu-app's to write,
+        # and there's nothing planted in a path that doesn't exist yet.
+        fresh = not os.path.exists(self.app_dir)
+        if fresh:
             log("Cloning AI Toolkit...")
             os.makedirs(self.state.apps_dir, exist_ok=True)
             run(["git", "clone", AITOOLKIT_REPO, self.app_dir])
+        prepare_app_dir(self.app_dir)
+        if fresh:
+            trust_repo_as_app(self.app_dir)
         else:
             log("AI Toolkit repo already exists, pulling latest...")
-            run(["git", "-C", self.app_dir, "pull"])
+            git_pull_as_app(self.app_dir)
 
         # 2. Create venv
         if not os.path.exists(self.venv_dir):
@@ -146,6 +152,7 @@ class AIToolkitInstaller(AppInstaller):
         # Verify PyTorch CUDA (system packages may differ on new instance;
         # also catches an arch switch, where every .so in the venv is wrong)
         prepare_venv_checks(self.venv_dir)
+        trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
             shutil.rmtree(self.venv_dir, ignore_errors=True)
@@ -161,10 +168,12 @@ class AIToolkitInstaller(AppInstaller):
         saved = self.state.get_app(self.name) or {}
         if saved.get("node_arch") != self._arch():
             log("Instance architecture changed, rebuilding UI node_modules...", "warn")
-            shutil.rmtree(os.path.join(self.ui_dir, "node_modules"), ignore_errors=True)
+            prepare_app_dir(self.app_dir)
+            self._wipe_node_modules()
             self._build_ui()
         elif not self._ui_built() or not os.path.isdir(os.path.join(self.ui_dir, "node_modules")):
             log("UI not fully built, building...", "warn")
+            prepare_app_dir(self.app_dir)
             self._build_ui()
 
         # Regenerate launch script + service (systemd unit is instance-local)
@@ -383,9 +392,21 @@ class AIToolkitInstaller(AppInstaller):
                      capture=True, check=False)
         log(f"Node.js installed: {result.stdout.strip()}")
 
+    def _wipe_node_modules(self) -> None:
+        """Remove node_modules as cloudgpu-app, or raise.
+
+        As ubuntu this could be refused on files cloudgpu-app wrote: `usermod -aG` doesn't reach
+        a process that's already running, so ubuntu isn't in the group yet on a new instance.
+        """
+        node_modules = os.path.join(self.ui_dir, "node_modules")
+        app_step(["rm", "-rf", node_modules], timeout=1800)
+        if os.path.lexists(node_modules):
+            raise RuntimeError(f"Couldn't remove {node_modules}")
+
     def _build_ui(self) -> None:
         """npm install + prisma db setup + next build (build once here; the
-        service only runs 'start', never rebuilds)."""
+        service only runs 'start', never rebuilds). Every step runs as cloudgpu-app, because
+        package.json and node_modules are theirs to write. prepare_app_dir must have run."""
         npm = os.path.join(self.node_bin, "npm")
         env = {
             "PATH": self.node_bin + os.pathsep + os.environ.get("PATH", ""),
@@ -395,30 +416,30 @@ class AIToolkitInstaller(AppInstaller):
         self._npm_install(npm, env)
         self._ensure_sqlite3(npm, env)
         log("Setting up UI database (prisma)...")
-        run([npm, "run", "update_db"], cwd=self.ui_dir, env=env, timeout=600)
+        app_step([npm, "run", "update_db"], cwd=self.ui_dir, env=env, timeout=600)
         log("Building UI (next build)...")
         # next build can exhaust the default Node heap
         build_env = {**env, "NODE_OPTIONS": "--max-old-space-size=4096"}
-        run([npm, "run", "build"], cwd=self.ui_dir, env=build_env, timeout=1800)
+        app_step([npm, "run", "build"], cwd=self.ui_dir, env=build_env, timeout=1800)
 
     def _npm_install(self, npm: str, env: dict) -> None:
         """npm install, retried once if it leaves node_modules half-written.
 
         npm downloads and extracts packages in parallel, and on this NFS with a
-        cold cache (every fresh instance starts with an empty ~/.npm) the
+        cold cache (cloudgpu-app's HOME is instance-local, so it starts empty) the
         extraction races itself: files vanish mid-write with TAR_ENTRY_ERROR
         ENOENT and packages land without their package.json. 'npm install'
         still exits 0, so the damage only surfaces much later — a package that
         lost its metadata reads as MODULE_NOT_FOUND during 'next build'. The
         retry extracts from the now-warm cache, which does not race.
         """
-        run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        app_step([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
         if self._npm_tree_ok(npm, env):
             return
         log("node_modules came out incomplete (npm's parallel extraction races "
             "on NFS); wiping and reinstalling from the warm cache...", "warn")
-        shutil.rmtree(os.path.join(self.ui_dir, "node_modules"), ignore_errors=True)
-        run([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
+        self._wipe_node_modules()
+        app_step([npm, "install"], cwd=self.ui_dir, env=env, timeout=1800)
         if not self._npm_tree_ok(npm, env):
             raise RuntimeError("npm install left an incomplete node_modules")
 
@@ -427,16 +448,18 @@ class AIToolkitInstaller(AppInstaller):
 
         'npm ls' exits non-zero for invalid or missing entries; unmet
         *optional* deps (the per-platform swc/macstats builds) exit 0, so they
-        do not trip this.
+        do not trip this. False wipes node_modules, so a check that couldn't run raises
+        CouldNotRun instead.
         """
-        result = run([npm, "ls", "--all"], cwd=self.ui_dir, env=env,
-                     check=False, capture=True, timeout=300)
+        result = app_step([npm, "ls", "--all"], cwd=self.ui_dir, env=env,
+                          check=False, capture=True, timeout=300)
         return result.returncode == 0
 
     def _sqlite3_loads(self, env: dict) -> bool:
+        """False starts a source rebuild, so a check that couldn't run raises CouldNotRun."""
         node = os.path.join(self.node_bin, "node")
-        result = run([node, "-e", "require('sqlite3')"], cwd=self.ui_dir,
-                     env=env, check=False, capture=True, timeout=120)
+        result = app_step([node, "-e", "require('sqlite3')"], cwd=self.ui_dir,
+                          env=env, check=False, capture=True, timeout=120)
         return result.returncode == 0
 
     def _ensure_sqlite3(self, npm: str, env: dict) -> None:
@@ -451,10 +474,10 @@ class AIToolkitInstaller(AppInstaller):
             return
         log("sqlite3 prebuilt binary is incompatible with this system's glibc; "
             "rebuilding from source...", "warn")
-        run([npm, "rebuild", "sqlite3", "--build-from-source"],
-            cwd=self.ui_dir,
-            env={**env, "npm_config_build_from_source": "true"},
-            timeout=1800)
+        app_step([npm, "rebuild", "sqlite3", "--build-from-source"],
+                 cwd=self.ui_dir,
+                 env={**env, "npm_config_build_from_source": "true"},
+                 timeout=1800)
         if not self._sqlite3_loads(env):
             raise RuntimeError("sqlite3 still fails to load after a source rebuild")
         log("sqlite3 rebuilt from source")
@@ -495,12 +518,4 @@ exec {self.node_bin}/npx concurrently --restart-tries -1 --restart-after 1000 -n
         """Get the current git commit short hash."""
         if not os.path.isdir(self.app_dir):
             return None
-        try:
-            result = run(
-                ["git", "-C", self.app_dir, "rev-parse", "--short", "HEAD"],
-                capture=True,
-                check=False,
-            )
-            return result.stdout.strip() if result.returncode == 0 else None
-        except Exception:
-            return None
+        return git_version_as_app(self.app_dir)

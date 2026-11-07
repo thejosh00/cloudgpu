@@ -99,6 +99,17 @@ def migrate_ownership(paths: list[str]) -> None:
         run(["sudo", "find", path, "-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
 
 
+def prepare_app_dir(app_dir: str) -> None:
+    """Make sure ``cloudgpu-app`` exists and can write ``app_dir``, so steps can run as it there.
+
+    A new instance may have neither the user nor a shared directory: a filesystem from an earlier
+    (ubuntu-run) version has files only ubuntu can change, including an old build's. Raises if
+    it can't, and the step that needed it must not go ahead.
+    """
+    ensure_app_user()
+    migrate_ownership([app_dir])
+
+
 def prepare_venv_checks(venv_dir: str) -> None:
     """Make sure ``cloudgpu-app`` exists and can read ``venv_dir``, so checks can run as it.
 

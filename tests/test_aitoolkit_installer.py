@@ -14,7 +14,10 @@ from cloudgpu.remote.state import State
 class TestAIToolkitInstaller:
     @pytest.fixture(autouse=True)
     def no_real_sudo(self):
-        with patch("cloudgpu.remote.apps.aitoolkit.prepare_venv_checks"):
+        module = "cloudgpu.remote.apps.aitoolkit"
+        with (patch(f"{module}.prepare_venv_checks"), patch(f"{module}.prepare_app_dir"),
+              patch(f"{module}.trust_repo_as_app"), patch(f"{module}.git_pull_as_app"),
+              patch(f"{module}.git_version_as_app", return_value="abc1234")):
             yield
 
     @pytest.fixture
@@ -110,6 +113,7 @@ class TestAIToolkitInstaller:
         assert os.path.join(installer.venv_dir, "bin") in content
         assert os.access(installer.launch_script, os.X_OK)
 
+    @patch.object(AIToolkitInstaller, "_wipe_node_modules")
     @patch.object(AIToolkitInstaller, "_build_ui")
     @patch.object(AIToolkitInstaller, "_ensure_node")
     @patch("cloudgpu.remote.apps.aitoolkit.install_service")
@@ -118,7 +122,7 @@ class TestAIToolkitInstaller:
     @patch("cloudgpu.remote.apps.aitoolkit.check_torch_cuda", return_value=True)
     def test_recover_arch_change_rebuilds_node_modules(
             self, mock_torch, mock_pip, mock_run, mock_service,
-            mock_node, mock_build, installer, state):
+            mock_node, mock_build, mock_wipe, installer, state):
         """An arch switch wipes per-arch node_modules and rebuilds the UI."""
         mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n")
         node_modules = os.path.join(installer.ui_dir, "node_modules")
@@ -128,7 +132,7 @@ class TestAIToolkitInstaller:
 
         installer.recover()
 
-        assert not os.path.isdir(node_modules)
+        mock_wipe.assert_called_once()
         mock_build.assert_called_once()
         assert state.get_app("ai-toolkit")["node_arch"] == installer._arch()
 
@@ -151,7 +155,7 @@ class TestAIToolkitInstaller:
 
         mock_build.assert_not_called()
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
     def test_npm_install_accepts_a_complete_tree(self, mock_run, installer):
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -162,11 +166,10 @@ class TestAIToolkitInstaller:
             ["npm", "install"], ["npm", "ls"],
         ]
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
-    def test_npm_install_retries_a_half_written_tree(self, mock_run, installer):
+    @patch.object(AIToolkitInstaller, "_wipe_node_modules")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
+    def test_npm_install_retries_a_half_written_tree(self, mock_run, mock_wipe, installer):
         """Cold-cache npm extraction races on NFS and exits 0 anyway."""
-        node_modules = os.path.join(installer.ui_dir, "node_modules")
-        os.makedirs(node_modules)
         mock_run.side_effect = [
             MagicMock(returncode=0),  # npm install
             MagicMock(returncode=1),  # npm ls: invalid packages
@@ -176,17 +179,18 @@ class TestAIToolkitInstaller:
 
         installer._npm_install("npm", {"PATH": "/bin"})
 
-        assert not os.path.isdir(node_modules)  # wiped before the retry
+        mock_wipe.assert_called_once()  # wiped before the retry
         assert mock_run.call_count == 4
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
-    def test_npm_install_raises_if_still_incomplete(self, mock_run, installer):
+    @patch.object(AIToolkitInstaller, "_wipe_node_modules")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
+    def test_npm_install_raises_if_still_incomplete(self, mock_run, mock_wipe, installer):
         mock_run.return_value = MagicMock(returncode=1)
 
         with pytest.raises(RuntimeError, match="node_modules"):
             installer._npm_install("npm", {"PATH": "/bin"})
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
     def test_ensure_sqlite3_skips_rebuild_when_loadable(self, mock_run, installer):
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -196,7 +200,7 @@ class TestAIToolkitInstaller:
         assert mock_run.call_count == 1
         assert "-e" in mock_run.call_args[0][0]
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
     def test_ensure_sqlite3_rebuilds_from_source(self, mock_run, installer):
         """glibc-incompatible prebuild is recompiled locally, then re-probed."""
         mock_run.side_effect = [
@@ -211,7 +215,7 @@ class TestAIToolkitInstaller:
         assert rebuild[0][0] == ["npm", "rebuild", "sqlite3", "--build-from-source"]
         assert rebuild[1]["env"]["npm_config_build_from_source"] == "true"
 
-    @patch("cloudgpu.remote.apps.aitoolkit.run")
+    @patch("cloudgpu.remote.apps.aitoolkit.app_step")
     def test_ensure_sqlite3_raises_if_still_broken(self, mock_run, installer):
         mock_run.return_value = MagicMock(returncode=1)
 

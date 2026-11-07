@@ -7,9 +7,11 @@ import stat
 import time
 
 from ..installer import AppInstaller
-from ..service import install_service, prepare_venv_checks, service_active
+from ..run_as_app import app_step
+from ..service import install_service, prepare_app_dir, prepare_venv_checks, service_active
 from ..utils import (run, pip_install, pip_install_torch, venv_python, check_torch_cuda,
-                     torch_cuda_status, log)
+                     git_pull_as_app, git_version_as_app, torch_cuda_status, trust_repo_as_app,
+                     log)
 
 COMFYUI_PORT = 8188
 
@@ -39,14 +41,19 @@ class ComfyUIInstaller(AppInstaller):
         """Install ComfyUI from scratch."""
         log("Installing ComfyUI...")
 
-        # 1. Clone ComfyUI
-        if not os.path.exists(self.app_dir):
+        # 1. Clone ComfyUI. The first clone stays ubuntu's: apps_dir isn't cloudgpu-app's to write,
+        # and there's nothing planted in a path that doesn't exist yet.
+        fresh = not os.path.exists(self.app_dir)
+        if fresh:
             log("Cloning ComfyUI...")
             os.makedirs(self.state.apps_dir, exist_ok=True)
             run(["git", "clone", COMFYUI_REPO, self.app_dir])
+        prepare_app_dir(self.app_dir)
+        if fresh:
+            trust_repo_as_app(self.app_dir)
         else:
             log("ComfyUI repo already exists, pulling latest...")
-            run(["git", "-C", self.app_dir, "pull"])
+            git_pull_as_app(self.app_dir)
 
         # 2. Create venv with
         if not os.path.exists(self.venv_dir):
@@ -85,11 +92,11 @@ class ComfyUIInstaller(AppInstaller):
         manager_dir = os.path.join(custom_nodes, "ComfyUI-Manager")
         if not os.path.exists(manager_dir):
             log("Cloning ComfyUI-Manager...")
-            os.makedirs(custom_nodes, exist_ok=True)
-            run(["git", "clone", MANAGER_REPO, manager_dir])
+            app_step(["mkdir", "-p", custom_nodes], timeout=60)
+            app_step(["git", "clone", MANAGER_REPO, manager_dir], timeout=600)
         else:
             log("ComfyUI-Manager already exists, pulling latest...")
-            run(["git", "-C", manager_dir, "pull"])
+            git_pull_as_app(manager_dir)
 
         # Install manager requirements if they exist
         manager_requirements = os.path.join(manager_dir, "requirements.txt")
@@ -143,6 +150,7 @@ class ComfyUIInstaller(AppInstaller):
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
         prepare_venv_checks(self.venv_dir)
+        trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
             import shutil
@@ -228,12 +236,4 @@ exec {python} {main_py} --listen 127.0.0.1 --port 8188 "$@"
         """Get the current git commit short hash."""
         if not os.path.isdir(self.app_dir):
             return None
-        try:
-            result = run(
-                ["git", "-C", self.app_dir, "rev-parse", "--short", "HEAD"],
-                capture=True,
-                check=False,
-            )
-            return result.stdout.strip() if result.returncode == 0 else None
-        except Exception:
-            return None
+        return git_version_as_app(self.app_dir)

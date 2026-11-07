@@ -14,7 +14,10 @@ from cloudgpu.remote.state import State
 class TestComfyUIInstaller:
     @pytest.fixture(autouse=True)
     def no_real_sudo(self):
-        with patch("cloudgpu.remote.apps.comfyui.prepare_venv_checks"):
+        module = "cloudgpu.remote.apps.comfyui"
+        with (patch(f"{module}.prepare_venv_checks"), patch(f"{module}.prepare_app_dir"),
+              patch(f"{module}.trust_repo_as_app"), patch(f"{module}.git_pull_as_app"),
+              patch(f"{module}.git_version_as_app", return_value="abc1234")):
             yield
 
     @pytest.fixture

@@ -7,7 +7,8 @@ import pwd
 import subprocess
 import sys
 
-from .run_as_app import APP_USER  # unprivileged user that runs app services and app-venv code
+# APP_USER: the unprivileged user that runs app services and app-venv code.
+from .run_as_app import APP_USER, CouldNotRun, app_step
 
 # Printed by every app-venv check before it does anything else, so a check that never got as
 # far as running (sudo refused, venv unreadable) can't be mistaken for one that failed.
@@ -104,6 +105,40 @@ def run_venv_check(venv_dir: str, code: str, timeout: int = 600) -> bool:
         raise VenvCheckUnavailable(
             f"couldn't run as '{APP_USER}': {result.stderr.strip() or 'no output'}")
     return result.returncode == 0
+
+
+def trust_repo_as_app(repo: str) -> None:
+    """Let APP_USER's git use a repo another user cloned, which it otherwise calls dubious.
+
+    Older gits ignore `-c safe.directory`, so this has to be APP_USER's global config. That lives
+    in its instance-local HOME, so every new instance needs this again. It names this one repo,
+    and it doesn't reach ubuntu's own git.
+    """
+    app_step(["git", "config", "--global", "--add", "safe.directory", repo], timeout=60)
+
+
+def git_pull_as_app(repo: str) -> None:
+    """Pull as APP_USER, because a hook or config in .git is theirs to write."""
+    trust_repo_as_app(repo)
+    app_step(["git", "-C", repo, "pull"], timeout=600)
+
+
+def git_version_as_app(repo: str) -> str | None:
+    """The repo's short commit hash, or None if it couldn't be read. Read-only.
+
+    `status` comes through here, so a user that doesn't exist yet means no sudo at all.
+    """
+    try:
+        pwd.getpwnam(APP_USER)
+    except KeyError:
+        return None
+    try:
+        result = app_step(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                          capture=True, check=False, timeout=60)
+    except (CouldNotRun, subprocess.TimeoutExpired) as e:
+        log(f"Couldn't read the version of {repo}: {e}", "warn")
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def check_torch_cuda(venv_dir: str) -> bool:
