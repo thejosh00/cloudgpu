@@ -68,7 +68,10 @@ hidden, and only the app's own dirs on the persistent filesystem (plus its priva
 in `/var/lib/cloudgpu-app` and `/tmp`) are writable. That keeps third-party code away
 from the root-only Lambda key used by auto-terminate. Setup and provisioning still run
 as `ubuntu`, which shares the app dirs through the `cloudgpu-app` group; existing
-filesystems are migrated to that group automatically on install/recover.
+filesystems are migrated to that group automatically on install/recover. cloudgpu's own
+checks of an app venv (`status`, install, recover) run its Python as `cloudgpu-app` too, never
+as `ubuntu`. Before install or recovery has created that user, `status` shows the app as
+`unverified` rather than running anything.
 
 ### Provisioning (extra setup, e.g. model downloads)
 

@@ -7,8 +7,9 @@ import stat
 import time
 
 from ..installer import AppInstaller
-from ..service import install_service, service_active
-from ..utils import run, pip_install, pip_install_torch, venv_python, check_torch_cuda, log
+from ..service import install_service, prepare_venv_checks, service_active
+from ..utils import (run, pip_install, pip_install_torch, venv_python, check_torch_cuda,
+                     torch_cuda_status, log)
 
 COMFYUI_PORT = 8188
 
@@ -57,6 +58,7 @@ class ComfyUIInstaller(AppInstaller):
 
         # 3. Verify PyTorch CUDA and install torchvision/torchaudio in venv
         log("Checking PyTorch CUDA availability...")
+        prepare_venv_checks(self.venv_dir)
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA not available via system packages, installing...", "warn")
             pip_install_torch(self.venv_dir, timeout=600)
@@ -115,7 +117,7 @@ class ComfyUIInstaller(AppInstaller):
             "app_dir": os.path.isdir(self.app_dir),
             "venv": os.path.isdir(self.venv_dir),
             "main_py": os.path.isfile(os.path.join(self.app_dir, "main.py")),
-            "torch_cuda": check_torch_cuda(self.venv_dir),
+            "torch_cuda": torch_cuda_status(self.venv_dir) is True,
             "launch_script": os.path.isfile(self.launch_script),
         }
         for check, passed in checks.items():
@@ -140,6 +142,7 @@ class ComfyUIInstaller(AppInstaller):
                 pip_install(self.venv_dir, "-r", requirements, timeout=120)
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
+        prepare_venv_checks(self.venv_dir)
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
             import shutil
@@ -168,10 +171,13 @@ class ComfyUIInstaller(AppInstaller):
         """Get current ComfyUI status."""
         app_exists = os.path.isdir(self.app_dir)
         venv_exists = os.path.isdir(self.venv_dir)
-        torch_ok = check_torch_cuda(self.venv_dir) if venv_exists else False
+        torch_ok = torch_cuda_status(self.venv_dir) if venv_exists else False
 
         saved = self.state.get_app(self.name) or {}
-        status = "installed" if (app_exists and venv_exists and torch_ok) else "broken"
+        if not (app_exists and venv_exists) or torch_ok is False:
+            status = "broken"
+        else:
+            status = "installed" if torch_ok else "unverified"
 
         return {
             "status": status,

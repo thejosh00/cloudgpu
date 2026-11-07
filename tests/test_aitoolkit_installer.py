@@ -12,6 +12,11 @@ from cloudgpu.remote.state import State
 
 
 class TestAIToolkitInstaller:
+    @pytest.fixture(autouse=True)
+    def no_real_sudo(self):
+        with patch("cloudgpu.remote.apps.aitoolkit.prepare_venv_checks"):
+            yield
+
     @pytest.fixture
     def state(self, tmp_persistent_dir):
         return State(tmp_persistent_dir)

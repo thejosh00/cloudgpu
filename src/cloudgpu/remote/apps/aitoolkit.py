@@ -10,9 +10,10 @@ import stat
 import time
 
 from ..installer import AppInstaller
-from ..service import install_service, service_active
-from ..utils import (run, pip_install, pip_install_torch, check_torch_cuda,
-                     torch_index_url, venv_python, log)
+from ..service import install_service, prepare_venv_checks, service_active
+from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
+                     check_torch_cuda, run_venv_check, torch_cuda_status, torch_index_url,
+                     venv_python, log)
 
 AITOOLKIT_PORT = 8675
 
@@ -112,7 +113,7 @@ class AIToolkitInstaller(AppInstaller):
             "app_dir": os.path.isdir(self.app_dir),
             "venv": os.path.isdir(self.venv_dir),
             "run_py": os.path.isfile(os.path.join(self.app_dir, "run.py")),
-            "torch_cuda": check_torch_cuda(self.venv_dir),
+            "torch_cuda": torch_cuda_status(self.venv_dir) is True,
             "venv_symlink": os.path.islink(os.path.join(self.app_dir, "venv")),
             "node": self._node_works(),
             "ui_built": self._ui_built(),
@@ -140,6 +141,7 @@ class AIToolkitInstaller(AppInstaller):
 
         # Verify PyTorch CUDA (system packages may differ on new instance;
         # also catches an arch switch, where every .so in the venv is wrong)
+        prepare_venv_checks(self.venv_dir)
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
             shutil.rmtree(self.venv_dir, ignore_errors=True)
@@ -180,11 +182,14 @@ class AIToolkitInstaller(AppInstaller):
         """Get current AI Toolkit status."""
         app_exists = os.path.isdir(self.app_dir)
         venv_exists = os.path.isdir(self.venv_dir)
-        torch_ok = check_torch_cuda(self.venv_dir) if venv_exists else False
+        torch_ok = torch_cuda_status(self.venv_dir) if venv_exists else False
         ui_built = self._ui_built()
 
         saved = self.state.get_app(self.name) or {}
-        status = "installed" if (app_exists and venv_exists and torch_ok and ui_built) else "broken"
+        if not (app_exists and venv_exists and ui_built) or torch_ok is False:
+            status = "broken"
+        else:
+            status = "installed" if torch_ok else "unverified"
 
         return {
             "status": status,
@@ -232,6 +237,7 @@ class AIToolkitInstaller(AppInstaller):
     def _ensure_torch(self) -> None:
         """Make sure the venv has a working CUDA PyTorch, plus vision/audio."""
         log("Checking PyTorch CUDA availability...")
+        prepare_venv_checks(self.venv_dir)
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA not available via system packages, installing...", "warn")
             pip_install_torch(self.venv_dir, timeout=600)
@@ -310,10 +316,15 @@ class AIToolkitInstaller(AppInstaller):
             log(f"torchcodec install failed ({e}); video and audio datasets "
                 f"will not work, image training is unaffected", "warn")
             return
-        probe = run([venv_python(self.venv_dir), "-c",
-                     "from torchcodec.decoders import VideoDecoder"],
-                    check=False, capture=True, timeout=300)
-        if probe.returncode != 0:
+        try:
+            loads = run_venv_check(self.venv_dir,
+                                   "from torchcodec.decoders import VideoDecoder",
+                                   timeout=300)
+        except VenvCheckUnavailable as e:
+            log(f"Couldn't check that torchcodec loads ({e}); video and audio datasets "
+                f"may not work, image training is unaffected", "warn")
+            return
+        if not loads:
             log("torchcodec installed but fails to load (needs FFmpeg shared "
                 "libraries and a matching torch build); video and audio "
                 "datasets will not work, image training is unaffected", "warn")

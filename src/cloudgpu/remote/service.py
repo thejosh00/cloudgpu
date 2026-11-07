@@ -27,10 +27,9 @@ import os
 import pwd
 from typing import Any
 
-from .utils import log, run
+from .utils import APP_USER, log, run
 
 
-APP_USER = "cloudgpu-app"
 APP_HOME = f"/var/lib/{APP_USER}"  # instance-local; owned by APP_USER (caches live here)
 
 
@@ -98,6 +97,17 @@ def migrate_ownership(paths: list[str]) -> None:
         run(["sudo", "chgrp", "-hR", APP_USER, path])
         run(["sudo", "chmod", "-R", "g+rwX", path])
         run(["sudo", "find", path, "-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+
+
+def prepare_venv_checks(venv_dir: str) -> None:
+    """Make sure ``cloudgpu-app`` exists and can read ``venv_dir``, so checks can run as it.
+
+    Not for read-only callers: this creates the user and changes ownership. On a new
+    instance the user doesn't exist yet, and a venv from an earlier (ubuntu-run) version
+    may not have been migrated, so install and recovery call this before checking.
+    """
+    ensure_app_user()
+    migrate_ownership([venv_dir])
 
 
 def install_service(spec: dict[str, Any]) -> None:

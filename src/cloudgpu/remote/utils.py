@@ -3,8 +3,19 @@
 from __future__ import annotations
 
 import os
+import pwd
 import subprocess
 import sys
+
+APP_USER = "cloudgpu-app"  # unprivileged user that runs app services and app-venv code
+
+# Printed by every app-venv check before it does anything else, so a check that never got as
+# far as running (sudo refused, venv unreadable) can't be mistaken for one that failed.
+_CHECK_STARTED = "cloudgpu-venv-check-started"
+
+
+class VenvCheckUnavailable(RuntimeError):
+    """An app-venv check couldn't run to a conclusion, so it says nothing about the venv."""
 
 
 def run(
@@ -61,18 +72,52 @@ def venv_python(venv_dir: str) -> str:
     return os.path.join(venv_dir, "bin", "python3")
 
 
-def check_torch_cuda(venv_dir: str) -> bool:
-    """Check if PyTorch with CUDA works in a venv."""
+def run_venv_check(venv_dir: str, code: str, timeout: int = 600) -> bool:
+    """Run ``code`` with a venv's Python as APP_USER; True if it succeeded.
+
+    App code can write the venv, so its Python must never run as ``ubuntu``, which has
+    passwordless sudo. sudo resets the environment, so secrets don't reach it either.
+
+    False is a verdict: the check ran and failed, or the venv has no Python. Raises
+    VenvCheckUnavailable when the check couldn't run to a conclusion, because callers
+    rebuild a venv on False and that must not happen to a good one.
+    """
     python = venv_python(venv_dir)
+    if not os.path.exists(python):
+        return False
+    try:
+        pwd.getpwnam(APP_USER)
+    except KeyError:
+        raise VenvCheckUnavailable(f"user '{APP_USER}' doesn't exist yet") from None
     try:
         result = run(
-            [python, "-c", "import torch; assert torch.cuda.is_available()"],
+            ["sudo", "-n", "-H", "-u", APP_USER, "--", python, "-c",
+             f"print({_CHECK_STARTED!r}, flush=True)\n{code}"],
+            cwd="/",  # ubuntu's cwd may be unreadable to APP_USER, or hold planted modules
             capture=True,
             check=False,
+            timeout=timeout,
         )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise VenvCheckUnavailable(f"couldn't run as '{APP_USER}': {e}") from e
+    if _CHECK_STARTED not in result.stdout:
+        raise VenvCheckUnavailable(
+            f"couldn't run as '{APP_USER}': {result.stderr.strip() or 'no output'}")
+    return result.returncode == 0
+
+
+def check_torch_cuda(venv_dir: str) -> bool:
+    """Check if PyTorch with CUDA works in a venv (see run_venv_check)."""
+    return run_venv_check(venv_dir, "import torch; assert torch.cuda.is_available()")
+
+
+def torch_cuda_status(venv_dir: str) -> bool | None:
+    """check_torch_cuda for read-only callers: None means it couldn't be checked."""
+    try:
+        return check_torch_cuda(venv_dir)
+    except VenvCheckUnavailable as e:
+        log(f"PyTorch CUDA unverified: {e}", "warn")
+        return None
 
 
 def detect_cuda_version() -> str | None:
