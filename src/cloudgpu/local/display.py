@@ -6,6 +6,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from . import capacity
+
 console = Console()
 error_console = Console(stderr=True)
 
@@ -24,6 +26,36 @@ def warn(msg: str) -> None:
 
 def info(msg: str) -> None:
     console.print(msg)
+
+
+def show_capacity_report(path: object, samples: list[dict], skipped: int, reports: list[dict]) -> None:
+    """Print the capacity report as plain text: names in it come from files, so never as markup."""
+    def line(text: str) -> None:
+        console.print(text, markup=False, highlight=False, soft_wrap=True)
+
+    def share(count: int, total: int) -> str:
+        return f"{count} of {total} ({capacity.percent(count, total)})"
+
+    stamps = [s["timestamp"] for s in samples]
+    line(f"Capacity samples in {path}")
+    line(f"  Samples: {len(samples)}, first {min(stamps)}, last {max(stamps)}")
+    line(f"  Skipped: {skipped} unreadable lines, counted in no bucket")
+    for report in reports:
+        line("")
+        line(f"{report['name']}: gpu {', '.join(report['gpu'])} = {', '.join(report['targets'])}")
+        if "problem" in report:
+            line(f"  No home figures: {report['problem']}")
+            continue
+        total, counts = report["total"], report["counts"]
+        line(f"  Home region: {report['home']} ({report['home_source']})")
+        line(f"  Home region had capacity:        {share(counts[capacity.HOME], total)}")
+        line(f"  Only other regions had capacity: {share(counts[capacity.ELSEWHERE], total)}"
+             "  <- the go/no-go reads this")
+        line(f"  No region had capacity:          {share(counts[capacity.NONE], total)}")
+        line(f"  Types not listed in the sample:  {share(counts[capacity.NOT_LISTED], total)}")
+        line("  Regions by samples with capacity:" + ("" if report["regions"] else " none"))
+        for region, count in report["regions"]:
+            line(f"    {region}: {share(count, total)}")
 
 
 def show_detection(detection: dict) -> None:

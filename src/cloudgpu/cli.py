@@ -1046,6 +1046,70 @@ def capacity_log() -> None:
     display.info(f"Recorded a capacity sample in {path}")
 
 
+def _filesystems_or_exit() -> list[dict]:
+    """The account's filesystems. A failed lookup must stop the report, not read as no home region."""
+    try:
+        filesystems = _api_call(lambda_api.list_filesystems)
+        if not isinstance(filesystems, list) or not all(isinstance(f, dict) for f in filesystems):
+            raise ValueError("the response is not a list of filesystems")
+    except (ValueError, OSError) as e:
+        display.error(f"No capacity report: could not look up filesystems: {e}")
+        sys.exit(1)
+    return filesystems
+
+
+@capacity_group.command(name="report")
+def capacity_report() -> None:
+    """Show how often each config in ./configs had capacity, from the logged samples."""
+    path = capacity.log_path()
+    try:
+        samples, skipped = capacity.read_samples(path)
+    except OSError as e:
+        display.error(f"No capacity report: could not read {path}: {e}")
+        sys.exit(1)
+    if not samples:
+        display.error(f"No capacity samples in {path} ({skipped} unreadable lines skipped).")
+        sys.exit(1)
+
+    config_dir = Path.cwd() / configs.CONFIGS_DIR
+    config_paths = sorted(config_dir.glob(f"*{configs.CONFIG_SUFFIX}"))
+    if not config_paths:
+        display.error(f"No capacity report: no configs in {config_dir}.")
+        sys.exit(1)
+
+    reports: list[dict] = []
+    loaded: list[dict] = []
+    for config_path in config_paths:
+        try:
+            loaded.append(configs.load_config(config_path))
+        except config.ConfigError as e:
+            reports.append({"name": config_path.stem, "gpu": [], "targets": [], "problem": str(e)})
+    # Only a config with no region of its own needs the API, and so the key.
+    filesystems = _filesystems_or_exit() if any(not c.get("region") for c in loaded) else []
+
+    for cfg in loaded:
+        targets = orchestration.expand_targets(cfg["gpu"])
+        report = {"name": cfg["name"], "gpu": cfg["gpu"], "targets": targets}
+        home = orchestration.home_region(cfg, filesystems)
+        if home is None:
+            report["problem"] = (
+                f"it sets no region and no filesystem named '{cfg['filesystem']}' has one, "
+                "so it has no home region yet."
+            )
+        else:
+            report["home"] = home
+            report["home_source"] = (
+                "set in the config" if cfg.get("region") else f"its filesystem '{cfg['filesystem']}'"
+            )
+            report.update(capacity.summarize(samples, targets, home))
+        reports.append(report)
+    reports.sort(key=lambda r: r["name"])
+
+    display.show_capacity_report(path, samples, skipped, reports)
+    if all("problem" in r for r in reports):
+        sys.exit(1)
+
+
 @cli.group(name="lambda")
 def lambda_group() -> None:
     """Manage Lambda Cloud resources via the API (needs LAMBDA_API_KEY)."""

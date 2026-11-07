@@ -127,6 +127,17 @@ def region_for_filesystem(filesystem: str) -> str | None:
     return _fs_region(fs) if fs else None
 
 
+def home_region(cfg: dict[str, Any], filesystems: list[dict]) -> str | None:
+    """Return the region ``acquire_instance`` would launch this config in, or None if undecided."""
+    if cfg.get("region"):
+        return cfg["region"]
+    for fs in filesystems:
+        if fs.get("name") == cfg["filesystem"]:
+            region = _fs_region(fs)
+            return region if isinstance(region, str) and region else None
+    return None
+
+
 def pick_target(types: dict, targets: list[str], region: str) -> str | None:
     """Return the first target type (in preference order) with capacity in ``region``."""
     for tname in targets:
