@@ -20,7 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
-from cloudgpu.remote.apps.aitoolkit import _FLATTEN_REQUIREMENTS, AIToolkitInstaller
+from cloudgpu.remote.apps import aitoolkit
+from cloudgpu.remote.apps.aitoolkit import AIToolkitInstaller
 from cloudgpu.remote.apps.comfyui import ComfyUIInstaller
 from cloudgpu.remote.state import State
 from cloudgpu.remote.utils import pip_install
@@ -545,7 +546,7 @@ class TestFlatten:
         monkeypatch.setattr(os, "unlink", unlink_then_plant)
         monkeypatch.setattr(sys, "argv", ["flatten", str(requirements), str(patched)])
         with pytest.raises(SystemExit) as stopped:
-            exec(_FLATTEN_REQUIREMENTS, {})
+            exec(aitoolkit._FLATTEN_REQUIREMENTS, {})
         assert stopped.value.code  # a message, not a clean exit
         assert victim.read_text() == "untouched\n"
 
