@@ -39,6 +39,7 @@ READ_MODES = {
     "http_500",  # ASSUMPTION: the spec lists no 5xx for reads, but gateways answer them anyway
     "http_502",  # ASSUMPTION: as above, with an HTML body
     "http_503",  # ASSUMPTION: as above
+    "http_500_not_found_code",  # ASSUMPTION: the not-found code on a status that isn't 404
     "http_429",  # published: global/rate-limited
     "http_401",  # published: global/invalid-api-key
     "http_403",  # published: global/forbidden
@@ -200,6 +201,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
             """Answer as this read mode says. Anything but ok finishes the request."""
             if mode == "http_500":
                 self._send(500, raw=b"Internal Server Error")
+            elif mode == "http_500_not_found_code":
+                self._error(500, "global/object-does-not-exist", "Specified instance does not exist.")
             elif mode == "http_502":
                 self._send(502, raw=b"<html>502 Bad Gateway</html>")
             elif mode == "http_503":
@@ -225,7 +228,7 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                 entry = {"id": "fake-instance-1", "status": "hibernating", "file_system_names": list(fake.filesystems)}
                 self._send(200, {"data": [entry] if self.path.endswith("/instances") else entry})
             elif mode == "200_not_a_list":
-                self._send(200, {"data": {"oops": True}})
+                self._send(200, {"data": {}})  # empty, so iterating it finds nothing rather than failing
             elif mode == "drop":
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)

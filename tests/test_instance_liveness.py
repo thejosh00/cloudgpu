@@ -46,7 +46,7 @@ def assert_stopped_unchanged(fake, result, state):
 
 @pytest.mark.parametrize(
     "mode",
-    ["http_500", "http_502", "http_503", "http_429", "http_401", "http_403", "404_no_code", "404_other_code",
+    ["http_500", "http_500_not_found_code", "http_502", "http_503", "http_429", "http_401", "http_403", "404_no_code", "404_other_code",
      "200_html", "200_no_status", "200_unlisted_status", "drop", "stall"],
 )
 def test_up_stops_unchanged_when_the_tracked_read_is_unclear(tmp_path, mode):
@@ -171,7 +171,9 @@ def test_an_error_that_clears_reuses_the_instance(tmp_path):
 # --- gone, and then what the listing says -------------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["http_503", "http_401", "drop", "200_html", "200_not_a_list", "200_no_status"])
+@pytest.mark.parametrize(
+    "mode", ["http_503", "http_401", "drop", "200_html", "200_not_a_list", "200_no_status", "200_unlisted_status"]
+)
 def test_gone_then_a_failed_list_does_not_launch(tmp_path, mode):
     """Catches: "couldn't list" reading as "nothing mounts it", and clearing state before asking."""
     state = tracked_state("gone-id")
@@ -273,7 +275,9 @@ def test_a_lost_launch_reply_after_a_gone_keeps_the_state(tmp_path):
 # --- down ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["http_503", "http_401", "drop", "200_html", "200_not_a_list", "200_no_status"])
+@pytest.mark.parametrize(
+    "mode", ["http_503", "http_401", "drop", "200_html", "200_not_a_list", "200_no_status", "200_unlisted_status"]
+)
 def test_down_with_nothing_tracked_and_a_failed_list_stops(tmp_path, mode):
     """Catches: "No running instance" and exit 0 during an outage, while an instance goes on billing."""
     with FakeLambda(list_reads_then=mode) as fake:
