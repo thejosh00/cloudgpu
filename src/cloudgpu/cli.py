@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from cloudgpu.local import apps, config, configs, display, lambda_api, orchestration, profiles, ssh, sync
+from cloudgpu.local import apps, capacity, config, configs, display, lambda_api, orchestration, profiles, ssh, sync
 
 console = Console()
 
@@ -1027,6 +1027,23 @@ def _api_call(fn, *args, **kwargs):
     except lambda_api.LambdaAPIError as e:
         display.error(str(e))
         sys.exit(1)
+
+
+@cli.group(name="capacity")
+def capacity_group() -> None:
+    """Record GPU capacity over time (needs LAMBDA_API_KEY)."""
+    pass
+
+
+@capacity_group.command(name="log")
+def capacity_log() -> None:
+    """Take one capacity sample and append it to the log. A failure records nothing."""
+    try:
+        path = capacity.append_sample(_api_call(lambda_api.list_instance_types))
+    except (ValueError, OSError) as e:
+        display.error(f"No capacity sample recorded: {e}")
+        sys.exit(1)
+    display.info(f"Recorded a capacity sample in {path}")
 
 
 @cli.group(name="lambda")

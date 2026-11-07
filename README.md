@@ -259,6 +259,10 @@ cloudgpu lambda instances          # grab the IP once it's active
 cloudgpu setup ubuntu@<instance-ip>
 ```
 
+`cloudgpu capacity log` takes one sample of which instance types have capacity in which regions
+and appends it to `~/.local/state/cloudgpu/capacity.jsonl`. A failed API call exits non-zero and
+records nothing, so a missing sample is never mistaken for "no capacity".
+
 ## How It Works
 
 1. Local CLI connects via SSH using your existing keys/config
