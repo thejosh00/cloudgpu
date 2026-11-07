@@ -7,7 +7,7 @@ import pwd
 import subprocess
 import sys
 
-APP_USER = "cloudgpu-app"  # unprivileged user that runs app services and app-venv code
+from .run_as_app import APP_USER  # unprivileged user that runs app services and app-venv code
 
 # Printed by every app-venv check before it does anything else, so a check that never got as
 # far as running (sudo refused, venv unreadable) can't be mistaken for one that failed.

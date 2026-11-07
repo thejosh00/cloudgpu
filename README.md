@@ -95,8 +95,18 @@ configs/my-box.state.json # tool-written state (gitignored, never rsynced)
 
 The entry point runs with the folder as CWD and these env vars (plus `cloudgpu/bin` on
 `PATH`): `CLOUDGPU_PROVISION_DIR` (where the files landed), `CLOUDGPU_PERSISTENT_DIR`,
-`CLOUDGPU_APPS_DIR`, `CLOUDGPU_VENVS_DIR`, `CLOUDGPU_BIN_DIR`. Raise the time budget with
-`provision_timeout = 7200` (seconds) in the profile's `cloudgpu.toml`.
+`CLOUDGPU_APPS_DIR`, `CLOUDGPU_VENVS_DIR`, `CLOUDGPU_BIN_DIR`, `CLOUDGPU_RUN_AS_APP`. Raise the
+time budget with `provision_timeout = 7200` (seconds) in the profile's `cloudgpu.toml`.
+
+The entry point runs as `ubuntu` with every secret from `secrets.env`, and `cloudgpu-app` can write
+the venvs and app dirs. So never run anything from those directly. Run it as `cloudgpu-app`, naming
+the variables it needs; their values stay off the command line, and a named variable that isn't set
+stops the step:
+
+```python
+subprocess.run([sys.executable, os.environ["CLOUDGPU_RUN_AS_APP"], "--pass", "HF_TOKEN", "--",
+                f"{venvs}/comfyui/bin/python3", "-c", code], check=True)
+```
 
 Example `provision.py` using `comfylib` — fetch SDXL and (optionally) a Civitai model:
 

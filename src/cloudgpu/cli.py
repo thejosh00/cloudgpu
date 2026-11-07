@@ -501,6 +501,9 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
     ``provision.sh``) runs from inside it on every `up`, with the persistent-dir paths +
     CLOUDGPU_PROVISION_DIR in the environment and cloudgpu/bin on PATH. Output streams
     live; a non-zero exit fails `up`. A profile with no entry point skips provisioning.
+
+    The entry point stays ubuntu, with every secret: it's the person's own script. Anything
+    it runs from a venv or app dir must go through CLOUDGPU_RUN_AS_APP (remote/run_as_app.py).
     """
     pdir = profile["dir"]
     if (pdir / "provision.py").exists():
@@ -537,6 +540,7 @@ def _run_provision(profile: dict, host: str, persistent_dir: str) -> bool:
         f"CLOUDGPU_VENVS_DIR={persistent_dir}/venvs "
         f"CLOUDGPU_BIN_DIR={bin_dir} "
         f"CLOUDGPU_PROVISION_DIR={remote_dir} "
+        f"CLOUDGPU_RUN_AS_APP={persistent_dir}/cloudgpu/remote/run_as_app.py "
         f"PATH={bin_dir}:$PATH"
     )
     # umask 002: files provisioning creates in the (setgid, cloudgpu-app group) app dirs

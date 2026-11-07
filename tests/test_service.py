@@ -107,7 +107,7 @@ class TestSandboxedAppUnit:
         assert self._directive(unit, "NoNewPrivileges") == "yes"
         assert self._directive(unit, "ProtectSystem") == "strict"
         assert set(self._directive(unit, "ReadWritePaths").split()) == {
-            f"{p}/apps/ai-toolkit", f"{p}/venvs/ai-toolkit", service.APP_HOME,
+            f"{p}/apps/ai-toolkit", f"{p}/venvs/ai-toolkit", f"{p}/hf_cache", service.APP_HOME,
         }
 
     def test_rw_paths_default_to_workdir(self):

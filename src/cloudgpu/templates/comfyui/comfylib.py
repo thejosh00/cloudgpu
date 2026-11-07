@@ -17,6 +17,8 @@ Design notes:
 - Idempotent: a file that already exists is skipped; partial downloads resume (.part).
 - Secret-safe: auth tokens are passed to curl via a stdin config, never on argv (so they
   don't show up in the instance's process list).
+- Custom nodes run as ``cloudgpu-app``: that user can write them and the venv, so their git hooks
+  and the venv's pip must never run as ``ubuntu``. They get none of the tokens.
 - Reads the ``CLOUDGPU_*`` env vars that ``cloudgpu up`` sets, and writes everything under
   the persistent filesystem so it survives instance termination.
 """
@@ -129,23 +131,42 @@ def civitai(version_id: int | str, dest, *, token: str | None = None) -> Path:
 # --- comfyui extras -------------------------------------------------------
 
 
+def _run_as_app(step: str, cmd: list[str]) -> None:
+    """Run ``cmd`` as cloudgpu-app, with no tokens. Failure exits; it never runs as this user."""
+    helper = os.environ.get("CLOUDGPU_RUN_AS_APP")
+    if not helper:
+        _fail(f"can't {step}: CLOUDGPU_RUN_AS_APP not set — run this via `cloudgpu up`.")
+    rc = subprocess.run([sys.executable, helper, "--", *cmd], check=False).returncode
+    if rc != 0:
+        _fail(f"couldn't {step} as cloudgpu-app (exit {rc}).")
+
+
 def custom_node(git_url: str, *, name: str | None = None) -> Path:
-    """Clone (or update) a ComfyUI custom node and install its requirements into the venv."""
+    """Clone (or update) a ComfyUI custom node and install its requirements into the venv.
+
+    Every step runs as cloudgpu-app, and a step that fails exits non-zero.
+    """
     name = name or git_url.rstrip("/").split("/")[-1].removesuffix(".git")
     nodes = comfy_dir() / "custom_nodes"
     nodes.mkdir(parents=True, exist_ok=True)
     dest = nodes / name
     if dest.exists():
         _log(f"  ↻ updating custom node {name} ...")
-        subprocess.run(["git", "-C", str(dest), "pull", "--ff-only"], check=False)
+        # An earlier version cloned as ubuntu, and git refuses a repo owned by someone else.
+        # Older gits ignore `-c safe.directory`, so this has to be the user's global config.
+        _run_as_app(f"trust custom node {name}",
+                    ["git", "config", "--global", "--add", "safe.directory", str(dest)])
+        _run_as_app(f"update custom node {name}", ["git", "-C", str(dest), "pull", "--ff-only"])
     else:
         _log(f"  ↓ cloning custom node {name} ...")
-        subprocess.run(["git", "clone", "--depth", "1", git_url, str(dest)], check=True)
+        _run_as_app(f"clone custom node {name}",
+                    ["git", "clone", "--depth", "1", git_url, str(dest)])
 
     req = dest / "requirements.txt"
     venvs = os.environ.get("CLOUDGPU_VENVS_DIR")
     if req.exists() and venvs:
         pip = Path(venvs) / "comfyui" / "bin" / "pip"
         if pip.exists():
-            subprocess.run([str(pip), "install", "-r", str(req)], check=True)
+            _run_as_app(f"install requirements for custom node {name}",
+                        [str(pip), "install", "-r", str(req)])
     return dest
