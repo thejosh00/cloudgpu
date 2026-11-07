@@ -115,7 +115,12 @@ def _record_launch_info(host: str, persistent_dir: str) -> dict:
 @click.group()
 def cli() -> None:
     """CloudGPU - Install GPU Python apps on Lambda Labs instances."""
-    pass
+    # Refuse a bad test override here, before any command can read its refusal as a failed
+    # API call (`up` would take that to mean its tracked instance is gone).
+    try:
+        lambda_api.api_base_override()
+    except lambda_api.LambdaAPIError as e:
+        raise click.UsageError(str(e)) from e
 
 
 def _pick_persistent_dir(mounts: list[str], filesystem: str | None) -> str:

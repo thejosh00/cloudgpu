@@ -299,6 +299,18 @@ uv pip install -e ".[dev]"
 .venv/bin/pytest tests/ -v
 ```
 
+`tests/fake_lambda` is a fake of Lambda's API, with `ssh` and `rsync` shims, for running the
+real `cloudgpu up` with no GPU, no money and no network beyond loopback. One scripted run,
+ending with the instances it left behind:
+
+```bash
+uv run --frozen --extra dev python -m tests.fake_lambda
+uv run --frozen --extra dev python -m tests.fake_lambda --launch start_then_502   # see --help
+```
+
+It reaches the fake through `CLOUDGPU_TEST_LAMBDA_API_BASE`, which is for tests only. The API
+key is sent to whatever that names, so anything but a loopback address is refused.
+
 ## Design Decisions
 
 - **SSH via subprocess** (not paramiko) - uses your existing SSH config/keys, zero extra deps

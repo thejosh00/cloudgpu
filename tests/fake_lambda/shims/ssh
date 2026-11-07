@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Stands in for ssh on the tests' PATH: records the call, answers as a fresh instance would."""
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+while args and args[0].startswith("-"):
+    args = args[2:]  # up only passes `-o <option>` pairs
+host, command = args[0], " ".join(args[1:])
+with open(os.environ["FAKE_SHIM_LOG"], "a") as log:
+    log.write(json.dumps({"tool": "ssh", "host": host, "command": command}) + "\n")
+
+filesystem = os.environ["FAKE_SHIM_FILESYSTEM"]
+detection = {"persistent_dir": f"/lambda/nfs/{filesystem}", "gpu": {"available": False}}
+if command == "echo ok":
+    print("ok")
+elif "/lambda/nfs" in command and "listdir" in command:
+    print(json.dumps({"mounts": [filesystem]}))
+elif "python3 -m remote" in command and command.endswith(" detect"):
+    print(json.dumps(detection))
+elif "python3 -m remote" in command and command.endswith(" status"):
+    print(json.dumps({"detection": detection, "apps": {}}))

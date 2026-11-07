@@ -5,15 +5,22 @@ The API key is read from the LAMBDA_API_KEY env var.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 API_BASE = "https://cloud.lambda.ai/api/v1"
 
 API_KEY_ENV = "LAMBDA_API_KEY"
+
+# Test-only: points the client at tests/fake_lambda. The API key is sent to whatever this
+# names, so only a loopback address is accepted, and no proxy is ever used for it.
+API_BASE_ENV = "CLOUDGPU_TEST_LAMBDA_API_BASE"
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # cloud.lambda.ai is fronted by Cloudflare, which 403s the default
 # "Python-urllib/x.y" user agent. Send an explicit UA so requests get through.
@@ -35,6 +42,41 @@ def _api_key() -> str:
     return key
 
 
+def _is_loopback_url(url: str) -> bool:
+    """True only for http(s) to a literal loopback IP. A hostname could resolve anywhere."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        address = ipaddress.ip_address(parts.hostname or "")
+        parts.port  # raises ValueError on a bad port
+    except ValueError:
+        return False
+    return (
+        parts.scheme in ("http", "https")
+        and address.is_loopback
+        and "@" not in parts.netloc
+        and not parts.query
+        and not parts.fragment
+    )
+
+
+def api_base_override() -> str | None:
+    """The test-only API base if one is set, else None.
+
+    Raises:
+        LambdaAPIError: If it is set to anything but a loopback address.
+    """
+    override = os.environ.get(API_BASE_ENV)
+    if not override:
+        return None
+    if not _is_loopback_url(override):
+        raise LambdaAPIError(
+            f"Refusing {API_BASE_ENV}={override!r}: the Lambda API key is sent to whatever it "
+            "names, so it must be a loopback address such as http://127.0.0.1:8000/api/v1. "
+            "Unset it to use the real API."
+        )
+    return override.rstrip("/")
+
+
 def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     """Make an authenticated request and return the unwrapped ``data`` payload.
 
@@ -46,7 +88,8 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     Raises:
         LambdaAPIError: On missing key, network failure, or non-2xx response.
     """
-    url = f"{API_BASE}{path}"
+    override = api_base_override()
+    url = f"{override or API_BASE}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {
         "Authorization": f"Bearer {_api_key()}",
@@ -59,7 +102,8 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        open_url = _DIRECT_OPENER.open if override else urllib.request.urlopen
+        with open_url(req, timeout=60) as resp:
             payload = resp.read().decode()
     except urllib.error.HTTPError as e:
         raise LambdaAPIError(_format_http_error(e)) from e
