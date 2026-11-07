@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -296,7 +297,8 @@ class TestInstallAndRecovery:
         """Bug: a venv that really is broken (say, after an arch switch) is never rebuilt."""
         installer, module = app
         with patch(f"{module}.run", return_value=MagicMock(returncode=1, stdout="")) as run:
-            with patch(f"{module}.check_torch_cuda", side_effect=[False, True]):
+            with (patch(f"{module}.check_torch_cuda", side_effect=[False, True]),
+                  patch(f"{module}.wipe_venv", side_effect=shutil.rmtree)):
                 installer.recover()
         assert not (Path(installer.venv_dir) / GOOD_VENV).exists()
         assert any(c.args[0][:3] == ["python3", "-m", "venv"] for c in run.call_args_list)

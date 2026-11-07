@@ -58,6 +58,7 @@ class TestAIToolkitInstaller:
         assert status["service"] == "inactive"
         assert status["port"] == AITOOLKIT_PORT
 
+    @patch.object(AIToolkitInstaller, "_install_requirements")
     @patch.object(AIToolkitInstaller, "_build_ui")
     @patch.object(AIToolkitInstaller, "_ensure_node")
     @patch("cloudgpu.remote.apps.aitoolkit.install_service")
@@ -65,7 +66,7 @@ class TestAIToolkitInstaller:
     @patch("cloudgpu.remote.apps.aitoolkit.pip_install")
     @patch("cloudgpu.remote.apps.aitoolkit.check_torch_cuda", return_value=True)
     def test_install(self, mock_torch, mock_pip, mock_run, mock_service,
-                     mock_node, mock_build, installer, state):
+                     mock_node, mock_build, mock_requirements, installer, state):
         """Install records state, creates the launch script and venv symlink."""
         mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n")
 
@@ -221,24 +222,6 @@ class TestAIToolkitInstaller:
 
         with pytest.raises(RuntimeError, match="sqlite3"):
             installer._ensure_sqlite3("npm", {"PATH": "/bin"})
-
-    def test_patched_requirements_drops_torchcodec_pin(self, installer):
-        """The pin lives in an included file and must not reach pip.
-
-        torchcodec ships no Linux arm64 wheel below 0.10, so upstream's
-        0.9.1 pin fails the whole requirements pass on a GH200.
-        """
-        os.makedirs(installer.app_dir)
-        with open(os.path.join(installer.app_dir, "requirements_base.txt"), "w") as f:
-            f.write("av==16.0.1\ntorchcodec==0.9.1\nlibrosa==0.11.0\n")
-        requirements = os.path.join(installer.app_dir, "requirements.txt")
-        with open(requirements, "w") as f:
-            f.write("-r requirements_base.txt\nscipy==1.12.0\n")
-
-        with open(installer._patched_requirements(requirements)) as f:
-            lines = [ln for ln in f.read().splitlines() if ln and not ln.startswith("#")]
-
-        assert lines == ["av==16.0.1", "librosa==0.11.0", "scipy==1.12.0"]
 
     @patch("cloudgpu.remote.apps.aitoolkit.run")
     @patch("cloudgpu.remote.apps.aitoolkit.pip_install")

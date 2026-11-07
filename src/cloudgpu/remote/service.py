@@ -27,6 +27,7 @@ import os
 import pwd
 from typing import Any
 
+from .run_as_app import app_step
 from .utils import APP_USER, log, run
 
 
@@ -111,7 +112,8 @@ def prepare_app_dir(app_dir: str) -> None:
 
 
 def prepare_venv_checks(venv_dir: str) -> None:
-    """Make sure ``cloudgpu-app`` exists and can read ``venv_dir``, so checks can run as it.
+    """Make sure ``cloudgpu-app`` exists and can read and write ``venv_dir``, so checks and
+    installs can run as it.
 
     Not for read-only callers: this creates the user and changes ownership. On a new
     instance the user doesn't exist yet, and a venv from an earlier (ubuntu-run) version
@@ -119,6 +121,33 @@ def prepare_venv_checks(venv_dir: str) -> None:
     """
     ensure_app_user()
     migrate_ownership([venv_dir])
+
+
+def install_requirements_as_app(venv_dir: str, requirements: str, *, timeout: int) -> None:
+    """``pip install -r`` as cloudgpu-app, because pip builds what a requirements file names.
+
+    cloudgpu-app can write those files, and ubuntu has passwordless sudo. Raises if it can't run or
+    pip fails. The venv is shared again each time, because ubuntu's own installs since the last
+    time left files only ubuntu can replace. No token reaches pip: a requirements file that needs
+    one has to get it some other way. PATH is for sdist compiles, as sudo may reset it. pip's cache
+    and temp files go to cloudgpu-app's own HOME and /tmp, and it streams its output.
+    """
+    prepare_venv_checks(venv_dir)
+    pip = os.path.join(venv_dir, "bin", "pip")
+    app_step([pip, "install", "-r", requirements],
+             env={"PATH": os.environ.get("PATH", os.defpath)}, timeout=timeout)
+
+
+def wipe_venv(venv_dir: str) -> None:
+    """Remove a venv so it can be rebuilt, or raise.
+
+    It's root's rm because neither user can be relied on: cloudgpu-app can't write the venvs
+    directory, and ubuntu may not have the group yet on a new instance (see utils._with_app_group).
+    rm runs nothing from the venv, and doesn't follow symlinks in it.
+    """
+    run(["sudo", "rm", "-rf", venv_dir], timeout=1800)
+    if os.path.lexists(venv_dir):
+        raise RuntimeError(f"Couldn't remove {venv_dir}")
 
 
 def install_service(spec: dict[str, Any]) -> None:

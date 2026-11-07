@@ -8,10 +8,11 @@ import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import install_service, prepare_app_dir, prepare_venv_checks, service_active
+from ..service import (install_requirements_as_app, install_service, prepare_app_dir,
+                       prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (run, pip_install, pip_install_torch, venv_python, check_torch_cuda,
-                     git_pull_as_app, git_version_as_app, torch_cuda_status, trust_repo_as_app,
-                     log)
+                     git_pull_as_app, git_version_as_app, requirements_present, torch_cuda_status,
+                     trust_repo_as_app, log)
 
 COMFYUI_PORT = 8188
 
@@ -83,9 +84,7 @@ class ComfyUIInstaller(AppInstaller):
 
         # 4. Install requirements
         log("Installing ComfyUI requirements...")
-        requirements = os.path.join(self.app_dir, "requirements.txt")
-        if os.path.exists(requirements):
-            pip_install(self.venv_dir, "-r", requirements, timeout=600)
+        self._install_requirements(self.app_dir, timeout=600)
 
         # 5. Clone ComfyUI-Manager
         custom_nodes = os.path.join(self.app_dir, "custom_nodes")
@@ -99,9 +98,7 @@ class ComfyUIInstaller(AppInstaller):
             git_pull_as_app(manager_dir)
 
         # Install manager requirements if they exist
-        manager_requirements = os.path.join(manager_dir, "requirements.txt")
-        if os.path.exists(manager_requirements):
-            pip_install(self.venv_dir, "-r", manager_requirements, timeout=120)
+        self._install_requirements(manager_dir, timeout=120)
 
         # 6. Create launch script + systemd service
         self._create_launch_script()
@@ -143,22 +140,19 @@ class ComfyUIInstaller(AppInstaller):
 
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
+            prepare_app_dir(self.app_dir)
             run(["python3", "-m", "venv", self.venv_dir])
-            requirements = os.path.join(self.app_dir, "requirements.txt")
-            if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=120)
+            self._install_requirements(self.app_dir, timeout=120)
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
         prepare_venv_checks(self.venv_dir)
         trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
-            import shutil
-            shutil.rmtree(self.venv_dir, ignore_errors=True)
+            prepare_app_dir(self.app_dir)
+            wipe_venv(self.venv_dir)
             run(["python3", "-m", "venv", self.venv_dir])
-            requirements = os.path.join(self.app_dir, "requirements.txt")
-            if os.path.exists(requirements):
-                pip_install(self.venv_dir, "-r", requirements, timeout=600)
+            self._install_requirements(self.app_dir, timeout=600)
 
         # Regenerate launch script (transient paths need refreshing) + service
         self._create_launch_script()
@@ -208,6 +202,13 @@ class ComfyUIInstaller(AppInstaller):
             # Only its own dirs are writable (models, outputs, custom nodes live under app_dir).
             "rw_paths": [self.app_dir, self.venv_dir],
         }
+
+    def _install_requirements(self, directory: str, *, timeout: int) -> None:
+        """Install ``directory``'s requirements as cloudgpu-app, if it has any.
+        prepare_app_dir must have run, so cloudgpu-app can read them."""
+        requirements = os.path.join(directory, "requirements.txt")
+        if requirements_present(requirements):
+            install_requirements_as_app(self.venv_dir, requirements, timeout=timeout)
 
     def _setup_service(self) -> None:
         """Install/enable the systemd service (best-effort: warn rather than abort)."""

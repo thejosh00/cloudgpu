@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import grp
 import os
 import pwd
 import subprocess
@@ -63,9 +64,41 @@ def run(
 
 
 def pip_install(venv_dir: str, *args: str, timeout: int = 600) -> None:
-    """Run pip install in a venv."""
+    """Run pip install in a venv, as the caller. Never for anything that reads app_dir: see
+    service.install_requirements_as_app."""
     pip = os.path.join(venv_dir, "bin", "pip")
-    run([pip, "install", *args], timeout=timeout)
+    run(_with_app_group([pip, "install", *args]), timeout=timeout)
+
+
+def _with_app_group(cmd: list[str]) -> list[str]:
+    """``cmd`` as the caller, with APP_USER's group if this process doesn't have it yet.
+
+    The venv is mostly cloudgpu-app's files, shared through that group, and `usermod -aG` doesn't
+    reach a process that's already running. So on a new instance the caller couldn't replace them,
+    but a new sudo session as itself reads the group afresh. It's still the caller: this is for
+    steps that name what they install, and it makes nothing run as APP_USER.
+    """
+    try:
+        gid = grp.getgrnam(APP_USER).gr_gid
+    except KeyError:
+        return cmd  # nothing can be shared through a group this instance doesn't have
+    if gid == os.getgid() or gid in os.getgroups():
+        return cmd
+    return ["sudo", "-n", "-u", pwd.getpwuid(os.getuid()).pw_name, "--", *cmd]
+
+
+def requirements_present(path: str) -> bool:
+    """Whether there's a requirements file to install. False only if nothing is there.
+
+    cloudgpu-app controls this path. A broken symlink counts as present, so pip fails on it rather
+    than the install being skipped quietly, and a directory the caller can't enter raises. It's
+    lstat, so the caller doesn't read or follow anything.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def venv_python(venv_dir: str) -> str:

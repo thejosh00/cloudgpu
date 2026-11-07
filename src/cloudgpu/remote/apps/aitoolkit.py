@@ -4,22 +4,60 @@ from __future__ import annotations
 
 import os
 import platform
-import re
-import shutil
 import stat
+import sys
 import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import install_service, prepare_app_dir, prepare_venv_checks, service_active
+from ..service import (install_requirements_as_app, install_service, prepare_app_dir,
+                       prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
-                     check_torch_cuda, git_pull_as_app, git_version_as_app, run_venv_check,
-                     torch_cuda_status, torch_index_url, trust_repo_as_app, venv_python, log)
+                     check_torch_cuda, git_pull_as_app, git_version_as_app, requirements_present,
+                     run_venv_check, torch_cuda_status, torch_index_url, trust_repo_as_app,
+                     venv_python, log)
 
 AITOOLKIT_PORT = 8675
 
 AITOOLKIT_REPO = "https://github.com/ostris/ai-toolkit.git"
 NODE_VERSION = "22.17.1"  # README requires Node > 20
+
+# Run as cloudgpu-app (see _patched_requirements). argv: the requirements file, the file to write.
+_FLATTEN_REQUIREMENTS = r"""
+import os, re, sys
+
+lines = []
+
+def inline(path, parents):
+    real = os.path.realpath(path)
+    if real in parents:
+        sys.exit("requirements include cycle: " + " -> ".join([*parents, real]))
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            include = None
+            for flag in ("-r ", "--requirement "):
+                if line.startswith(flag):
+                    include = line[len(flag):].strip()
+            if include:
+                inline(os.path.join(os.path.dirname(path), include), [*parents, real])
+            elif re.match(r"torchcodec\b", line):
+                lines.append(f"# {line}  (pin dropped by cloudgpu)")
+            else:
+                lines.append(raw.rstrip("\n"))
+
+requirements, patched = sys.argv[1:]
+try:
+    inline(requirements, [])
+    if os.path.lexists(patched):
+        os.unlink(patched)
+    # O_EXCL: a symlink put here since the unlink fails this rather than redirecting it.
+    fd = os.open(patched, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+except (OSError, UnicodeError) as e:
+    sys.exit(str(e))
+"""
 
 
 class AIToolkitInstaller(AppInstaller):
@@ -145,6 +183,7 @@ class AIToolkitInstaller(AppInstaller):
 
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
+            prepare_app_dir(self.app_dir)
             self._create_venv()
             self._ensure_torch()
             self._install_requirements()
@@ -155,7 +194,8 @@ class AIToolkitInstaller(AppInstaller):
         trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
-            shutil.rmtree(self.venv_dir, ignore_errors=True)
+            prepare_app_dir(self.app_dir)
+            wipe_venv(self.venv_dir)
             self._create_venv()
             self._ensure_torch()
             self._install_requirements()
@@ -268,13 +308,14 @@ class AIToolkitInstaller(AppInstaller):
                     "torchvision", "torchaudio", timeout=600)
 
     def _install_requirements(self) -> None:
-        """Install ai-toolkit's requirements, then torchcodec separately."""
+        """Install ai-toolkit's requirements, then torchcodec separately.
+        prepare_app_dir must have run, so cloudgpu-app can read and flatten them."""
         requirements = os.path.join(self.app_dir, "requirements.txt")
-        if not os.path.exists(requirements):
+        if not requirements_present(requirements):
             return
         log("Installing AI Toolkit requirements...")
-        pip_install(self.venv_dir, "-r", self._patched_requirements(requirements),
-                    timeout=1800)
+        install_requirements_as_app(self.venv_dir, self._patched_requirements(requirements),
+                                    timeout=1800)
         self._install_torchcodec()
 
     def _patched_requirements(self, requirements: str) -> str:
@@ -287,28 +328,16 @@ class AIToolkitInstaller(AppInstaller):
         unobtainable: torchcodec publishes no Linux arm64 wheel before 0.10, so
         the whole requirements pass dies on it. Flattening is needed because
         the pin lives in requirements_base.txt, pulled in via '-r'.
+
+        Runs as cloudgpu-app, which chooses every path here: as ubuntu, a symlink or an include
+        would copy any file ubuntu can read into app_dir, and a symlink at the output would
+        overwrite any file ubuntu can write. Raises if it can't flatten them.
         """
-        lines: list[str] = []
-
-        def inline(path: str) -> None:
-            with open(path) as f:
-                for raw in f:
-                    line = raw.strip()
-                    include = None
-                    for flag in ("-r ", "--requirement "):
-                        if line.startswith(flag):
-                            include = line[len(flag):].strip()
-                    if include:
-                        inline(os.path.join(os.path.dirname(path), include))
-                    elif re.match(r"torchcodec\b", line):
-                        lines.append(f"# {line}  (pin dropped by cloudgpu)")
-                    else:
-                        lines.append(raw.rstrip("\n"))
-
-        inline(requirements)
         patched = os.path.join(self.app_dir, ".cloudgpu-requirements.txt")
-        with open(patched, "w") as f:
-            f.write("\n".join(lines) + "\n")
+        result = app_step([sys.executable, "-I", "-c", _FLATTEN_REQUIREMENTS, requirements, patched],
+                          capture=True, check=False, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"Couldn't read {requirements}: {result.stderr.strip()}")
         return patched
 
     def _install_torchcodec(self) -> None:
