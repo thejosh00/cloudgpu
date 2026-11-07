@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cloudgpu.remote.apps.aitoolkit import AIToolkitInstaller
+from cloudgpu.remote.apps.aitoolkit import _FLATTEN_REQUIREMENTS, AIToolkitInstaller
 from cloudgpu.remote.apps.comfyui import ComfyUIInstaller
 from cloudgpu.remote.state import State
 from cloudgpu.remote.utils import pip_install
@@ -497,10 +497,10 @@ class TestFlatten:
         assert SECRET not in self.written_to_app_dir(toolkit)
 
     def test_the_failure_message_carries_no_contents(self, box, toolkit):
-        """Bug: the error echoes the file it couldn't read into the log."""
+        """Bug: the error echoes a requirements file, and any token in it, into the log."""
         marker = self.secret(box)
         requirements = Path(toolkit.app_dir) / "requirements.txt"
-        requirements.write_text(f"-r {marker}\n")
+        requirements.write_text(f"--extra-index-url https://{SECRET}@example.invalid/simple\n-r {marker}\n")
         with pytest.raises(RuntimeError) as raised:
             toolkit._patched_requirements(str(requirements))
         assert SECRET not in str(raised.value)
@@ -514,12 +514,40 @@ class TestFlatten:
             toolkit._patched_requirements(str(app / "requirements.txt"))
 
     def test_self_include_through_a_symlink_is_a_cycle(self, box, toolkit):
-        """Bug: the cycle check compares names, so a symlink to the same file gets past it."""
+        """Bug: a cycle through a symlink recurses until it crashes."""
         app = Path(toolkit.app_dir)
         (app / "alias.txt").symlink_to(app / "requirements.txt")
         (app / "requirements.txt").write_text("-r alias.txt\n")
         with pytest.raises(RuntimeError, match="include cycle"):
             toolkit._patched_requirements(str(app / "requirements.txt"))
+
+    def test_self_include_under_a_new_spelling_each_time_is_a_cycle(self, box, toolkit):
+        """Bug: the cycle check compares names, and `./` makes every name different, so it never fires."""
+        app = Path(toolkit.app_dir)
+        (app / "requirements.txt").write_text("-r ./requirements.txt\n")
+        with pytest.raises(RuntimeError, match="include cycle"):
+            toolkit._patched_requirements(str(app / "requirements.txt"))
+
+    def test_symlink_planted_after_the_unlink_does_not_redirect_the_write(self, tmp_path, monkeypatch):
+        """Bug: without O_EXCL, a symlink put at the output just after the unlink gets written through."""
+        victim = tmp_path / "victim.txt"
+        victim.write_text("untouched\n")
+        requirements = tmp_path / "requirements.txt"
+        requirements.write_text("av\n")
+        patched = tmp_path / ".cloudgpu-requirements.txt"
+        patched.write_text("old\n")
+        real_unlink = os.unlink
+
+        def unlink_then_plant(path, *args, **kwargs):
+            real_unlink(path, *args, **kwargs)
+            os.symlink(victim, path)
+
+        monkeypatch.setattr(os, "unlink", unlink_then_plant)
+        monkeypatch.setattr(sys, "argv", ["flatten", str(requirements), str(patched)])
+        with pytest.raises(SystemExit) as stopped:
+            exec(_FLATTEN_REQUIREMENTS, {})
+        assert stopped.value.code  # a message, not a clean exit
+        assert victim.read_text() == "untouched\n"
 
     def test_same_file_included_twice_is_not_a_cycle(self, box, toolkit):
         """Bug: the cycle check refuses a harmless repeat, failing a good install."""
