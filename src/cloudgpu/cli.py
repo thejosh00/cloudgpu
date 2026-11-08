@@ -65,6 +65,12 @@ def _resolve_target(host: str | None = None, config_name: str | None = None) -> 
         state = configs.load_state(config_name)
         if state.get("host") and state.get("persistent_dir"):
             return state["host"], state["persistent_dir"]
+        if state.get("instance_id") and not state.get("host"):
+            raise click.UsageError(
+                f"Config '{config_name}' tracks instance {state['instance_id']}, which isn't set up yet "
+                "(it may still be booting, and is billed while it runs). Run "
+                f"'cloudgpu up -C {config_name}' to finish, or 'cloudgpu down -C {config_name}' to terminate it."
+            )
         raise click.UsageError(
             f"Config '{config_name}' has no running instance yet. Run 'cloudgpu up --config {config_name}' first."
         )
@@ -435,6 +441,34 @@ def _stop_not_ready(inst: dict) -> NoReturn:
     """An instance exists but can't be used yet: another launch would bill twice."""
     status = liveness.describe(inst)
     _stop_unchanged(f"Instance {inst.get('id')} is {status}, so not launching another. Run this again once it's active.")
+
+
+def _stop_launched(config_name: str, runtime: dict, why: str, code: int = 1) -> NoReturn:
+    """A launch went through and `up` can't go on: say what's running and billed, and what to run."""
+    display.error(
+        f"{escape(why)}\nInstance {runtime.get('instance_id')} ({runtime.get('instance_type')}, "
+        f"{runtime.get('region')}) is still running and billed, and is saved for this config. "
+        f"'cloudgpu up -C {config_name}' picks it up again; 'cloudgpu down -C {config_name}' terminates it."
+    )
+    sys.exit(code)
+
+
+def _forget_gone_launch(config_name: str, before: dict, runtime: dict, why: str) -> NoReturn:
+    """The launched instance terminated while booting: put the state back as it was before the launch.
+
+    Lambda said terminated, so nothing bills and there's nothing for `down` to do; keeping the id
+    would only make the next `up` read it to learn the same thing.
+    """
+    if before:
+        configs.save_state(config_name, before)
+    else:
+        configs.clear_state(config_name)
+    display.error(
+        f"{escape(why)}\nInstance {runtime.get('instance_id')} ({runtime.get('instance_type')}, "
+        f"{runtime.get('region')}) is terminated, so nothing is left running from this launch. "
+        f"Run 'cloudgpu up -C {config_name}' to try again."
+    )
+    sys.exit(1)
 
 
 def _runtime_from_instance(inst: dict, filesystem: str) -> dict:
@@ -809,15 +843,37 @@ def up(config_name: str, profile_csv: str | None) -> None:
             )
             state = _runtime_from_instance(existing, filesystem)
         else:
+            launched: dict = {}
+
+            def save_launched(runtime: dict) -> None:
+                # Written down before the boot wait, so nothing can leave it billing untracked.
+                launched.update(runtime)
+                early = dict(runtime)
+                if provisioned:
+                    early["provisioned_profiles"] = provisioned
+                configs.save_state(config_name, early)
+
             try:
-                state = orchestration.acquire_instance(cfg)
+                state = orchestration.acquire_instance(cfg, on_launched=save_launched)
+            except KeyboardInterrupt:
+                if launched:
+                    _stop_launched(config_name, launched, "Interrupted while waiting for the instance to boot.", 130)
+                raise
+            except orchestration.BootFailed as e:
+                if e.gone:
+                    _forget_gone_launch(config_name, state, launched, str(e))
+                _stop_launched(config_name, launched, str(e))
             except lambda_api.LambdaReplyLost as e:
+                if launched:
+                    _stop_launched(config_name, launched, str(e))
                 display.error(
                     f"{escape(str(e))}\nNot trying again: if that was a launch, it may have gone through. "
                     "Check 'cloudgpu lambda instances' before running this again."
                 )
                 sys.exit(1)
             except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:
+                if launched:
+                    _stop_launched(config_name, launched, str(e))
                 display.error(str(e))
                 sys.exit(1)
             if state.get("created_filesystem"):

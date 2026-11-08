@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import display, lambda_api
+from . import display, lambda_api, liveness
 
 # Friendly aliases -> Lambda instance-type names, in preference order.
 ALIASES = {
@@ -28,6 +29,31 @@ SKIP_SSH_NAMES = {"known_hosts", "known_hosts2", "config", "authorized_keys", "e
 
 class OrchestrationError(Exception):
     """Raised when an instance can't be acquired (no capacity, no SSH key, boot failure)."""
+
+
+class BootFailed(OrchestrationError):
+    """A launched instance didn't become active. ``gone`` is True only if Lambda says it's terminated."""
+
+    def __init__(self, message: str, *, gone: bool = False):
+        super().__init__(message)
+        self.gone = gone
+
+
+# Launch errors Lambda publishes as a refusal: nothing was started, so polling again is safe.
+_LAUNCH_REFUSALS = {
+    "instance-operations/launch/insufficient-capacity",
+    "global/rate-limited",
+    "global/invalid-parameters",
+}
+
+
+def launch_was_refused(e: lambda_api.LambdaAPIError) -> bool:
+    """True if this launch error says nothing was started.
+
+    A published refusal, or no HTTP answer at all (the request never reached Lambda). A 5xx or
+    anything unrecognised may follow a launch that took effect.
+    """
+    return e.status is None or e.code in _LAUNCH_REFUSALS
 
 
 def expand_targets(gpu: list[str]) -> list[str]:
@@ -166,8 +192,8 @@ def pick_target_any(types: dict, targets: list[str], allowed: list[str] | None =
     return None
 
 
-def wait_active(instance_id: str, poll: int = 20, max_minutes: int = 20) -> dict:
-    """Poll until the instance is active with an IP, or raise on failure/timeout."""
+def wait_active(instance_id: str, poll: int = 20, max_minutes: float = 20) -> dict:
+    """Poll until the instance is active with an IP, or raise BootFailed on failure/timeout."""
     deadline = time.time() + max_minutes * 60
     while time.time() < deadline:
         inst = lambda_api.get_instance(instance_id)
@@ -176,12 +202,28 @@ def wait_active(instance_id: str, poll: int = 20, max_minutes: int = 20) -> dict
         if status == "active" and ip:
             return inst
         if status in ("terminated", "error"):
-            raise OrchestrationError(f"instance entered '{status}' before becoming active")
+            raise BootFailed(f"instance entered '{status}' before becoming active", gone=status == "terminated")
         time.sleep(poll)
-    raise OrchestrationError("timed out waiting for instance to become active")
+    raise BootFailed(f"timed out after {max_minutes:g} minutes waiting for instance to become active")
 
 
-def acquire_instance(profile: dict[str, Any]) -> dict[str, Any]:
+def _find_what_launched(filesystem: str, error: lambda_api.LambdaAPIError) -> dict:
+    """After a launch error that may hide a launch: the instance it made, or stop.
+
+    Anything not terminated mounting the filesystem is taken as that launch's (`up` only gets
+    here when nothing was mounting it). Nothing found, or no clear answer: raise LambdaReplyLost,
+    so nothing is launched again blind.
+    """
+    found = liveness.find_mounting(filesystem)
+    if found.kind is liveness.Kind.ALIVE:
+        return found.instance
+    why = "nothing is mounting it yet" if found.kind is liveness.Kind.GONE else found.detail
+    raise lambda_api.LambdaReplyLost(f"launch failed ({error}), and looking for what it made on '{filesystem}': {why}")
+
+
+def acquire_instance(
+    profile: dict[str, Any], on_launched: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Poll for capacity and launch an instance for the profile.
 
     The filesystem is auto-managed: if one named ``profile['filesystem']`` already
@@ -190,13 +232,18 @@ def acquire_instance(profile: dict[str, Any]) -> dict[str, Any]:
 
     Returns a runtime dict (instance_id, ip, host, filesystem, filesystem_id,
     created_filesystem, instance_type, region, ssh_key, price_cents_per_hour,
-    launched_at). Raises OrchestrationError on timeout/boot failure, LambdaAPIError on
-    API failure.
+    launched_at). Raises OrchestrationError on timeout (BootFailed once launched),
+    LambdaAPIError on API failure, LambdaReplyLost if a launch may have gone through unseen
+    (including a Ctrl-C while the launch request is out).
+
+    ``on_launched`` is called with the runtime so far (no ip or host) as soon as an instance
+    id is known, before waiting for it to boot, so the caller can write it down.
     """
     filesystem = profile.get("filesystem") or profile["name"]
     targets = expand_targets(profile["gpu"])
     ssh_key = ensure_ssh_key(profile.get("ssh_key"))
     poll = int(profile.get("poll_seconds", 20))
+    boot_minutes = float(profile.get("boot_minutes", 20))
     max_hours = float(profile.get("max_hours", 12))
     pinned_region = profile.get("region") or None
 
@@ -246,38 +293,56 @@ def acquire_instance(profile: dict[str, Any]) -> dict[str, Any]:
             created = True
 
         display.success(f"Capacity found: {tname} in {chosen_region} -- launching")
+        found = None
         try:
-            res = lambda_api.launch_instance(
-                region_name=chosen_region,
-                instance_type_name=tname,
-                ssh_key_names=[ssh_key],
-                file_system_names=[filesystem],
-                name=profile.get("instance_name", profile["name"]),
-            )
-        except lambda_api.LambdaAPIError as e:  # capacity may have vanished in the race
-            display.warn(f"launch failed ({e}); continuing to poll")
-            time.sleep(poll)
-            continue
+            try:
+                res = lambda_api.launch_instance(
+                    region_name=chosen_region,
+                    instance_type_name=tname,
+                    ssh_key_names=[ssh_key],
+                    file_system_names=[filesystem],
+                    name=profile.get("instance_name", profile["name"]),
+                )
+            except lambda_api.LambdaAPIError as e:
+                if launch_was_refused(e):  # nothing started: capacity may have vanished in the race
+                    display.warn(f"launch failed ({e}); continuing to poll")
+                    time.sleep(poll)
+                    continue
+                display.warn(f"launch failed ({e}); it may have gone through, so looking for what it made...")
+                found = _find_what_launched(filesystem, e)
+                res = {"id": found.get("id")}
+        except KeyboardInterrupt:
+            raise lambda_api.LambdaReplyLost("launch interrupted (Ctrl-C) before Lambda's reply was read") from None
 
         instance_id = _first_instance_id(res)
         if not instance_id:
             raise OrchestrationError(f"launch returned no instance id: {res}")
-        display.info(f"Launched {instance_id}; waiting for it to become active...")
-        inst = wait_active(instance_id, poll=poll)
-
-        ip = inst.get("ip")
-        return {
+        if found is not None:
+            itype, iregion = found.get("instance_type") or {}, found.get("region") or {}
+            tname = itype.get("name") if isinstance(itype, dict) and itype.get("name") else tname
+            chosen_region = iregion.get("name") if isinstance(iregion, dict) and iregion.get("name") else chosen_region
+            display.info(f"Found {instance_id} on '{filesystem}': tracking it, not launching another.")
+        runtime = {
             "instance_id": instance_id,
-            "ip": ip,
-            "host": f"ubuntu@{ip}",
             "filesystem": filesystem,
             "filesystem_id": fs_id,
             "created_filesystem": created,
             "instance_type": tname,
             "region": chosen_region,
             "ssh_key": ssh_key,
-            "price_cents_per_hour": (inst.get("instance_type") or {}).get("price_cents_per_hour"),
             "launched_at": int(time.time()),
+        }
+        if on_launched is not None:
+            on_launched(dict(runtime))
+        display.info(f"Launched {instance_id}; waiting for it to become active...")
+        inst = wait_active(instance_id, poll=poll, max_minutes=boot_minutes)
+
+        ip = inst.get("ip")
+        return {
+            **runtime,
+            "ip": ip,
+            "host": f"ubuntu@{ip}",
+            "price_cents_per_hour": (inst.get("instance_type") or {}).get("price_cents_per_hour"),
         }
 
     raise OrchestrationError(
