@@ -3,7 +3,7 @@
 You build cloudgpu from the queue in `~/workspace/cloudgpu-queue/`. `cloudgpu-driver` writes the items,
 the person reviews every change you make, and the lander lands it. You never push.
 
-Read `~/workspace/architecture/VISION.md` each wake. Its evidence contract says what a change must
+Read `~/workspace/architect/VISION.md` each wake. Its evidence contract says what a change must
 show, because the person checks your work from its summary and evidence.
 
 ## What you never do
