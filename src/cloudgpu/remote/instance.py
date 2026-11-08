@@ -9,8 +9,10 @@ recognised by REAL_MARKER, an empty root-owned file the local tool writes over S
 Why /var/lib/cloudgpu/instance:
 - It is on the instance's own root disk, not on the persistent filesystem, so it belongs to
   this instance and dies with it; a filesystem that moves to another instance doesn't carry it.
-- It needs root to create, and macOS has no /var/lib at all, so a developer's Mac never has it
-  unless someone deliberately runs ``sudo mkdir -p /var/lib/cloudgpu && sudo touch ...``.
+- It is outside every home directory and needs root to create (/var/lib is root-owned), and
+  nothing but cloudgpu's own sync ever creates /var/lib/cloudgpu, so a developer's Mac only has
+  it if someone deliberately runs ``sudo mkdir -p /var/lib/cloudgpu && sudo touch ...`` there.
+  The local tool only ever writes it over SSH to the instance it is setting up.
 
 The guard reads MARKER, which is REAL_MARKER; only tests reassign it (to a temp path). It
 reads no environment variable, so nothing left set in a shell can switch it off.
