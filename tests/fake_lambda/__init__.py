@@ -31,6 +31,7 @@ LAUNCH_MODES = {
     "start_then_drop",  # ASSUMPTION: as above, with the connection closed and no reply
     "start_then_200_html",  # ASSUMPTION: as above, with a proxy's page and a 200
     "start_then_stall",  # ASSUMPTION: as above, with headers and part of the body, then nothing
+    "start_then_hang",  # ASSUMPTION: as above, with no reply at all until the client times out
     "insufficient_capacity",  # published: HTTP 400, instance-operations/launch/insufficient-capacity
     "rate_limited",  # published: HTTP 429, global/rate-limited
     "bad_request",  # published: HTTP 400, global/invalid-parameters
@@ -180,7 +181,8 @@ class FakeLambda:
         """Record a launch. Returns its mode, and the instances it started."""
         self.launches.append(body)
         mode = self.launch_script.pop(0) if self.launch_script else self.then
-        if mode in ("ok", "start_then_502", "start_then_drop", "start_then_200_html", "start_then_stall"):
+        if mode in ("ok", "start_then_502", "start_then_drop", "start_then_200_html", "start_then_stall",
+                    "start_then_hang"):
             # ASSUMPTION: a launch on a filesystem already in use is accepted. The spec doesn't
             # say, and only lists filesystem-in-use for deleting one.
             return mode, [self._start(body.get("name"), body.get("file_system_names") or [], self.boot_polls)]
@@ -311,6 +313,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                         self._send(200, raw=b"<html>Please wait</html>")
                     elif mode == "start_then_stall":
                         stall = True  # answered below, outside the lock
+                    elif mode == "start_then_hang":
+                        stall = "hang"
                     elif mode == "start_then_drop":
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -329,7 +333,10 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                     self._send(200, {"data": {"terminated_instances": []}})
                 else:
                     self._error(404, "global/object-does-not-exist", f"Fake has no POST {self.path}")
-            if stall:
+            if stall == "hang":
+                fake._stop.wait(30)
+                self.close_connection = True
+            elif stall:
                 self._stall()
 
     return Handler
