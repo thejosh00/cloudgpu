@@ -281,9 +281,29 @@ def recover(host: str | None, config_name: str | None) -> None:
         config.save_host(host, persistent_dir)
         _record_launch_info(host, persistent_dir)
         display.success("Recovery complete!")
+        _warn_marks_left(host, persistent_dir, config_name)
     else:
         display.error(f"Recovery failed (exit code {result.returncode})")
         sys.exit(1)
+
+
+def _warn_marks_left(host: str, persistent_dir: str, config_name: str | None) -> None:
+    """After `recover`: name the apps whose venv a rebuild emptied, and the command that
+    re-provisions their profiles and clears the mark. `recover` provisions nothing itself."""
+    try:
+        known = json.loads(_remote_run(host, persistent_dir, "status")).get("apps", {})
+    except (ssh.SSHError, ValueError) as e:
+        display.warn(f"Couldn't check for apps whose profiles must be provisioned again: {e}")
+        return
+    marked = _marked_apps(known)
+    if not marked:
+        return
+    command = f"cloudgpu up -C {config_name}" if config_name else "cloudgpu up -C <this instance's config>"
+    apps_list = ", ".join(marked)
+    display.warn(
+        f"Recovery rebuilt the venv of {apps_list}, so what its profiles installed there is gone. "
+        f"{apps_list} stays marked for re-provisioning until you run '{command}', which provisions "
+        "those profiles again and clears the mark.")
 
 
 @cli.command()
@@ -510,6 +530,11 @@ def _recover_recorded(host: str, persistent_dir: str) -> dict:
     return known
 
 
+def _marked_apps(known: dict) -> list[str]:
+    """The recorded apps carrying a re-provision mark (their venv was rebuilt)."""
+    return [app for app, rec in known.items() if isinstance(rec, dict) and rec.get("reprovision")]
+
+
 def _reprovision(config_name: str, state: dict, known: dict,
                  profile_list: list[dict]) -> tuple[list[dict], list[str]]:
     """The recorded profiles to provision again because recovery rebuilt an app's venv.
@@ -520,7 +545,7 @@ def _reprovision(config_name: str, state: dict, known: dict,
     cleared once those are provisioned). A recorded profile that won't load might use a marked
     app, so then nothing is cleared, and the warning says what to fix.
     """
-    marked = [app for app, rec in known.items() if isinstance(rec, dict) and rec.get("reprovision")]
+    marked = _marked_apps(known)
     if not marked:
         return [], []
     requested = {p["name"] for p in profile_list}
@@ -1000,8 +1025,13 @@ def provision(config_name: str, profile_csv: str) -> None:
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
-    app_list = _provision_profiles(config_name, state, host, persistent_dir, profile_list)
-    names = ", ".join(p["name"] for p in profile_list)
+    # As `up` does: also provision the recorded profiles that use an app a venv rebuild marked,
+    # and clear the marks only once all of them were provisioned again.
+    known = _recover_recorded(host, persistent_dir)
+    redo, marked = _reprovision(config_name, state, known, profile_list)
+    app_list = _provision_profiles(config_name, state, host, persistent_dir, profile_list + redo, known)
+    _clear_reprovision(host, persistent_dir, marked)
+    names = ", ".join(p["name"] for p in profile_list + redo)
     display.success(f"Provisioned {names} onto '{config_name}'.")
     ports = apps.app_ports(app_list)
     for p in ports:

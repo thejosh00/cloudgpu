@@ -11,6 +11,10 @@ from .state import State
 # The methods that change the host; each is guarded in every subclass that defines it.
 GUARDED = ("install", "recover")
 
+# The status an already-recorded app gets when installing it again fails: the next recover
+# installs it again rather than only recovering it (remote/recovery.py).
+INSTALL_FAILED = "install_failed"
+
 
 def _guarded(method):
     @functools.wraps(method)
@@ -20,11 +24,24 @@ def _guarded(method):
     return wrapper
 
 
+def _marks_failed_install(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            self.mark_install_failed()
+            raise
+    return wrapper
+
+
 class AppInstaller(abc.ABC):
     """Abstract base class for app installers."""
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        if "install" in cls.__dict__:
+            cls.install = _marks_failed_install(cls.__dict__["install"])
         for name in GUARDED:
             if name in cls.__dict__:
                 setattr(cls, name, _guarded(cls.__dict__[name]))
@@ -71,3 +88,11 @@ class AppInstaller(abc.ABC):
         if (self.state.get_app(self.name) or {}).get("reprovision"):
             record = {**record, "reprovision": True}
         self.state.set_app(self.name, record)
+
+    def mark_install_failed(self) -> None:
+        """An install failed: if the app was recorded, say so in its record (keeping the rest,
+        a re-provision mark included), so the next recover installs it again. An app installed
+        for the first time stays unrecorded."""
+        record = self.state.get_app(self.name)
+        if record is not None:
+            self.state.set_app(self.name, {**record, "status": INSTALL_FAILED})

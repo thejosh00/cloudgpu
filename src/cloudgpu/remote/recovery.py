@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 
 from . import instance
+from .installer import INSTALL_FAILED
 from .state import State
 from .utils import log
 
@@ -45,7 +46,8 @@ def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> 
     """Recover all installed apps on a new instance.
 
     Keeps going after an app fails, still sets up PATH, and returns the failures
-    as {app name: error}. Empty means every app with an installer came back.
+    as {app name: error}. Empty means every recorded app came back. A recorded app with no
+    installer is a failure; one whose last install failed is installed again, not recovered.
     """
     instance.require_instance()  # before anything, setup_path included
     installed = state.list_apps()
@@ -59,13 +61,18 @@ def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> 
     failures: dict[str, str] = {}
     for app_name, app_state in installed.items():
         if app_name not in app_installers:
-            log(f"Skipping {app_name}: no installer available", "warn")
+            failures[app_name] = "no installer available"
+            log(f"Can't recover {app_name}: no installer available", "error")
             continue
 
-        log(f"Recovering {app_name}...")
         installer = app_installers[app_name](state)
         try:
-            installer.recover()
+            if isinstance(app_state, dict) and app_state.get("status") == INSTALL_FAILED:
+                log(f"{app_name}'s last install failed; installing it again...", "warn")
+                installer.install()
+            else:
+                log(f"Recovering {app_name}...")
+                installer.recover()
             log(f"{app_name} recovered successfully")
         except Exception as e:
             failures[app_name] = str(e) or type(e).__name__

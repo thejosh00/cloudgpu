@@ -116,13 +116,15 @@ def test_nothing_recorded_exits_zero(monkeypatch, tmp_persistent_dir, capsys):
     assert "nothing to recover" in "".join(capsys.readouterr())
 
 
-def test_app_without_installer_stays_a_warning(monkeypatch, tmp_persistent_dir, capsys):
-    """Catches: folding the 'no installer' skip into the failures (out of scope for 0.5)."""
+def test_app_without_installer_is_a_failure(monkeypatch, tmp_persistent_dir, capsys):
+    """Catches: a recorded app with no installer only warned about, so `recover` exits 0 without it.
+    (0.5 kept it a warning; 0.13 makes it a failure, as the plan's bug table asks.)"""
     calls = []
     installers = {"comfyui": _fake_installer("comfyui", calls)}
-    code, _ = _recover(monkeypatch, tmp_persistent_dir, installers, ["comfyui", "mystery"])
+    code, path_calls = _recover(monkeypatch, tmp_persistent_dir, installers, ["comfyui", "mystery"])
     text = "".join(capsys.readouterr())
-    assert code == 0
-    assert "Skipping mystery: no installer available" in text
-    assert "Recovery complete!" in text
-
+    assert code != 0
+    assert calls == ["comfyui"]
+    assert len(path_calls) == 1
+    assert "mystery: no installer available" in text[text.index("Recovery failed"):]
+    assert "Recovery complete!" not in text

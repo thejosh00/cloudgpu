@@ -143,7 +143,7 @@ class AIToolkitInstaller(AppInstaller):
         self._setup_service()
 
         # 8. Update state
-        self.state.set_app(self.name, {
+        self.save_record({
             "status": "installed",
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
@@ -178,15 +178,14 @@ class AIToolkitInstaller(AppInstaller):
 
         if not os.path.isdir(self.app_dir):
             log("App directory missing, doing full install", "warn")
+            # The new install gets a new venv: the profiles must put back what they put in it.
+            self.state.mark_reprovision(self.name)
             self.install()
             return
 
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
-            prepare_app_dir(self.app_dir)
-            self._create_venv()
-            self._ensure_torch()
-            self._install_requirements()
+            self._rebuild_venv(wipe=False)
 
         # Verify PyTorch CUDA (system packages may differ on new instance;
         # also catches an arch switch, where every .so in the venv is wrong)
@@ -194,11 +193,7 @@ class AIToolkitInstaller(AppInstaller):
         trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
-            prepare_app_dir(self.app_dir)
-            wipe_venv(self.venv_dir)
-            self._create_venv()
-            self._ensure_torch()
-            self._install_requirements()
+            self._rebuild_venv(wipe=True)
 
         self._ensure_venv_symlink()
         self._ensure_node()
@@ -220,7 +215,7 @@ class AIToolkitInstaller(AppInstaller):
         self._create_launch_script()
         self._setup_service()
 
-        self.state.set_app(self.name, {
+        self.save_record({
             "status": "installed",
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
@@ -279,6 +274,20 @@ class AIToolkitInstaller(AppInstaller):
         except Exception as e:
             raise RuntimeError(f"Could not set up systemd service '{self.name}': "
                                f"{str(e) or type(e).__name__}") from e
+
+    def _rebuild_venv(self, *, wipe: bool) -> None:
+        """Make a new venv in place of a missing or wiped one, as install would.
+
+        Marks the app first: whatever the profiles put in the venv is gone, and the mark has to
+        outlive a recover or `up` that dies part way through (as ComfyUI's _rebuild_venv).
+        """
+        self.state.mark_reprovision(self.name)
+        prepare_app_dir(self.app_dir)
+        if wipe:
+            wipe_venv(self.venv_dir)
+        self._create_venv()
+        self._ensure_torch()
+        self._install_requirements()
 
     def _create_venv(self) -> None:
         """Create the venv and bring its pip up to date.
