@@ -20,4 +20,7 @@ elif "/lambda/nfs" in command and "listdir" in command:
 elif "python3 -m remote" in command and command.endswith(" detect"):
     print(json.dumps(detection))
 elif "python3 -m remote" in command and command.endswith(" status"):
-    print(json.dumps({"detection": detection, "apps": {}}))
+    # FAKE_SHIM_APPS: the apps the filesystem's state.json records, as JSON (default none).
+    print(json.dumps({"detection": detection, "apps": json.loads(os.environ.get("FAKE_SHIM_APPS") or "{}")}))
+elif "python3 -m remote" in command and command.endswith(" recover"):
+    sys.exit(int(os.environ.get("FAKE_SHIM_RECOVER_EXIT") or 0))

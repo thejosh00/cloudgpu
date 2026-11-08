@@ -151,7 +151,7 @@ def test_provision_command_records_profiles(tmp_path, tmp_config_dir, monkeypatc
 
     ensured, provisioned = [], []
     monkeypatch.setattr(cli.sync, "sync_remote", lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_ensure_apps", lambda host, pd, app_list: ensured.append(app_list))
+    monkeypatch.setattr(cli, "_ensure_apps", lambda host, pd, app_list, known=None: ensured.append(app_list))
     monkeypatch.setattr(cli, "_run_provision", lambda prof, host, pd: provisioned.append(prof["name"]) or True)
     monkeypatch.setattr(cli, "_restart_services", lambda host, app_list: None)
 

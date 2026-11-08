@@ -330,10 +330,13 @@ def run_up(fake: FakeLambda, workdir: Path, **kwargs) -> UpResult:
 def run_cloudgpu(
     fake: FakeLambda, workdir: Path, args: list[str], *,
     poll_seconds=0, max_hours=1.0, timeout=60, base_url=None, state=None, api_key="dummy-key-not-real", pace=None,
+    config_extra="", shim_env=None,
 ) -> UpResult:
     """Run a real `cloudgpu` command in a subprocess against the fake, with ssh and rsync shimmed.
 
     `api_key=None` leaves the key out. `pace` divides its timeouts and retry delays.
+    `config_extra` is appended to the config's TOML; `shim_env` adds FAKE_SHIM_* settings
+    for the ssh shim (FAKE_SHIM_APPS, FAKE_SHIM_RECOVER_EXIT).
 
     The environment is built from nothing, with a throwaway HOME, so no real key, ~/.ssh or
     secrets file is in reach. The proxy variables point at a closed port: if the override
@@ -345,7 +348,7 @@ def run_cloudgpu(
     (configs / "box.toml").write_text(
         f'filesystem = "{fake.filesystems[0] if fake.filesystems else "box-fs"}"\n'
         'gpu = ["a10"]\nssh_key = "fake-key"\n'
-        f"poll_seconds = {poll_seconds}\nmax_hours = {max_hours}\n"
+        f"poll_seconds = {poll_seconds}\nmax_hours = {max_hours}\n{config_extra}"
     )
     state_file = configs / "box.state.json"
     if state is not None:
@@ -361,6 +364,7 @@ def run_cloudgpu(
         "FAKE_SHIM_LOG": str(shim_log),
         "FAKE_SHIM_FILESYSTEM": fake.filesystems[0] if fake.filesystems else "box-fs",
     }
+    env.update(shim_env or {})
     if api_key is not None:
         env["LAMBDA_API_KEY"] = api_key
     if pace is not None:

@@ -454,20 +454,33 @@ def _runtime_from_instance(inst: dict, filesystem: str) -> dict:
     }
 
 
-def _ensure_apps(host: str, persistent_dir: str, app_list: list[str]) -> None:
-    """Converge installed apps to the profile: recover what exists, install what's missing."""
-    if not app_list:
-        return
+def _recover_recorded(host: str, persistent_dir: str) -> dict:
+    """Recover every app the filesystem's state.json records; return what it records.
+
+    Recover restores the recorded apps (no re-download). Nothing recorded: no recover.
+    A failed recover fails the command.
+    """
     output = _remote_run(host, persistent_dir, "status")
     known = json.loads(output).get("apps", {})
-
-    # Recover restores everything already recorded on the filesystem (no re-download).
     if known:
         display.info("Recovering existing apps from persistent storage...")
         result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "recover"), capture=False, timeout=3600)
         if not result.ok:
             display.error(f"Recovery failed (exit code {result.returncode})")
             sys.exit(1)
+    return known
+
+
+def _ensure_apps(host: str, persistent_dir: str, app_list: list[str], known: dict | None = None) -> None:
+    """Converge installed apps to the profile: recover what exists, install what's missing.
+
+    ``known`` is what an earlier ``_recover_recorded`` returned this run (``up`` recovers on
+    every run); given it, recovery isn't repeated.
+    """
+    if not app_list:
+        return
+    if known is None:
+        known = _recover_recorded(host, persistent_dir)
 
     # Install any profile app not yet present in state.json.
     for app in [a for a in app_list if a not in known]:
@@ -665,13 +678,13 @@ def _parse_profiles(profile_csv: str | None) -> list[dict]:
 
 
 def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir: str,
-                        profile_list: list[dict]) -> list[str]:
+                        profile_list: list[dict], known: dict | None = None) -> list[str]:
     """Ensure apps + run provisioning for each profile, record them in state.
 
     Returns the union of the profiles' apps (for reporting / port forwarding). The union
     is installed once (so `recover` runs a single time), then each profile's payload is
     provisioned into its own remote dir. Profile names are merged into
-    state['provisioned_profiles'].
+    state['provisioned_profiles']. ``known``: the apps already recovered this run, if any.
     """
     app_union: list[str] = []
     for prof in profile_list:
@@ -679,7 +692,7 @@ def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir
             if a not in app_union:
                 app_union.append(a)
 
-    _ensure_apps(host, persistent_dir, app_union)
+    _ensure_apps(host, persistent_dir, app_union, known)
     for prof in profile_list:
         _run_provision(prof, host, persistent_dir)
     _restart_services(host, app_union)
@@ -781,9 +794,12 @@ def up(config_name: str, profile_csv: str | None) -> None:
         state.pop("auto_terminate_at", None)
     configs.save_state(config_name, state)
 
+    # Recover what the filesystem records, on every up (with or without profiles), once.
+    known = _recover_recorded(state["host"], persistent_dir)
+
     # Provision the requested profiles (if any), then report.
     if profile_list:
-        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list)
+        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list, known)
     app_list = _apps_for_config(config_name)
     _report_up(config_name, state, persistent_dir, app_list)
 
