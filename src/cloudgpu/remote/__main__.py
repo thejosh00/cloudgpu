@@ -44,7 +44,8 @@ def cmd_install(state: State, args: argparse.Namespace) -> None:
 def cmd_recover(state: State, args: argparse.Namespace) -> None:
     """Recover all installed apps."""
     from .recovery import recover_all
-    recover_all(state, APP_INSTALLERS)
+    if recover_all(state, APP_INSTALLERS):
+        sys.exit(1)
 
 
 def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:

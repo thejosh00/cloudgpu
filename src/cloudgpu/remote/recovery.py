@@ -40,16 +40,21 @@ def setup_path(state: State) -> None:
     log("Added cloudgpu/bin to PATH in .bashrc")
 
 
-def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> None:
-    """Recover all installed apps on a new instance."""
+def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> dict[str, str]:
+    """Recover all installed apps on a new instance.
+
+    Keeps going after an app fails, still sets up PATH, and returns the failures
+    as {app name: error}. Empty means every app with an installer came back.
+    """
     installed = state.list_apps()
 
     if not installed:
         log("No apps found in state.json - nothing to recover")
-        return
+        return {}
 
     log(f"Found {len(installed)} app(s) to recover: {', '.join(installed.keys())}")
 
+    failures: dict[str, str] = {}
     for app_name, app_state in installed.items():
         if app_name not in app_installers:
             log(f"Skipping {app_name}: no installer available", "warn")
@@ -61,9 +66,16 @@ def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> 
             installer.recover()
             log(f"{app_name} recovered successfully")
         except Exception as e:
-            log(f"Failed to recover {app_name}: {e}", "error")
+            failures[app_name] = str(e) or type(e).__name__
+            log(f"Failed to recover {app_name}: {failures[app_name]}", "error")
 
     # Setup PATH
     setup_path(state)
 
-    log("Recovery complete!")
+    if failures:
+        log(f"Recovery failed for {len(failures)} app(s):", "error")
+        for app_name, error in failures.items():
+            log(f"  {app_name}: {error}", "error")
+    else:
+        log("Recovery complete!")
+    return failures
