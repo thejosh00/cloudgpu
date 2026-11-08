@@ -49,6 +49,19 @@ class State:
         state["apps"][app_name] = app_state
         self.save(state)
 
+    def mark_reprovision(self, app_name: str) -> None:
+        """Record that the app's venv was rebuilt, so the profiles using it must be provisioned
+        again (what they put into the venv is gone). Stays until clear_reprovision."""
+        app = self.get_app(app_name) or {}
+        app["reprovision"] = True
+        self.set_app(app_name, app)
+
+    def clear_reprovision(self, app_name: str) -> None:
+        """Drop the mark, once the profiles using the app were provisioned again."""
+        app = self.get_app(app_name)
+        if app is not None and app.pop("reprovision", None) is not None:
+            self.set_app(app_name, app)
+
     def remove_app(self, app_name: str) -> None:
         """Remove an app from state."""
         state = self.load()

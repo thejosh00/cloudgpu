@@ -21,6 +21,14 @@ elif "python3 -m remote" in command and command.endswith(" detect"):
     print(json.dumps(detection))
 elif "python3 -m remote" in command and command.endswith(" status"):
     # FAKE_SHIM_APPS: the apps the filesystem's state.json records, as JSON (default none).
-    print(json.dumps({"detection": detection, "apps": json.loads(os.environ.get("FAKE_SHIM_APPS") or "{}")}))
+    # FAKE_SHIM_APPS_AFTER_RECOVER, if set: what it records once a `recover` has run.
+    apps = os.environ.get("FAKE_SHIM_APPS") or "{}"
+    with open(os.environ["FAKE_SHIM_LOG"]) as log:
+        recovered = any(json.loads(line)["command"].endswith(" recover") for line in log)
+    if recovered and os.environ.get("FAKE_SHIM_APPS_AFTER_RECOVER"):
+        apps = os.environ["FAKE_SHIM_APPS_AFTER_RECOVER"]
+    print(json.dumps({"detection": detection, "apps": json.loads(apps)}))
 elif "python3 -m remote" in command and command.endswith(" recover"):
     sys.exit(int(os.environ.get("FAKE_SHIM_RECOVER_EXIT") or 0))
+elif "provision.py" in command or "provision.sh" in command:
+    sys.exit(int(os.environ.get("FAKE_SHIM_PROVISION_EXIT") or 0))

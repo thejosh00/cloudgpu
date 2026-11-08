@@ -127,3 +127,96 @@ def test_provision_still_recovers_before_installing(tmp_path, tmp_config_dir, mo
     assert len(recovers) == 1
     assert [commands[i].split("--app ")[1] for i in installs] == ["ai-toolkit"]
     assert recovers[0] < installs[0]
+
+
+# --- plan item 0.7: a recovery that rebuilt an app's venv re-provisions its profiles -------------
+
+BOTH = {**RECORDED, "ai-toolkit": {"status": "installed", "version": "1"}}
+REBUILT = {**BOTH, "comfyui": {**RECORDED["comfyui"], "reprovision": True}}
+
+
+def _provisioning_profile(workdir, name, apps):
+    _profile(workdir, name, apps)
+    (workdir / "profiles" / name / "provision.py").write_text("print('provisioned')\n")
+
+
+def _provisions(calls):
+    """(index, profile name) of each ssh call that ran a profile's provision entry point."""
+    return [(i, c["command"].split("/cloudgpu/provision/")[1].split(" ")[0]) for i, c in enumerate(calls)
+            if c["tool"] == "ssh" and "provision.py" in c["command"]]
+
+
+def _clears(calls):
+    return [(i, c["command"].split("--app ")[1]) for i, c in enumerate(calls)
+            if c["tool"] == "ssh" and " clear-reprovision " in c["command"]]
+
+
+def _up_after_rebuild(tmp_path, *args, after=REBUILT, provision_exit=0):
+    _provisioning_profile(tmp_path, "nodes", ["comfyui"])
+    _provisioning_profile(tmp_path, "trainer", ["ai-toolkit"])
+    with FakeLambda() as fake:
+        result = run_cloudgpu(
+            fake, tmp_path, ["up", "--config", "box", *args], config_extra=CAP,
+            state={"provisioned_profiles": ["nodes", "trainer"]},
+            shim_env={"FAKE_SHIM_APPS": json.dumps(BOTH), "FAKE_SHIM_APPS_AFTER_RECOVER": json.dumps(after),
+                      "FAKE_SHIM_PROVISION_EXIT": str(provision_exit)},
+        )
+    assert "Traceback" not in result.output, result.output
+    return result
+
+
+def test_bare_up_reprovisions_the_profiles_of_a_rebuilt_app_then_clears_the_mark(tmp_path):
+    """Catches: a rebuilt ComfyUI venv (custom nodes' requirements gone) left so by a bare `up`."""
+    result = _up_after_rebuild(tmp_path)
+    assert result.returncode == 0, result.output
+    calls = result.shim_calls
+    [recover] = _remote(calls, "recover")
+    provisions = _provisions(calls)
+    assert [name for _, name in provisions] == ["nodes"], result.output  # not "trainer": no comfyui
+    assert recover < provisions[0][0]
+    clears = _clears(calls)
+    assert [app for _, app in clears] == ["comfyui"], result.output
+    assert provisions[-1][0] < clears[0][0], "the mark is cleared only after provisioning"
+    assert _installs(calls) == []
+    assert result.state["provisioned_profiles"] == ["nodes", "trainer"]
+    assert "nodes" in result.output and "is up" in result.output
+
+
+def test_failed_reprovision_keeps_the_mark_and_fails_up(tmp_path):
+    """Catches: the mark cleared (or `up` reported as fine) when the re-provisioning failed."""
+    result = _up_after_rebuild(tmp_path, provision_exit=4)
+    assert result.returncode != 0, result.output
+    assert [name for _, name in _provisions(result.shim_calls)] == ["nodes"], result.output
+    assert _clears(result.shim_calls) == [], result.output
+    assert "is up" not in result.output
+
+
+def test_reprovision_merges_with_an_explicit_profile_without_running_it_twice(tmp_path):
+    """Catches: `up -P nodes` after a rebuild provisioning 'nodes' twice."""
+    result = _up_after_rebuild(tmp_path, "-P", "nodes")
+    assert result.returncode == 0, result.output
+    assert [name for _, name in _provisions(result.shim_calls)] == ["nodes"], result.output
+    assert [app for _, app in _clears(result.shim_calls)] == ["comfyui"]
+
+
+def test_no_mark_means_no_reprovision(tmp_path):
+    """Catches: a bare `up` re-provisioning every recorded profile when nothing was rebuilt."""
+    result = _up_after_rebuild(tmp_path, after=BOTH)
+    assert result.returncode == 0, result.output
+    assert _provisions(result.shim_calls) == []
+    assert _clears(result.shim_calls) == []
+
+
+def test_unloadable_recorded_profile_keeps_the_mark_and_names_it(tmp_path):
+    """Catches: the mark cleared while a recorded profile that may use the app was never re-run."""
+    _provisioning_profile(tmp_path, "nodes", ["comfyui"])
+    with FakeLambda() as fake:
+        result = run_cloudgpu(
+            fake, tmp_path, ["up", "--config", "box"], config_extra=CAP,
+            state={"provisioned_profiles": ["nodes", "gone"]},
+            shim_env={"FAKE_SHIM_APPS": json.dumps(BOTH), "FAKE_SHIM_APPS_AFTER_RECOVER": json.dumps(REBUILT)},
+        )
+    assert result.returncode == 0, result.output
+    assert [name for _, name in _provisions(result.shim_calls)] == ["nodes"], result.output
+    assert _clears(result.shim_calls) == [], result.output
+    assert "cloudgpu up -C box -P gone" in " ".join(result.output.split())

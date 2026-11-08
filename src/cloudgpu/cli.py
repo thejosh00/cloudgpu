@@ -458,7 +458,8 @@ def _recover_recorded(host: str, persistent_dir: str) -> dict:
     """Recover every app the filesystem's state.json records; return what it records.
 
     Recover restores the recorded apps (no re-download). Nothing recorded: no recover.
-    A failed recover fails the command.
+    A failed recover fails the command. What's returned is read after the recover, so it carries
+    the re-provision marks a venv rebuild left (see _reprovision).
     """
     output = _remote_run(host, persistent_dir, "status")
     known = json.loads(output).get("apps", {})
@@ -468,7 +469,57 @@ def _recover_recorded(host: str, persistent_dir: str) -> dict:
         if not result.ok:
             display.error(f"Recovery failed (exit code {result.returncode})")
             sys.exit(1)
+        known = json.loads(_remote_run(host, persistent_dir, "status")).get("apps", {})
     return known
+
+
+def _reprovision(config_name: str, state: dict, known: dict,
+                 profile_list: list[dict]) -> tuple[list[dict], list[str]]:
+    """The recorded profiles to provision again because recovery rebuilt an app's venv.
+
+    A rebuild loses what provisioning put into the venv (custom nodes' requirements), so the
+    remote records ``reprovision`` on the app until it's cleared. Returns (the recorded profiles
+    using a marked app that aren't in ``profile_list`` already, the marked apps whose marks can be
+    cleared once those are provisioned). A recorded profile that won't load might use a marked
+    app, so then nothing is cleared, and the warning says what to fix.
+    """
+    marked = [app for app, rec in known.items() if isinstance(rec, dict) and rec.get("reprovision")]
+    if not marked:
+        return [], []
+    requested = {p["name"] for p in profile_list}
+    redo: list[dict] = []
+    unloadable: list[str] = []
+    for name in state.get("provisioned_profiles") or []:
+        try:
+            prof = profiles.load_profile(name)
+        except config.ConfigError as e:
+            unloadable.append(name)
+            display.warn(f"Can't load recorded profile '{name}': {e}")
+            continue
+        if name not in requested and any(a in marked for a in prof.get("apps", [])):
+            redo.append(prof)
+    apps_list = ", ".join(marked)
+    if redo:
+        display.warn(f"Recovery rebuilt the venv of {apps_list}; provisioning "
+                     f"{', '.join(p['name'] for p in redo)} again to put back what it installed.")
+    if unloadable:
+        display.warn(
+            f"Recovery rebuilt the venv of {apps_list}, and recorded profile(s) "
+            f"{', '.join(unloadable)} can't be loaded, so they can't be provisioned again. "
+            f"Fix them and run 'cloudgpu up -C {config_name} -P {','.join(unloadable)}'; "
+            "until then every 'up' asks again.")
+        return redo, []
+    return redo, marked
+
+
+def _clear_reprovision(host: str, persistent_dir: str, marked: list[str]) -> None:
+    """Drop the marks, now the profiles using those apps were provisioned again."""
+    for app in marked:
+        result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "clear-reprovision", [f"--app {app}"]),
+                             timeout=120)
+        if not result.ok:
+            display.warn(f"Couldn't clear {app}'s re-provision mark (exit {result.returncode}); "
+                         "the next 'up' provisions its profiles again.")
 
 
 def _ensure_apps(host: str, persistent_dir: str, app_list: list[str], known: dict | None = None) -> None:
@@ -797,9 +848,12 @@ def up(config_name: str, profile_csv: str | None) -> None:
     # Recover what the filesystem records, on every up (with or without profiles), once.
     known = _recover_recorded(state["host"], persistent_dir)
 
-    # Provision the requested profiles (if any), then report.
-    if profile_list:
-        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list, known)
+    # Provision the requested profiles (if any), and the recorded ones a venv rebuild emptied
+    # (the marks are cleared only once that provisioning succeeded), then report.
+    redo, marked = _reprovision(config_name, state, known, profile_list)
+    if profile_list or redo:
+        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list + redo, known)
+    _clear_reprovision(state["host"], persistent_dir, marked)
     app_list = _apps_for_config(config_name)
     _report_up(config_name, state, persistent_dir, app_list)
 

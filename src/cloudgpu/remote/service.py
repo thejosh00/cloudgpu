@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import os
 import pwd
-from typing import Any
+from typing import Any, Callable
 
 from .run_as_app import app_step
 from .utils import APP_USER, log, run
@@ -136,6 +136,33 @@ def install_requirements_as_app(venv_dir: str, requirements: str, *, timeout: in
     pip = os.path.join(venv_dir, "bin", "pip")
     app_step([pip, "install", "-r", requirements],
              env={"PATH": os.environ.get("PATH", os.defpath)}, timeout=timeout)
+
+
+def ensure_torch(venv_dir: str, *, prepare: Callable[[str], None], check: Callable[[str], bool],
+                 install_torch: Callable[..., None], install: Callable[..., None]) -> None:
+    """Make sure the venv has a working CUDA PyTorch, plus matching torchvision/torchaudio.
+
+    The one torch step for every installer's install and venv rebuild, run before any ``-r``
+    install so a requirements file can't settle which torch the venv gets: check (as
+    cloudgpu-app), install CUDA torch if that fails, check again and raise if it still fails.
+
+    The installer passes its own prepare_venv_checks, check_torch_cuda, pip_install_torch and
+    pip_install, so each step is the one it imports (and that its tests stub, in-process).
+    """
+    log("Checking PyTorch CUDA availability...")
+    prepare(venv_dir)
+    if not check(venv_dir):
+        log("PyTorch CUDA not available via system packages, installing...", "warn")
+        install_torch(venv_dir, timeout=600)
+        if not check(venv_dir):
+            log("PyTorch CUDA still not working after install!", "error")
+            raise RuntimeError("Failed to get PyTorch with CUDA support")
+    else:
+        log("PyTorch with CUDA is available via system packages")
+
+    # Always install torchvision/torchaudio into the venv so they match its torch.
+    log("Installing matching torchvision and torchaudio in venv...")
+    install(venv_dir, "--no-deps", "torchvision", "torchaudio", timeout=600)
 
 
 def wipe_venv(venv_dir: str) -> None:

@@ -236,11 +236,12 @@ def broken_then_healthy():
     return lambda *_: next(answers, True)
 
 
-# Each way into the -r install, and how many -r installs it does.
+# Each way into the -r install, and how many -r installs it does (ComfyUI's are the app's and
+# ComfyUI-Manager's, on recovery's rebuilds too since 0.7).
 PATHS = [
     pytest.param(COMFY, "install", 2, id="comfyui-install"),
-    pytest.param(COMFY, "venv-missing", 1, id="comfyui-recover-venv-missing"),
-    pytest.param(COMFY, "rebuild", 1, id="comfyui-recover-rebuild"),
+    pytest.param(COMFY, "venv-missing", 2, id="comfyui-recover-venv-missing"),
+    pytest.param(COMFY, "rebuild", 2, id="comfyui-recover-rebuild"),
     pytest.param(TOOLKIT, "install", 1, id="ai-toolkit-install"),
     pytest.param(TOOLKIT, "venv-missing", 1, id="ai-toolkit-recover-venv-missing"),
     pytest.param(TOOLKIT, "rebuild", 1, id="ai-toolkit-recover-rebuild"),
@@ -280,11 +281,11 @@ class TestEveryInstallRunsAsApp:
 
     @pytest.mark.parametrize("path,timeout", [("venv-missing", 120), ("rebuild", 600)])
     def test_comfyui_recover_timeouts_kept(self, box, tmp_path, stubs, path, timeout):
-        """Bug: as above, on the recovery paths."""
+        """Bug: as above, on the recovery paths (the app's, then ComfyUI-Manager's as in install)."""
         _, call = go(box, tmp_path, stubs, COMFY, path)
         with patch("cloudgpu.remote.service.app_step") as step:
             call()
-        assert [c.kwargs["timeout"] for c in step.call_args_list] == [timeout]
+        assert [c.kwargs["timeout"] for c in step.call_args_list] == [timeout, 120]
 
     def test_ai_toolkit_timeout_kept(self, box, tmp_path, stubs):
         """Bug: as above: ai-toolkit's set can compile sdists for half an hour on aarch64."""

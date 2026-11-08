@@ -8,8 +8,8 @@ import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import (app_status, install_requirements_as_app, install_service, prepare_app_dir,
-                       prepare_venv_checks, service_active, wipe_venv)
+from ..service import (app_status, ensure_torch, install_requirements_as_app, install_service,
+                       prepare_app_dir, prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (run, pip_install, pip_install_torch, venv_python, check_torch_cuda,
                      git_pull_as_app, git_version_as_app, requirements_present, torch_cuda_status,
                      trust_repo_as_app, log)
@@ -65,22 +65,7 @@ class ComfyUIInstaller(AppInstaller):
             log("Venv already exists")
 
         # 3. Verify PyTorch CUDA and install torchvision/torchaudio in venv
-        log("Checking PyTorch CUDA availability...")
-        prepare_venv_checks(self.venv_dir)
-        if not check_torch_cuda(self.venv_dir):
-            log("PyTorch CUDA not available via system packages, installing...", "warn")
-            pip_install_torch(self.venv_dir, timeout=600)
-            if not check_torch_cuda(self.venv_dir):
-                log("PyTorch CUDA still not working after install!", "error")
-                raise RuntimeError("Failed to get PyTorch with CUDA support")
-        else:
-            log("PyTorch with CUDA is available via system packages")
-
-        # Always install torchvision/torchaudio into the venv so they match
-        # the venv torch version.
-        log("Installing matching torchvision and torchaudio in venv...")
-        pip_install(self.venv_dir, "--no-deps",
-                    "torchvision", "torchaudio", timeout=600)
+        self._ensure_torch()
 
         # 4. Install requirements
         log("Installing ComfyUI requirements...")
@@ -88,7 +73,7 @@ class ComfyUIInstaller(AppInstaller):
 
         # 5. Clone ComfyUI-Manager
         custom_nodes = os.path.join(self.app_dir, "custom_nodes")
-        manager_dir = os.path.join(custom_nodes, "ComfyUI-Manager")
+        manager_dir = self._manager_dir
         if not os.path.exists(manager_dir):
             log("Cloning ComfyUI-Manager...")
             app_step(["mkdir", "-p", custom_nodes], timeout=60)
@@ -105,7 +90,7 @@ class ComfyUIInstaller(AppInstaller):
         self._setup_service()
 
         # 7. Update state
-        self.state.set_app(self.name, {
+        self.save_record({
             "status": "installed",
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
@@ -135,31 +120,28 @@ class ComfyUIInstaller(AppInstaller):
 
         if not os.path.isdir(self.app_dir):
             log("App directory missing, doing full install", "warn")
+            # Custom nodes live in app_dir: the profiles must put them back.
+            self.state.mark_reprovision(self.name)
             self.install()
             return
 
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
-            prepare_app_dir(self.app_dir)
-            run(["python3", "-m", "venv", self.venv_dir])
-            self._install_requirements(self.app_dir, timeout=120)
+            self._rebuild_venv(wipe=False, timeout=120)
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
         prepare_venv_checks(self.venv_dir)
         trust_repo_as_app(self.app_dir)  # for reading its version, here and in `status`
         if not check_torch_cuda(self.venv_dir):
             log("PyTorch CUDA broken, rebuilding venv...", "warn")
-            prepare_app_dir(self.app_dir)
-            wipe_venv(self.venv_dir)
-            run(["python3", "-m", "venv", self.venv_dir])
-            self._install_requirements(self.app_dir, timeout=600)
+            self._rebuild_venv(wipe=True, timeout=600)
 
         # Regenerate launch script (transient paths need refreshing) + service
         self._create_launch_script()
         self._setup_service()
 
         # Update state
-        self.state.set_app(self.name, {
+        self.save_record({
             "status": "installed",
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
@@ -203,6 +185,31 @@ class ComfyUIInstaller(AppInstaller):
             # Only its own dirs are writable (models, outputs, custom nodes live under app_dir).
             "rw_paths": [self.app_dir, self.venv_dir],
         }
+
+    def _ensure_torch(self) -> None:
+        """Working CUDA torch plus matching vision/audio, as ai-toolkit gets (service.ensure_torch)."""
+        ensure_torch(self.venv_dir, prepare=prepare_venv_checks, check=check_torch_cuda,
+                     install_torch=pip_install_torch, install=pip_install)
+
+    @property
+    def _manager_dir(self) -> str:
+        return os.path.join(self.app_dir, "custom_nodes", "ComfyUI-Manager")
+
+    def _rebuild_venv(self, *, wipe: bool, timeout: int) -> None:
+        """Make a new venv in place of a missing or wiped one, as install would.
+
+        Marks the app first: whatever the profiles put in the venv (custom nodes' requirements)
+        is gone, and the mark has to outlive a recover or `up` that dies part way through.
+        """
+        self.state.mark_reprovision(self.name)
+        prepare_app_dir(self.app_dir)
+        if wipe:
+            wipe_venv(self.venv_dir)
+        os.makedirs(self.state.venvs_dir, exist_ok=True)
+        run(["python3", "-m", "venv", self.venv_dir])
+        self._ensure_torch()
+        self._install_requirements(self.app_dir, timeout=timeout)
+        self._install_requirements(self._manager_dir, timeout=120)
 
     def _install_requirements(self, directory: str, *, timeout: int) -> None:
         """Install ``directory``'s requirements as cloudgpu-app, if it has any.

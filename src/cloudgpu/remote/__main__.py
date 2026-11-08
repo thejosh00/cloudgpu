@@ -48,6 +48,11 @@ def cmd_recover(state: State, args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_clear_reprovision(state: State, args: argparse.Namespace) -> None:
+    """Drop an app's re-provision mark, once its profiles were provisioned again."""
+    state.clear_reprovision(args.app)
+
+
 def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:
     """Arm (hours > 0) or disarm (hours <= 0) the instance lifetime cap."""
     from . import autoterminate
@@ -88,6 +93,10 @@ def main() -> None:
     subparsers.add_parser("recover", help="Recover all installed apps")
     subparsers.add_parser("status", help="Show status")
 
+    clear_parser = subparsers.add_parser("clear-reprovision",
+                                         help="Drop an app's re-provision mark (after provisioning)")
+    clear_parser.add_argument("--app", required=True)
+
     at_parser = subparsers.add_parser("autoterminate", help="Arm/disarm the instance lifetime cap")
     at_parser.add_argument("--hours", type=float, required=True, help="Cap in hours; <= 0 disarms")
     at_parser.add_argument("--instance-id", default=None, help="This instance's Lambda id")
@@ -102,6 +111,7 @@ def main() -> None:
         "install": cmd_install,
         "recover": cmd_recover,
         "status": cmd_status,
+        "clear-reprovision": cmd_clear_reprovision,
         "autoterminate": cmd_autoterminate,
     }
 

@@ -45,3 +45,9 @@ class AppInstaller(abc.ABC):
         {"name", "exec_start", "workdir", "port"}. Default: not a service.
         """
         return None
+
+    def save_record(self, record: dict) -> None:
+        """Replace the app's record in state.json, keeping a re-provision mark it carries."""
+        if (self.state.get_app(self.name) or {}).get("reprovision"):
+            record = {**record, "reprovision": True}
+        self.state.set_app(self.name, record)

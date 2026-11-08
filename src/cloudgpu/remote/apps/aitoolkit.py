@@ -10,8 +10,8 @@ import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import (app_status, install_requirements_as_app, install_service, prepare_app_dir,
-                       prepare_venv_checks, service_active, wipe_venv)
+from ..service import (app_status, ensure_torch, install_requirements_as_app, install_service,
+                       prepare_app_dir, prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
                      check_torch_cuda, git_pull_as_app, git_version_as_app, requirements_present,
                      run_venv_check, torch_cuda_status, torch_index_url, trust_repo_as_app,
@@ -292,21 +292,9 @@ class AIToolkitInstaller(AppInstaller):
         pip_install(self.venv_dir, "--upgrade", "pip", timeout=300)
 
     def _ensure_torch(self) -> None:
-        """Make sure the venv has a working CUDA PyTorch, plus vision/audio."""
-        log("Checking PyTorch CUDA availability...")
-        prepare_venv_checks(self.venv_dir)
-        if not check_torch_cuda(self.venv_dir):
-            log("PyTorch CUDA not available via system packages, installing...", "warn")
-            pip_install_torch(self.venv_dir, timeout=600)
-            if not check_torch_cuda(self.venv_dir):
-                log("PyTorch CUDA still not working after install!", "error")
-                raise RuntimeError("Failed to get PyTorch with CUDA support")
-        else:
-            log("PyTorch with CUDA is available via system packages")
-
-        log("Installing matching torchvision and torchaudio in venv...")
-        pip_install(self.venv_dir, "--no-deps",
-                    "torchvision", "torchaudio", timeout=600)
+        """Make sure the venv has a working CUDA PyTorch, plus vision/audio (shared with ComfyUI)."""
+        ensure_torch(self.venv_dir, prepare=prepare_venv_checks, check=check_torch_cuda,
+                     install_torch=pip_install_torch, install=pip_install)
 
     def _install_requirements(self) -> None:
         """Install ai-toolkit's requirements, then torchcodec separately.
