@@ -250,7 +250,7 @@ def app(request, tmp_persistent_dir):
     patches = [patch(f"{module}.install_service"),
                patch(f"{module}.pip_install"),
                patch(f"{module}.pip_install_torch"),
-               patch(f"{module}.service_active", return_value="inactive")]
+               patch(f"{module}.service_active", return_value="active")]
     if cls is AIToolkitInstaller:
         patches += [patch.object(cls, "_ensure_node"),
                     patch.object(cls, "_build_ui"),

@@ -10,7 +10,7 @@ import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import (install_requirements_as_app, install_service, prepare_app_dir,
+from ..service import (app_status, install_requirements_as_app, install_service, prepare_app_dir,
                        prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
                      check_torch_cuda, git_pull_as_app, git_version_as_app, requirements_present,
@@ -243,16 +243,17 @@ class AIToolkitInstaller(AppInstaller):
             status = "broken"
         else:
             status = "installed" if torch_ok else "unverified"
+        service = service_active(self.name)
 
         return {
-            "status": status,
+            "status": app_status(status, service),
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
             "version": self._get_version() if app_exists else None,
             "torch_cuda": torch_ok,
             "node_ok": self._node_works(),
             "ui_built": ui_built,
-            "service": service_active(self.name),
+            "service": service,
             "port": AITOOLKIT_PORT,
             **{k: v for k, v in saved.items() if k not in ("status", "app_dir", "venv_dir", "version")},
         }
@@ -270,14 +271,14 @@ class AIToolkitInstaller(AppInstaller):
         }
 
     def _setup_service(self) -> None:
-        """Install/enable the systemd service (best-effort: warn rather than abort)."""
+        """Install/enable the systemd service; raises if it can't (so install/recover fail)."""
         # systemd won't start a unit whose ReadWritePaths doesn't exist.
         os.makedirs(self.hf_home, exist_ok=True)
         try:
             install_service(self.service_spec())
         except Exception as e:
-            log(f"Could not set up systemd service (run 'cloudgpu ssh -- ai-toolkit' "
-                f"manually instead): {e}", "warn")
+            raise RuntimeError(f"Could not set up systemd service '{self.name}': "
+                               f"{str(e) or type(e).__name__}") from e
 
     def _create_venv(self) -> None:
         """Create the venv and bring its pip up to date.

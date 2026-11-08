@@ -97,15 +97,20 @@ def show_status(apps: dict) -> None:
     table = Table(title="Installed Apps")
     table.add_column("App", style="bold")
     table.add_column("Status")
+    table.add_column("Service")
     table.add_column("Version")
     table.add_column("Path")
 
     for name, app in apps.items():
         status = app.get("status", "unknown")
         style = "green" if status == "installed" else "yellow"
+        # Green only when running; "unknown" (systemctl couldn't say) is not "active".
+        service = app.get("service") or "?"
+        service_style = {"active": "green", "inactive": "red", "failed": "red"}.get(service, "yellow")
         table.add_row(
             name,
             f"[{style}]{status}[/{style}]",
+            f"[{service_style}]{service}[/{service_style}]",
             app.get("version", "?"),
             app.get("app_dir", "?"),
         )

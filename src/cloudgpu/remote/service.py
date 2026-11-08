@@ -174,6 +174,16 @@ def restart_service(name: str) -> None:
     log(f"Service '{name}' restarted.")
 
 
+def app_status(status: str, service: str) -> str:
+    """An app's status given its service state: "installed" only while the service is active.
+
+    Otherwise it says what the service is ("service-inactive", "service-unknown", ...).
+    """
+    if status == "installed" and service != "active":
+        return f"service-{service}"
+    return status
+
+
 def service_active(name: str) -> str:
     """Return the service's systemd state ('active', 'inactive', ...); best-effort."""
     try:

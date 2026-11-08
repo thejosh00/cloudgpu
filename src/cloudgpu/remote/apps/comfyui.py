@@ -8,7 +8,7 @@ import time
 
 from ..installer import AppInstaller
 from ..run_as_app import app_step
-from ..service import (install_requirements_as_app, install_service, prepare_app_dir,
+from ..service import (app_status, install_requirements_as_app, install_service, prepare_app_dir,
                        prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (run, pip_install, pip_install_torch, venv_python, check_torch_cuda,
                      git_pull_as_app, git_version_as_app, requirements_present, torch_cuda_status,
@@ -180,14 +180,15 @@ class ComfyUIInstaller(AppInstaller):
             status = "broken"
         else:
             status = "installed" if torch_ok else "unverified"
+        service = service_active(self.name)
 
         return {
-            "status": status,
+            "status": app_status(status, service),
             "app_dir": self.app_dir,
             "venv_dir": self.venv_dir,
             "version": self._get_version() if app_exists else None,
             "torch_cuda": torch_ok,
-            "service": service_active(self.name),
+            "service": service,
             "port": COMFYUI_PORT,
             **{k: v for k, v in saved.items() if k not in ("status", "app_dir", "venv_dir", "version")},
         }
@@ -211,12 +212,12 @@ class ComfyUIInstaller(AppInstaller):
             install_requirements_as_app(self.venv_dir, requirements, timeout=timeout)
 
     def _setup_service(self) -> None:
-        """Install/enable the systemd service (best-effort: warn rather than abort)."""
+        """Install/enable the systemd service; raises if it can't (so install/recover fail)."""
         try:
             install_service(self.service_spec())
         except Exception as e:
-            log(f"Could not set up systemd service (run 'cloudgpu ssh -- comfyui' "
-                f"manually instead): {e}", "warn")
+            raise RuntimeError(f"Could not set up systemd service '{self.name}': "
+                               f"{str(e) or type(e).__name__}") from e
 
     def _create_launch_script(self) -> None:
         """Create the launch script at cloudgpu/bin/comfyui."""
