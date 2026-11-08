@@ -45,16 +45,16 @@ def test_mode_start_then_502_tracks_the_one_instance_it_launched(tmp_path):
     assert result.state["instance_id"] == "fake-instance-1"
 
 
-def test_mode_start_then_drop_stops_without_a_second_launch(tmp_path):
+def test_mode_start_then_drop_adopts_the_instance_without_a_second_launch(tmp_path):
     with FakeLambda(launches=["start_then_drop"]) as fake:
         result = run_up(fake, tmp_path)
 
-    assert result.returncode != 0
+    assert result.returncode == 0, result.output
     assert "Traceback" not in result.output
     assert "it may have gone through" in result.output
     assert len(fake.launches) == 1
     assert fake.alive() == ["fake-instance-1"]
-    assert result.state == {}
+    assert result.state["instance_id"] == "fake-instance-1"
 
 
 def test_mode_insufficient_capacity_polls_then_launches(tmp_path):
@@ -77,13 +77,13 @@ def test_mode_rate_limited_polls_then_launches(tmp_path):
     assert fake.alive() == ["fake-instance-1"]
 
 
-def test_mode_bad_request_is_retried_until_max_hours_today(tmp_path):
+def test_mode_bad_request_stops_after_one_attempt(tmp_path):
     with FakeLambda(then="bad_request") as fake:
         result = run_up(fake, tmp_path, max_hours=0.0003)  # about a second
 
     assert result.returncode == 1
-    assert "Timed out" in result.output
-    assert len(fake.launches) > 1
+    assert "Invalid request." in result.output
+    assert len(fake.launches) == 1
     assert fake.alive() == []
 
 
@@ -100,7 +100,7 @@ def test_mode_boot_polls_waits_for_the_ip(tmp_path):
 def test_up_during_boot_does_not_launch_a_second_instance(tmp_path):
     with FakeLambda() as fake:
         fake.add_instance(boot_polls=1000)
-        result = run_up(fake, tmp_path)
+        result = run_up(fake, tmp_path, config_extra="boot_minutes = 0.0001\n")
 
     assert result.returncode != 0
     assert fake.launches == []

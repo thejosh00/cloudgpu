@@ -145,7 +145,7 @@ def test_up_after_a_ctrl_c_does_not_launch_again(tmp_path):
     """Catches: a second `up` that doesn't see the saved, still-booting id and launches another."""
     with FakeLambda(boot_polls=FOREVER) as fake:
         interrupt_while_booting(fake, tmp_path)
-        again = run_up(fake, tmp_path, pace=PACE)
+        again = run_up(fake, tmp_path, pace=PACE, config_extra="boot_minutes = 0.005\n")
 
     assert again.returncode != 0
     assert "Traceback" not in again.output, again.output
@@ -229,7 +229,7 @@ def test_start_then_502_with_an_unclear_list_stops_without_launching_again(tmp_p
     assert len(fake.launches) == 1
 
 
-@pytest.mark.parametrize("mode", ["insufficient_capacity", "rate_limited", "bad_request"])
+@pytest.mark.parametrize("mode", ["insufficient_capacity", "rate_limited"])
 def test_known_launch_rejections_still_poll_and_launch_once(tmp_path, mode):
     """Catches: treating a published rejection as a launch that might have gone through."""
     with FakeLambda(launches=[mode]) as fake:

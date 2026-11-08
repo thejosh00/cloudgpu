@@ -109,7 +109,7 @@ def test_up_stops_on_a_tracked_instance_that_is_not_ready(tmp_path, status, ip):
     state = tracked_state()
     with FakeLambda() as fake:
         fake.add_instance(status=status, ip=ip)
-        result = run_up(fake, tmp_path, state=state, pace=PACE)
+        result = run_up(fake, tmp_path, state=state, pace=PACE, config_extra="boot_minutes = 0.002\n")
 
     assert_stopped_unchanged(fake, result, state)
     assert TRACKED_ID in result.output
@@ -190,7 +190,7 @@ def test_nothing_tracked_and_a_not_ready_instance_on_the_filesystem_does_not_lau
     """Catches: the old filter and its no-ip fall-through, which launch beside a billing instance."""
     with FakeLambda() as fake:
         fake.add_instance(status=status, ip=ip)
-        result = run_up(fake, tmp_path, pace=PACE)
+        result = run_up(fake, tmp_path, pace=PACE, config_extra="boot_minutes = 0.002\n")
 
     assert result.returncode != 0, result.output
     assert fake.launches == []
@@ -256,9 +256,10 @@ def test_a_launch_reply_that_says_nothing_launches_exactly_once(tmp_path, mode):
     with FakeLambda(launches=[mode]) as fake:
         result = run_up(fake, tmp_path, pace=PACE)
 
-    assert result.returncode != 0, result.output
+    assert result.returncode == 0, result.output
     assert len(fake.launches) == 1
     assert fake.alive() == ["fake-instance-1"]
+    assert result.state["instance_id"] == "fake-instance-1"
 
 
 def test_a_lost_launch_reply_after_a_gone_keeps_the_state(tmp_path):
@@ -267,9 +268,10 @@ def test_a_lost_launch_reply_after_a_gone_keeps_the_state(tmp_path):
     with FakeLambda(instance_reads=["not_found"], launches=["start_then_drop"]) as fake:
         result = run_up(fake, tmp_path, state=state, pace=PACE)
 
-    assert result.returncode != 0, result.output
+    assert result.returncode == 0, result.output
     assert len(fake.launches) == 1
-    assert result.state_bytes == json.dumps(state).encode()
+    assert result.state["instance_id"] == "fake-instance-1"
+    assert result.state["provisioned_profiles"] == ["alpha", "beta"]
 
 
 # --- down ---------------------------------------------------------------------------------------
