@@ -54,6 +54,7 @@ READ_MODES = {
     "200_no_status",  # ASSUMPTION: an instance with no status field, or a list entry with none
     "200_unlisted_status",  # ASSUMPTION: a status InstanceStatus doesn't list
     "200_not_a_list",  # ASSUMPTION: a list read that answers with an object
+    "200_empty",  # ASSUMPTION: a list that lags behind a launch and doesn't show the new instance yet
     "drop",  # ASSUMPTION: the connection closes with no reply
     "stall",  # ASSUMPTION: headers and part of the body, then nothing
 }
@@ -246,6 +247,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                 self._send(200, {"data": [entry] if self.path.endswith("/instances") else entry})
             elif mode == "200_not_a_list":
                 self._send(200, {"data": {}})  # empty, so iterating it finds nothing rather than failing
+            elif mode == "200_empty":
+                self._send(200, {"data": []})  # empty, so iterating it finds nothing rather than failing
             elif mode == "drop":
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)

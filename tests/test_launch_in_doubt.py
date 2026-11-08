@@ -40,6 +40,14 @@ def test_launch_read_timeout_ends_with_one_tracked_instance(tmp_path):
         assert_one_tracked(fake, result)
 
 
+def test_list_that_lags_then_shows_the_instance_adopts_it(tmp_path):
+    # The first list is up's own look before launching; the next two lag behind the launch.
+    with FakeLambda(launches=["start_then_502"], list_reads=["ok", "200_empty", "200_empty"]) as fake:
+        result = run_up(fake, tmp_path, pace=PACE)
+        assert_one_tracked(fake, result)
+        assert result.output.count("looking again") == 2, result.output
+
+
 def test_up_during_boot_waits_and_launches_nothing(tmp_path):
     with FakeLambda() as fake:
         booting = fake.add_instance(boot_polls=3)
