@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +30,7 @@ LAUNCH_MODES = {
     "start_then_502",  # ASSUMPTION: a gateway error can follow a launch that took effect
     "start_then_drop",  # ASSUMPTION: as above, with the connection closed and no reply
     "start_then_200_html",  # ASSUMPTION: as above, with a proxy's page and a 200
+    "start_then_stall",  # ASSUMPTION: as above, with headers and part of the body, then nothing
     "insufficient_capacity",  # published: HTTP 400, instance-operations/launch/insufficient-capacity
     "rate_limited",  # published: HTTP 429, global/rate-limited
     "bad_request",  # published: HTTP 400, global/invalid-parameters
@@ -61,6 +64,7 @@ class FakeLambda:
     def __init__(
         self, *, launches=(), then="ok", boot_polls=0, filesystem="box-fs", region="us-fake-1",
         instance_reads=(), instance_reads_then="ok", list_reads=(), list_reads_then="ok",
+        boot_ends="active",
     ):
         """
         Args:
@@ -73,6 +77,8 @@ class FakeLambda:
             instance_reads_then: what every read after those does.
             list_reads: what each GET /instances does, in order.
             list_reads_then: what every list after those does.
+            boot_ends: the status a launched instance has once its boot polls are used up:
+                "active" (with an ip), or "terminated" / "error" (no ip) for one that died booting.
         """
         unknown = {*launches, then} - LAUNCH_MODES
         if unknown:
@@ -88,6 +94,12 @@ class FakeLambda:
         self.launch_script = list(launches)
         self.then = then
         self.boot_polls = boot_polls
+        if boot_ends not in ("active", "terminated", "error"):
+            raise ValueError(f"unknown boot_ends: {boot_ends!r}")
+        self.boot_ends = boot_ends
+        # Called with each GET's path before it's answered, outside the lock (a test can look
+        # at the state file at that moment).
+        self.on_get = None
         self.region = region
         self.filesystems = [filesystem] if filesystem else []
         self.launches: list[dict] = []  # every launch body received, whatever it then did
@@ -159,13 +171,16 @@ class FakeLambda:
         if inst["_booting_for"] > 0:
             inst["_booting_for"] -= 1
             return {**public, "status": "booting"}
+        if self.boot_ends != "active":
+            inst["_status"], inst["_shows_ip"] = self.boot_ends, False
+            return {**public, "status": self.boot_ends}
         return {**public, "status": "active", "ip": inst["_ip"]}
 
     def _launch(self, body: dict) -> tuple[str, list[str]]:
         """Record a launch. Returns its mode, and the instances it started."""
         self.launches.append(body)
         mode = self.launch_script.pop(0) if self.launch_script else self.then
-        if mode in ("ok", "start_then_502", "start_then_drop", "start_then_200_html"):
+        if mode in ("ok", "start_then_502", "start_then_drop", "start_then_200_html", "start_then_stall"):
             # ASSUMPTION: a launch on a filesystem already in use is accepted. The spec doesn't
             # say, and only lists filesystem-in-use for deleting one.
             return mode, [self._start(body.get("name"), body.get("file_system_names") or [], self.boot_polls)]
@@ -243,6 +258,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
             self.close_connection = True
 
         def do_GET(self) -> None:
+            if fake.on_get is not None:
+                fake.on_get(self.path)
             with fake._lock:
                 fake.requests.append(("GET", self.path))
                 mode = fake._read_mode(self.path)
@@ -278,6 +295,7 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            stall = False
             with fake._lock:
                 fake.requests.append(("POST", self.path))
                 if self.path == "/api/v1/filesystems":
@@ -291,6 +309,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                         self._send(502, raw=b"<html>502 Bad Gateway</html>")
                     elif mode == "start_then_200_html":
                         self._send(200, raw=b"<html>Please wait</html>")
+                    elif mode == "start_then_stall":
+                        stall = True  # answered below, outside the lock
                     elif mode == "start_then_drop":
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -309,6 +329,8 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                     self._send(200, {"data": {"terminated_instances": []}})
                 else:
                     self._error(404, "global/object-does-not-exist", f"Fake has no POST {self.path}")
+            if stall:
+                self._stall()
 
     return Handler
 
@@ -330,13 +352,14 @@ def run_up(fake: FakeLambda, workdir: Path, **kwargs) -> UpResult:
 def run_cloudgpu(
     fake: FakeLambda, workdir: Path, args: list[str], *,
     poll_seconds=0, max_hours=1.0, timeout=60, base_url=None, state=None, api_key="dummy-key-not-real", pace=None,
-    config_extra="", shim_env=None,
+    config_extra="", shim_env=None, interrupt_when=None,
 ) -> UpResult:
     """Run a real `cloudgpu` command in a subprocess against the fake, with ssh and rsync shimmed.
 
     `api_key=None` leaves the key out. `pace` divides its timeouts and retry delays.
     `config_extra` is appended to the config's TOML; `shim_env` adds FAKE_SHIM_* settings
-    for the ssh shim (FAKE_SHIM_APPS, FAKE_SHIM_RECOVER_EXIT).
+    for the ssh shim (FAKE_SHIM_APPS, FAKE_SHIM_RECOVER_EXIT). `interrupt_when`, if given, is
+    checked every few milliseconds; once it's true the command gets a SIGINT, as from a Ctrl-C.
 
     The environment is built from nothing, with a throwaway HOME, so no real key, ~/.ssh or
     secrets file is in reach. The proxy variables point at a closed port: if the override
@@ -369,13 +392,27 @@ def run_cloudgpu(
         env["LAMBDA_API_KEY"] = api_key
     if pace is not None:
         env["CLOUDGPU_TEST_LAMBDA_PACE"] = str(pace)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-c", "from cloudgpu.cli import cli; cli()", *args],
-        cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout,
+        cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    try:
+        if interrupt_when is not None:
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None and not interrupt_when():
+                if time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                time.sleep(0.01)
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
     return UpResult(
         returncode=proc.returncode,
-        output=proc.stdout + proc.stderr,
+        output=stdout + stderr,
         state=json.loads(state_file.read_text()) if state_file.exists() else {},
         shim_calls=[json.loads(line) for line in shim_log.read_text().splitlines()] if shim_log.exists() else [],
         state_bytes=state_file.read_bytes() if state_file.exists() else None,

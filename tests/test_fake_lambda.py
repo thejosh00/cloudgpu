@@ -35,13 +35,14 @@ def test_up_creates_a_missing_filesystem(tmp_path):
     assert fake.alive() == ["fake-instance-1"]
 
 
-def test_mode_start_then_502_leaves_two_alive_one_tracked_today(tmp_path):
+def test_mode_start_then_502_tracks_the_one_instance_it_launched(tmp_path):
     with FakeLambda(launches=["start_then_502"]) as fake:
         result = run_up(fake, tmp_path)
 
     assert result.returncode == 0, result.output
-    assert len(fake.alive()) == 2
-    assert result.state["instance_id"] == "fake-instance-2"
+    assert len(fake.launches) == 1
+    assert fake.alive() == ["fake-instance-1"]
+    assert result.state["instance_id"] == "fake-instance-1"
 
 
 def test_mode_start_then_drop_stops_without_a_second_launch(tmp_path):
