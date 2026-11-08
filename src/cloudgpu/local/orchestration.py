@@ -39,21 +39,18 @@ class BootFailed(OrchestrationError):
         self.gone = gone
 
 
-# Launch errors Lambda publishes as a refusal: nothing was started, so polling again is safe.
-_LAUNCH_REFUSALS = {
-    "instance-operations/launch/insufficient-capacity",
-    "global/rate-limited",
-    "global/invalid-parameters",
-}
+class LaunchRejected(OrchestrationError):
+    """Lambda refused the launch with a 4xx that asking again won't fix. Nothing was started."""
 
 
-def launch_was_refused(e: lambda_api.LambdaAPIError) -> bool:
-    """True if this launch error says nothing was started.
+# After a launch whose outcome is in doubt, how long to keep looking for what it made before
+# deciding nothing started, and how often. Lambda's list may lag a launch; how much is unverified,
+# so this is a guess. Both are divided by lambda_api.pace(), so tests can shrink them.
+LAUNCH_LOOK_WINDOW_SECONDS = 60
+LAUNCH_LOOK_EVERY_SECONDS = 10
 
-    A published refusal, or no HTTP answer at all (the request never reached Lambda). A 5xx or
-    anything unrecognised may follow a launch that took effect.
-    """
-    return e.status is None or e.code in _LAUNCH_REFUSALS
+# Backing off after a 429 with no Retry-After: at least this, or the poll interval if longer.
+RATE_LIMIT_BACKOFF_SECONDS = 30
 
 
 def expand_targets(gpu: list[str]) -> list[str]:
@@ -207,18 +204,49 @@ def wait_active(instance_id: str, poll: int = 20, max_minutes: float = 20) -> di
     raise BootFailed(f"timed out after {max_minutes:g} minutes waiting for instance to become active")
 
 
-def _find_what_launched(filesystem: str, error: lambda_api.LambdaAPIError) -> dict:
-    """After a launch error that may hide a launch: the instance it made, or stop.
+class LaunchInDoubt(lambda_api.LambdaReplyLost):
+    """A launch may have started an instance, and looking for it didn't settle it. Nothing more is launched."""
+
+    def __init__(self, message: str, *, filesystem: str):
+        super().__init__(message)
+        self.filesystem = filesystem
+
+
+def _find_what_launched(filesystem: str, name: str | None, error: BaseException) -> dict:
+    """After a launch whose outcome is in doubt: the instance it made, or stop.
 
     Anything not terminated mounting the filesystem is taken as that launch's (`up` only gets
-    here when nothing was mounting it). Nothing found, or no clear answer: raise LambdaReplyLost,
-    so nothing is launched again blind.
+    here when nothing was mounting it: the filesystem is the config's identity). The list may lag
+    the launch, so it is read more than once over LAUNCH_LOOK_WINDOW_SECONDS. Nothing found in
+    that window, or a list that can't be read: raise LaunchInDoubt, so nothing is launched blind.
     """
-    found = liveness.find_mounting(filesystem)
-    if found.kind is liveness.Kind.ALIVE:
-        return found.instance
-    why = "nothing is mounting it yet" if found.kind is liveness.Kind.GONE else found.detail
-    raise lambda_api.LambdaReplyLost(f"launch failed ({error}), and looking for what it made on '{filesystem}': {why}")
+    window = LAUNCH_LOOK_WINDOW_SECONDS / lambda_api.pace()
+    every = LAUNCH_LOOK_EVERY_SECONDS / lambda_api.pace()
+    deadline = time.monotonic() + window
+    looks = 0
+    while True:
+        looks += 1
+        found = liveness.find_mounting(filesystem)
+        if found.kind is liveness.Kind.ALIVE:
+            inst = found.instance
+            if name and inst.get("name") not in (None, name):
+                display.warn(f"Instance {inst.get('id')} on '{filesystem}' is named {inst.get('name')!r}, "
+                             f"not {name!r}; taking it anyway, as nothing else mounts this filesystem.")
+            return inst
+        if found.kind is liveness.Kind.UNKNOWN:
+            raise LaunchInDoubt(
+                f"launch failed ({error}), and the instance list couldn't be read to see whether it "
+                f"started one on '{filesystem}': {found.detail}",
+                filesystem=filesystem,
+            )
+        if time.monotonic() >= deadline:
+            raise LaunchInDoubt(
+                f"launch failed ({error}), and nothing appeared on '{filesystem}' in {looks} looks over "
+                f"{window:g}s; the list may still be lagging",
+                filesystem=filesystem,
+            )
+        display.info(f"  nothing on '{filesystem}' yet; looking again in {every:g}s...")
+        time.sleep(every)
 
 
 def acquire_instance(
@@ -294,6 +322,7 @@ def acquire_instance(
 
         display.success(f"Capacity found: {tname} in {chosen_region} -- launching")
         found = None
+        instance_name = profile.get("instance_name", profile["name"])
         try:
             try:
                 res = lambda_api.launch_instance(
@@ -301,18 +330,29 @@ def acquire_instance(
                     instance_type_name=tname,
                     ssh_key_names=[ssh_key],
                     file_system_names=[filesystem],
-                    name=profile.get("instance_name", profile["name"]),
+                    name=instance_name,
                 )
-            except lambda_api.LambdaAPIError as e:
-                if launch_was_refused(e):  # nothing started: capacity may have vanished in the race
-                    display.warn(f"launch failed ({e}); continuing to poll")
+            except (lambda_api.LambdaAPIError, lambda_api.LambdaReplyLost) as e:
+                outcome = lambda_api.classify_launch_error(e)
+                if outcome is lambda_api.LaunchOutcome.REJECTED:
+                    raise LaunchRejected(f"Lambda refused the launch, so not trying again: {e}") from e
+                if outcome is lambda_api.LaunchOutcome.RATE_LIMITED:
+                    retry_after = getattr(e, "retry_after", None)
+                    wait = retry_after if retry_after is not None else max(poll, RATE_LIMIT_BACKOFF_SECONDS)
+                    display.warn(f"launch failed ({e}); rate-limited, backing off {wait:g}s before polling again")
+                    time.sleep(wait / lambda_api.pace())
+                    continue
+                if outcome in (lambda_api.LaunchOutcome.NO_CAPACITY, lambda_api.LaunchOutcome.NOT_SENT):
+                    display.warn(f"launch failed ({e}); nothing was started, continuing to poll")
                     time.sleep(poll)
                     continue
                 display.warn(f"launch failed ({e}); it may have gone through, so looking for what it made...")
-                found = _find_what_launched(filesystem, e)
+                found = _find_what_launched(filesystem, instance_name, e)
                 res = {"id": found.get("id")}
         except KeyboardInterrupt:
-            raise lambda_api.LambdaReplyLost("launch interrupted (Ctrl-C) before Lambda's reply was read") from None
+            raise LaunchInDoubt(
+                "launch interrupted (Ctrl-C) before Lambda's reply was read", filesystem=filesystem,
+            ) from None
 
         instance_id = _first_instance_id(res)
         if not instance_id:

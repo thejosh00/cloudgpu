@@ -5,6 +5,7 @@ The API key is read from the LAMBDA_API_KEY env var.
 
 from __future__ import annotations
 
+import enum
 import http.client
 import ipaddress
 import json
@@ -43,11 +44,15 @@ class LambdaAPIError(Exception):
         retryable: False when asking again can't help: a missing key, a refused key.
     """
 
-    def __init__(self, message: str, *, status: int | None = None, code: str | None = None, retryable: bool = True):
+    def __init__(
+        self, message: str, *, status: int | None = None, code: str | None = None, retryable: bool = True,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
         self.retryable = retryable
+        self.retry_after = retry_after  # seconds, from a Retry-After header, if one came
 
 
 class LambdaReplyLost(Exception):
@@ -181,7 +186,49 @@ def _http_error(e: urllib.error.HTTPError) -> LambdaAPIError:
         status=e.code,
         code=code,
         retryable=e.code not in (400, 401, 403),
+        retry_after=_retry_after(e),
     )
+
+
+def _retry_after(e: urllib.error.HTTPError) -> float | None:
+    """Retry-After in seconds, if the reply had one in that form (an HTTP date is ignored)."""
+    try:
+        value = float((e.headers or {}).get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+# --- What a failed launch means -------------------------------------------
+
+INSUFFICIENT_CAPACITY_CODE = "instance-operations/launch/insufficient-capacity"
+
+
+class LaunchOutcome(enum.Enum):
+    """What a failed launch request says about whether an instance was started."""
+
+    NOT_SENT = "not-sent"  # never reached Lambda: nothing started, safe to poll again
+    IN_DOUBT = "in-doubt"  # 5xx, timeout, dropped connection, unreadable reply: it may have started
+    NO_CAPACITY = "insufficient-capacity"  # published refusal: nothing started, poll again
+    RATE_LIMITED = "rate-limited"  # 429: nothing started, back off then poll again
+    REJECTED = "rejected"  # any other 4xx: asking again won't help, so stop
+
+
+def classify_launch_error(e: BaseException) -> LaunchOutcome:
+    """Sort a launch failure by what the caller may safely do next."""
+    if isinstance(e, LambdaReplyLost):
+        return LaunchOutcome.IN_DOUBT
+    if not isinstance(e, LambdaAPIError):
+        return LaunchOutcome.IN_DOUBT
+    if e.status is None:
+        return LaunchOutcome.NOT_SENT
+    if e.status == 429:
+        return LaunchOutcome.RATE_LIMITED
+    if e.code == INSUFFICIENT_CAPACITY_CODE:
+        return LaunchOutcome.NO_CAPACITY
+    if 400 <= e.status < 500:
+        return LaunchOutcome.REJECTED
+    return LaunchOutcome.IN_DOUBT
 
 
 # --- Filesystems ----------------------------------------------------------

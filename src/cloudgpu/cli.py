@@ -808,6 +808,54 @@ def up(config_name: str, profile_csv: str | None) -> None:
         raise click.UsageError(str(e)) from e
     profile_list = _parse_profiles(profile_csv)
 
+    # One `up` per config at a time on this computer, so two can't both launch. Refuse rather
+    # than wait: the other may be polling for capacity for hours.
+    try:
+        lock = configs.hold_up_lock(config_name)
+    except configs.UpLocked as e:
+        display.error(
+            f"Another 'cloudgpu up -C {escape(config_name)}' is already running on this computer "
+            f"(it holds {escape(str(e.path))}), so not starting a second one. "
+            "Let it finish, or stop it first."
+        )
+        sys.exit(1)
+    with lock:
+        _up_locked(config_name, cfg, profile_list)
+
+
+def _waits_for_boot(inst: dict) -> bool:
+    """Still coming up: booting, or active with no ip yet. Worth waiting on, not launching beside."""
+    return inst.get("status") == "booting" or (inst.get("status") == "active" and not inst.get("ip"))
+
+
+def _wait_for_booting(config_name: str, cfg: dict, inst: dict) -> dict:
+    """Wait, bounded by the config's boot_minutes, for an instance on this filesystem to boot.
+
+    Never launches. On timeout or failure stop, and say what is still billing.
+    """
+    inst_id = inst.get("id")
+    poll = int(cfg.get("poll_seconds", 20))
+    minutes = float(cfg.get("boot_minutes", 20))
+    display.info(
+        f"Instance {inst_id} on '{escape(cfg['filesystem'])}' is {liveness.describe(inst)}; "
+        f"waiting up to {minutes:g} minutes for it rather than launching another..."
+    )
+    try:
+        return {"id": inst_id, **orchestration.wait_active(inst_id, poll=poll, max_minutes=minutes)}
+    except orchestration.BootFailed as e:
+        if e.gone:
+            _stop_unchanged(f"Instance {inst_id} {e}, so it is no longer billing. Run 'cloudgpu up -C {config_name}' to launch.")
+        why = str(e)
+    except (lambda_api.LambdaAPIError, lambda_api.LambdaReplyLost) as e:
+        why = f"couldn't keep checking it: {e}"
+    _stop_unchanged(
+        f"Waiting for instance {inst_id} ({liveness.describe(inst)}) to boot: {why}. Not launching another.\n"
+        f"Instance {inst_id} may still be running and billing. 'cloudgpu up -C {config_name}' waits for it "
+        f"again; 'cloudgpu down -C {config_name}' terminates it."
+    )
+
+
+def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     filesystem = cfg["filesystem"]
 
     # Reuse a live instance if we already track one for this config. The state file stays as it
@@ -818,9 +866,12 @@ def up(config_name: str, profile_csv: str | None) -> None:
     if read and read.kind is liveness.Kind.UNKNOWN:
         _stop_unchanged(read.detail)
     if read and read.kind is liveness.Kind.ALIVE:
-        if not liveness.usable(read.instance):
-            _stop_not_ready({"id": tracked, **read.instance})
-        ip = read.instance.get("ip")
+        inst = {"id": tracked, **read.instance}
+        if not liveness.usable(inst):
+            if not _waits_for_boot(inst):
+                _stop_not_ready(inst)
+            inst = _wait_for_booting(config_name, cfg, inst)
+        ip = inst.get("ip")
         display.info(f"Reusing running instance {tracked} ({ip}).")
         state["host"] = f"ubuntu@{ip}"
         state["ip"] = ip
@@ -836,7 +887,9 @@ def up(config_name: str, profile_csv: str | None) -> None:
         if mounting.kind is liveness.Kind.ALIVE:
             existing = mounting.instance
             if not liveness.usable(existing):
-                _stop_not_ready(existing)
+                if not _waits_for_boot(existing):
+                    _stop_not_ready(existing)
+                existing = _wait_for_booting(config_name, cfg, existing)
             display.info(
                 f"Adopting running instance {existing.get('id')} ({existing.get('ip')}) "
                 f"already mounting '{filesystem}'."
@@ -867,8 +920,10 @@ def up(config_name: str, profile_csv: str | None) -> None:
                 if launched:
                     _stop_launched(config_name, launched, str(e))
                 display.error(
-                    f"{escape(str(e))}\nNot trying again: if that was a launch, it may have gone through. "
-                    "Check 'cloudgpu lambda instances' before running this again."
+                    f"{escape(str(e))}\nNot trying again: if that was a launch, it may have gone through, and "
+                    f"an instance may be running and billing on filesystem '{escape(filesystem)}'. Check with "
+                    f"'cloudgpu lambda instances'. Once it shows, 'cloudgpu up -C {config_name}' adopts it and "
+                    f"'cloudgpu down -C {config_name}' terminates it."
                 )
                 sys.exit(1)
             except (orchestration.OrchestrationError, lambda_api.LambdaAPIError) as e:

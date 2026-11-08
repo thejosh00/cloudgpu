@@ -17,6 +17,7 @@ Note the distinction from ``config.py`` (singular): that module is the global
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,48 @@ def state_path(config_path_or_name: str | Path) -> Path:
     """State file beside the config: configs/<name>.toml -> configs/<name>.state.json."""
     p = config_path(config_path_or_name)
     return p.with_name(f"{p.stem}{STATE_SUFFIX}")
+
+
+UP_LOCK_SUFFIX = ".up.lock"
+
+
+class UpLocked(Exception):
+    """Another `up` on this computer holds this config's lock."""
+
+    def __init__(self, path: Path):
+        super().__init__(str(path))
+        self.path = path
+
+
+def up_lock_path(config_path_or_name: str | Path) -> Path:
+    """Lock file beside the config's state: configs/<name>.toml -> configs/<name>.up.lock."""
+    p = config_path(config_path_or_name)
+    return p.with_name(f"{p.stem}{UP_LOCK_SUFFIX}")
+
+
+def hold_up_lock(config_path_or_name: str | Path):
+    """Take this config's `up` lock without waiting, and return the open file that holds it.
+
+    flock, so a crash or kill releases it with the process. Covers this computer only: two
+    machines running `up` on one config aren't stopped by it. The file is left in place.
+
+    Raises:
+        UpLocked: If another process holds it.
+    """
+    import fcntl
+
+    path = up_lock_path(config_path_or_name)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise UpLocked(path) from None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def load_state(config_path_or_name: str | Path) -> dict[str, Any]:
