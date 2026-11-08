@@ -26,3 +26,12 @@ def tmp_config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cloudgpu.local.config.CONFIG_DIR", config_dir)
     monkeypatch.setattr("cloudgpu.local.config.CONFIG_FILE", config_dir / "config.json")
     return config_dir
+
+
+@pytest.fixture(autouse=True)
+def _short_launch_look_window(monkeypatch):
+    """In-process tests: look for what a doubtful launch made over a tiny window, not a minute."""
+    from cloudgpu.local import orchestration
+
+    monkeypatch.setattr(orchestration, "LAUNCH_LOOK_WINDOW_SECONDS", 0.05)
+    monkeypatch.setattr(orchestration, "LAUNCH_LOOK_EVERY_SECONDS", 0.01)
