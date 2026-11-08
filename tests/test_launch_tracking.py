@@ -155,8 +155,12 @@ def test_up_after_a_ctrl_c_does_not_launch_again(tmp_path):
 
 
 def test_down_after_a_ctrl_c_terminates_the_saved_id(tmp_path):
-    """Catches: `down` missing an id saved with no host."""
-    with FakeLambda(boot_polls=FOREVER) as fake:
+    """Catches: `down` missing an id saved with no host.
+
+    Every list after `up`'s first fails, so `down` can't fall back to what mounts the filesystem:
+    only the saved id can find the instance.
+    """
+    with FakeLambda(boot_polls=FOREVER, list_reads=["ok"], list_reads_then="http_503") as fake:
         interrupt_while_booting(fake, tmp_path)
         down = run_cloudgpu(fake, tmp_path, ["down", "--config", "box", "--yes"], pace=PACE)
         alive = fake.alive()
