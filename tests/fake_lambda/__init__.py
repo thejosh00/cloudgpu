@@ -66,7 +66,7 @@ class FakeLambda:
     def __init__(
         self, *, launches=(), then="ok", boot_polls=0, filesystem="box-fs", region="us-fake-1",
         instance_reads=(), instance_reads_then="ok", list_reads=(), list_reads_then="ok",
-        boot_ends="active",
+        boot_ends="active", filesystem_reads=(), filesystem_reads_then="ok",
     ):
         """
         Args:
@@ -81,17 +81,23 @@ class FakeLambda:
             list_reads_then: what every list after those does.
             boot_ends: the status a launched instance has once its boot polls are used up:
                 "active" (with an ip), or "terminated" / "error" (no ip) for one that died booting.
+            filesystem_reads: what each GET /file-systems does, in order (see READ_MODES).
+            filesystem_reads_then: what every filesystem list after those does.
         """
         unknown = {*launches, then} - LAUNCH_MODES
         if unknown:
             raise ValueError(f"unknown launch modes: {sorted(unknown)}")
-        unknown = {*instance_reads, instance_reads_then, *list_reads, list_reads_then} - READ_MODES
+        unknown = {
+            *instance_reads, instance_reads_then, *list_reads, list_reads_then, *filesystem_reads, filesystem_reads_then,
+        } - READ_MODES
         if unknown:
             raise ValueError(f"unknown read modes: {sorted(unknown)}")
         self.instance_read_script = list(instance_reads)
         self.instance_reads_then = instance_reads_then
         self.list_read_script = list(list_reads)
         self.list_reads_then = list_reads_then
+        self.filesystem_read_script = list(filesystem_reads)
+        self.filesystem_reads_then = filesystem_reads_then
         self._stop = threading.Event()
         self.launch_script = list(launches)
         self.then = then
@@ -104,6 +110,7 @@ class FakeLambda:
         self.on_get = None
         self.region = region
         self.filesystems = [filesystem] if filesystem else []
+        self.deleted_filesystems: list[str] = []  # ids of every filesystem a DELETE removed
         self.launches: list[dict] = []  # every launch body received, whatever it then did
         self.requests: list[tuple[str, str]] = []  # every (method, path) received
         self.instances: list[dict] = []
@@ -195,6 +202,8 @@ class FakeLambda:
             return self.list_read_script.pop(0) if self.list_read_script else self.list_reads_then
         if path.startswith("/api/v1/instances/"):
             return self.instance_read_script.pop(0) if self.instance_read_script else self.instance_reads_then
+        if path == "/api/v1/file-systems":
+            return self.filesystem_read_script.pop(0) if self.filesystem_read_script else self.filesystem_reads_then
         return None
 
 
@@ -330,10 +339,16 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                     else:
                         self._error(400, "global/invalid-parameters", "Invalid request.")
                 elif self.path == "/api/v1/instance-operations/terminate":
-                    for inst in fake.instances:
-                        if inst["id"] in body.get("instance_ids", []):
-                            inst["_status"] = "terminated"
-                    self._send(200, {"data": {"terminated_instances": []}})
+                    wanted = body.get("instance_ids", [])
+                    known = {inst["id"] for inst in fake.instances}
+                    if any(i not in known for i in wanted):
+                        # ASSUMPTION: terminating an id Lambda doesn't have fails, with its not-found code.
+                        self._error(404, "global/object-does-not-exist", "Specified instance does not exist.")
+                    else:
+                        for inst in fake.instances:
+                            if inst["id"] in wanted:
+                                inst["_status"] = "terminated"
+                        self._send(200, {"data": {"terminated_instances": []}})
                 else:
                     self._error(404, "global/object-does-not-exist", f"Fake has no POST {self.path}")
             if stall == "hang":
@@ -341,6 +356,18 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                 self.close_connection = True
             elif stall:
                 self._stall()
+
+        def do_DELETE(self) -> None:
+            with fake._lock:
+                fake.requests.append(("DELETE", self.path))
+                prefix = "/api/v1/filesystems/fs-"
+                name = self.path[len(prefix):] if self.path.startswith(prefix) else None
+                if name in fake.filesystems:
+                    fake.filesystems.remove(name)
+                    fake.deleted_filesystems.append(f"fs-{name}")
+                    self._send(200, {"data": {"deleted_ids": [f"fs-{name}"]}})
+                else:
+                    self._error(404, "global/object-does-not-exist", f"Fake has no DELETE {self.path}")
 
     return Handler
 

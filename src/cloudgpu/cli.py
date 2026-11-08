@@ -437,10 +437,13 @@ def _stop_unchanged(message: str) -> NoReturn:
     sys.exit(1)
 
 
-def _stop_not_ready(inst: dict) -> NoReturn:
+def _stop_not_ready(config_name: str, inst: dict) -> NoReturn:
     """An instance exists but can't be used yet: another launch would bill twice."""
     status = liveness.describe(inst)
-    _stop_unchanged(f"Instance {inst.get('id')} is {status}, so not launching another. Run this again once it's active.")
+    _stop_unchanged(
+        f"Instance {inst.get('id')} is {status}, so not launching another. It may still be billing.\n"
+        f"'cloudgpu up -C {config_name}' uses it once it's active; 'cloudgpu down -C {config_name}' terminates it."
+    )
 
 
 def _stop_launched(config_name: str, runtime: dict, why: str, code: int = 1) -> NoReturn:
@@ -869,7 +872,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
         inst = {"id": tracked, **read.instance}
         if not liveness.usable(inst):
             if not _waits_for_boot(inst):
-                _stop_not_ready(inst)
+                _stop_not_ready(config_name, inst)
             inst = _wait_for_booting(config_name, cfg, inst)
         ip = inst.get("ip")
         display.info(f"Reusing running instance {tracked} ({ip}).")
@@ -888,7 +891,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
             existing = mounting.instance
             if not liveness.usable(existing):
                 if not _waits_for_boot(existing):
-                    _stop_not_ready(existing)
+                    _stop_not_ready(config_name, existing)
                 existing = _wait_for_booting(config_name, cfg, existing)
             display.info(
                 f"Adopting running instance {existing.get('id')} ({existing.get('ip')}) "
@@ -1061,15 +1064,20 @@ def autoterminate(hours: float | None, off: bool, config_name: str) -> None:
         display.success("Auto-terminate disarmed.")
 
 
-def _find_filesystem(name: str) -> dict | None:
-    """Return the account filesystem with this name, or None."""
+def _find_filesystem(config_name: str, name: str) -> dict | None:
+    """Return the account filesystem with this name, or None if the list doesn't have it.
+
+    A lookup that fails stops: it must not read as "no filesystem", which would leave one billing.
+    """
     try:
-        for fs in lambda_api.list_filesystems():
-            if fs.get("name") == name:
-                return fs
-    except lambda_api.LambdaAPIError:
-        pass
-    return None
+        return orchestration.filesystem_record(name)
+    except (lambda_api.LambdaAPIError, lambda_api.LambdaReplyLost) as e:
+        display.error(
+            f"Couldn't look up filesystem '{escape(name)}': {escape(str(e))}\n"
+            f"Filesystem '{escape(name)}' was not deleted and may still be billing. "
+            f"Run 'cloudgpu down -C {config_name} --delete-filesystem' again to delete it."
+        )
+        sys.exit(1)
 
 
 def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bool:
@@ -1111,7 +1119,14 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
     # Find the instance: tracked id, or whatever is mounting the filesystem.
     instance_id = state.get("instance_id")
     already_terminating = False
-    if not instance_id:
+    already_gone = False
+    if instance_id:
+        # Read it first: terminating an id Lambda has lost fails, and would keep the stale id forever.
+        read = liveness.read_instance(instance_id)
+        if read.kind is liveness.Kind.UNKNOWN:
+            _stop_unchanged(read.detail)
+        already_gone = read.kind is liveness.Kind.GONE
+    else:
         mounting = liveness.find_mounting(filesystem)
         if mounting.kind is liveness.Kind.UNKNOWN:
             _stop_unchanged(mounting.detail)
@@ -1127,14 +1142,16 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
                 f"'{filesystem}' and all its data?",
                 abort=True,
             )
-        elif instance_id and not already_terminating:
+        elif instance_id and not already_terminating and not already_gone:
             click.confirm(
                 f"Terminate instance {instance_id} for config '{name}'? "
                 f"(filesystem '{filesystem}' is kept)",
                 abort=True,
             )
 
-    if already_terminating:
+    if already_gone:
+        display.info(f"Instance {instance_id} is already gone; clearing it from this config.")
+    elif already_terminating:
         display.info(f"Instance {instance_id} is already terminating.")
     elif instance_id:
         _api_call(lambda_api.terminate_instances, [instance_id])
@@ -1146,12 +1163,12 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
     if not delete_filesystem:
         return
 
-    fs = _find_filesystem(filesystem)
+    fs = _find_filesystem(config_name, filesystem)
     if not fs:
         display.info(f"Filesystem '{filesystem}' not found; nothing to delete.")
         return
     # The filesystem can't be deleted while an instance still mounts it.
-    if instance_id:
+    if instance_id and not already_gone:
         display.info("Waiting for the instance to terminate before deleting the filesystem...")
         if not _wait_terminated(instance_id):
             display.error(
