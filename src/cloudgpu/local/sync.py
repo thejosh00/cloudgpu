@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from cloudgpu.remote import instance
+
 
 def get_remote_dir() -> Path:
     """Get the path to the local remote/ scripts directory."""
@@ -19,9 +21,12 @@ def sync_remote(host: str, persistent_dir: str) -> None:
     local_dir = str(get_remote_dir()) + "/"
     remote_path = f"{persistent_dir}/cloudgpu/remote/"
 
-    # Ensure target directory exists
+    # Mark the host as a cloudgpu instance (the installers refuse to run without it; see
+    # cloudgpu.remote.instance), then ensure the target directory exists. Every command that
+    # runs the remote tool syncs first, so a fresh instance is marked before any installer.
     subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {remote_path}"],
+        ["ssh", "-o", "BatchMode=yes", host,
+         f"{instance.write_marker_command()} && mkdir -p {remote_path}"],
         check=True,
         timeout=15,
     )

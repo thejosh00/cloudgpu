@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import abc
+import functools
+
+from . import instance
 from .state import State
+
+# The methods that change the host; each is guarded in every subclass that defines it.
+GUARDED = ("install", "recover")
+
+
+def _guarded(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        instance.require_instance()  # before the first host-changing command
+        return method(self, *args, **kwargs)
+    return wrapper
 
 
 class AppInstaller(abc.ABC):
     """Abstract base class for app installers."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for name in GUARDED:
+            if name in cls.__dict__:
+                setattr(cls, name, _guarded(cls.__dict__[name]))
 
     def __init__(self, state: State):
         self.state = state

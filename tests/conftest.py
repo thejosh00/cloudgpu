@@ -35,3 +35,18 @@ def _short_launch_look_window(monkeypatch):
 
     monkeypatch.setattr(orchestration, "LAUNCH_LOOK_WINDOW_SECONDS", 0.05)
     monkeypatch.setattr(orchestration, "LAUNCH_LOOK_EVERY_SECONDS", 0.01)
+
+
+@pytest.fixture(autouse=True)
+def _instance_marker(tmp_path_factory, monkeypatch):
+    """Every test runs "on an instance" whose marker is a temp file, never the real path.
+
+    Tests that check the refusal point the guard at a missing temp path themselves.
+    """
+    try:
+        from cloudgpu.remote import instance
+    except ImportError:  # base code without the guard (red runs)
+        return
+    marker = tmp_path_factory.mktemp("instance") / "instance"
+    marker.write_text("")
+    monkeypatch.setattr(instance, "MARKER", str(marker))

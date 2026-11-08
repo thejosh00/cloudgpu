@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 
+from .instance import NotOnInstance
 from .state import State
 from .detect import detect_all
 from .recovery import setup_path
@@ -115,7 +116,11 @@ def main() -> None:
         "autoterminate": cmd_autoterminate,
     }
 
-    commands[args.command](state, args)
+    try:
+        commands[args.command](state, args)
+    except NotOnInstance as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

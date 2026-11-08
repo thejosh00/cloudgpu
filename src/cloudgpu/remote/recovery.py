@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+from . import instance
 from .state import State
 from .utils import log
 
@@ -46,6 +47,7 @@ def recover_all(state: State, app_installers: dict[str, type[AppInstaller]]) -> 
     Keeps going after an app fails, still sets up PATH, and returns the failures
     as {app name: error}. Empty means every app with an installer came back.
     """
+    instance.require_instance()  # before anything, setup_path included
     installed = state.list_apps()
 
     if not installed:
