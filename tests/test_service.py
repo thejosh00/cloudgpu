@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from cloudgpu.remote import service
+
+
+def _healthy_run(calls):
+    """A fake run that records commands; systemd reports the started unit staying up (0.6-fix)."""
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        stdout = "ActiveState=active\nSubState=running\nNRestarts=0\n" if cmd[:2] == ["systemctl", "show"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout)
+    return run
+
+
+@pytest.fixture(autouse=True)
+def _no_settle_wait(monkeypatch):
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: None)
 
 SPEC = {
     "name": "comfyui",
@@ -26,7 +44,7 @@ class TestUnitText:
 class TestInstallService:
     def test_writes_unit_and_enables(self, monkeypatch, tmp_path):
         calls = []
-        monkeypatch.setattr(service, "run", lambda cmd, **k: calls.append(cmd))
+        monkeypatch.setattr(service, "run", _healthy_run(calls))
         # write to a temp path we can inspect (avoid /tmp clutter is fine, but check cmds)
         service.install_service(SPEC)
 
@@ -158,7 +176,7 @@ class TestAppUserAndMigration:
 
     def test_install_creates_user_and_migrates_before_starting(self, monkeypatch, tmp_path):
         calls = []
-        monkeypatch.setattr(service, "run", lambda cmd, **k: calls.append(cmd))
+        monkeypatch.setattr(service, "run", _healthy_run(calls))
         monkeypatch.setattr(service.pwd, "getpwnam", lambda name: object())
         spec = {**SPEC, "workdir": str(tmp_path), "rw_paths": [str(tmp_path)]}
         service.install_service(spec)
@@ -168,7 +186,7 @@ class TestAppUserAndMigration:
 
     def test_install_restarts_so_old_unsandboxed_process_is_replaced(self, monkeypatch, tmp_path):
         calls = []
-        monkeypatch.setattr(service, "run", lambda cmd, **k: calls.append(cmd))
+        monkeypatch.setattr(service, "run", _healthy_run(calls))
         monkeypatch.setattr(service.pwd, "getpwnam", lambda name: object())
         service.install_service({**SPEC, "workdir": str(tmp_path)})
         enable = calls.index(["sudo", "systemctl", "enable", "--now", "comfyui"])

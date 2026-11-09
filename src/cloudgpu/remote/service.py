@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import time
 from typing import Any, Callable
 
 from .run_as_app import app_step
@@ -192,7 +193,60 @@ def install_service(spec: dict[str, Any]) -> None:
     # enable --now leaves an already-running process alone; restart so an instance
     # upgraded in place stops running the old (ubuntu, unsandboxed) process right away.
     run(["sudo", "systemctl", "restart", name])
+    confirm_running(name)
     log(f"Service '{name}' enabled and started (systemd, restarts on boot/crash).")
+
+
+# How long a started service must stay up before install believes it. systemd accepts a
+# Type=simple start before the process has run, and Restart=always / RestartSec=3 (unit_text)
+# then hides a process that exits at once behind restarts, so this covers more than one cycle.
+SETTLE_SECONDS = 10
+JOURNAL_LINES = 20
+
+
+def service_props(name: str) -> dict[str, str]:
+    """The service's ActiveState, SubState and NRestarts from ``systemctl show`` ({} if unreadable)."""
+    result = run(["systemctl", "show", "-p", "ActiveState,SubState,NRestarts", name],
+                 capture=True, check=False)
+    props: dict[str, str] = {}
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _restarts(props: dict[str, str]) -> int | None:
+    try:
+        return int(props["NRestarts"])
+    except (KeyError, ValueError):
+        return None
+
+
+def confirm_running(name: str, *, settle: float = SETTLE_SECONDS) -> None:
+    """Raise unless ``name`` is still up ``settle`` seconds after a start, without having restarted.
+
+    Up means ActiveState=active, SubState=running, and NRestarts no higher than just after the
+    start. The error names the service, says what systemd reports, and ends with the last lines
+    of its journal, so install, recover and up fail saying why.
+    """
+    before = service_props(name)
+    time.sleep(settle)
+    after = service_props(name)
+    active, sub = after.get("ActiveState", "unknown"), after.get("SubState", "unknown")
+    restarts_before, restarts_after = _restarts(before), _restarts(after)
+    restarted = (restarts_after is None or restarts_before is None
+                 or restarts_after > restarts_before)
+    if active == "active" and sub == "running" and not restarted:
+        return
+    restarts = "unknown" if restarts_after is None else str(restarts_after)
+    if restarts_before is not None and restarts_after is not None:
+        restarts = f"{restarts_after - restarts_before} in {settle:g}s"
+    journal = run(["sudo", "journalctl", "-u", name, "-n", str(JOURNAL_LINES), "--no-pager"],
+                  capture=True, check=False)
+    tail = (getattr(journal, "stdout", "") or "").strip() or "(no journal output)"
+    raise RuntimeError(f"Service '{name}' didn't stay up after starting: {active}/{sub}, "
+                       f"restarts: {restarts}. Last journal lines:\n{tail}")
 
 
 def restart_service(name: str) -> None:
