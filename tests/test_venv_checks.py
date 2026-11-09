@@ -192,7 +192,7 @@ class TestCheckTorchCuda:
         def too_slow(*args, **kwargs):
             raise subprocess.TimeoutExpired("python3", 600)
 
-        monkeypatch.setattr(utils.subprocess, "run", too_slow)
+        monkeypatch.setattr(utils, "run_stoppable", too_slow)
         with pytest.raises(RuntimeError):
             check_torch_cuda(str(venv))
 

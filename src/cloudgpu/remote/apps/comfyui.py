@@ -127,7 +127,7 @@ class ComfyUIInstaller(AppInstaller):
 
         if not os.path.isdir(self.venv_dir):
             log("Venv missing, recreating...", "warn")
-            self._rebuild_venv(wipe=False, timeout=120)
+            self._rebuild_venv(wipe=False, timeout=600)  # a new venv, as a fresh install
 
         # Verify PyTorch CUDA (system packages may differ on new instance)
         prepare_venv_checks(self.venv_dir)

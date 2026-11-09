@@ -31,10 +31,12 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Mapping
 
 APP_USER = "cloudgpu-app"
 COULD_NOT_RUN = 125
+_STOP_GRACE = 10  # seconds a step that timed out gets between SIGTERM and SIGKILL
 
 _END = "cloudgpu-env-end"
 _STARTED = "cloudgpu-step-started"
@@ -56,6 +58,116 @@ exit {COULD_NOT_RUN}
 
 class CouldNotRun(RuntimeError):
     """The step never started. The message must never contain a variable's value."""
+
+
+def _step_groups(sudo_pid: int) -> set[int]:
+    """The process groups of sudo and of everything under it, apart from the caller's own.
+
+    A step's children stay in its group even once their parent has gone, so a group still finds
+    them. sudo's own group is always there: sudo runs in one of its own (see run_stoppable), and run
+    without a pty it leaves the step in it. With a pty the step is in a group further down.
+    """
+    groups = {sudo_pid}
+    try:
+        table = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="],
+                               capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        table = ""
+    children: dict[int, list[int]] = {}
+    group_of: dict[int, int] = {}
+    for line in table.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and all(f.isdigit() for f in fields):
+            pid, ppid, pgid = map(int, fields)
+            children.setdefault(ppid, []).append(pid)
+            group_of[pid] = pgid
+    todo, seen = [sudo_pid], set()
+    while todo:
+        pid = todo.pop()
+        if pid not in seen:
+            seen.add(pid)
+            groups.add(group_of.get(pid, sudo_pid))
+            todo.extend(children.get(pid, ()))
+    return {g for g in groups if g > 1 and g != os.getpgrp()}
+
+
+def _groups_running(groups: set[int]) -> bool:
+    """Whether any process in ``groups`` is still running (a zombie has stopped)."""
+    try:
+        table = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
+                               capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in table.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and int(fields[0]) in groups \
+                and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def _stop_step(proc: subprocess.Popen) -> None:
+    """Stop everything the step started, its children included, before app_step gives up on it.
+
+    Signalling sudo isn't enough. Python started it in Python's own process group, and sudo
+    1.9.9 (Ubuntu 22.04) drops any signal from a process in its own group, so the SIGTERM never
+    reached the step; SIGKILL can't be relayed at all and stopped only sudo. Even relayed, a
+    signal reaches only the step's first process, never pip's children, and a step may ignore it.
+    So the step's process groups are signalled as APP_USER (the caller can't signal its
+    processes), SIGTERM first and SIGKILL after _STOP_GRACE.
+    """
+    groups = _step_groups(proc.pid)
+    kill = ["sudo", "-n", "-u", APP_USER, "--", "kill"]
+    sudo_env = {"PATH": os.environ.get("PATH", os.defpath)}
+
+    def signal_groups(name: str) -> None:
+        if not groups:
+            return
+        try:
+            subprocess.run([*kill, f"-{name}", "--", *(f"-{g}" for g in sorted(groups))],
+                           cwd="/", env=sudo_env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass  # sudo's own relaying and the SIGKILL to sudo below are all that's left
+
+    def wait_until_stopped(seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while True:
+            proc.poll()  # reap sudo, so it doesn't count as running
+            if not _groups_running(groups):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    proc.terminate()  # sudo relays it now that the signal comes from outside its group
+    signal_groups("TERM")
+    if not wait_until_stopped(_STOP_GRACE):
+        signal_groups("KILL")
+        proc.kill()
+        wait_until_stopped(5)
+    proc.wait()
+
+
+def run_stoppable(argv: list[str], *, input: str | None = None, timeout: float | None = None,
+                  env: Mapping[str, str] | None = None,
+                  capture: bool = False) -> subprocess.CompletedProcess:
+    """Run a ``sudo -u APP_USER`` command line from /, as subprocess.run (without ``check``),
+    except that a timeout or ^C first stops everything it started (see _stop_step)."""
+    pipes = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE} if capture else {}
+    with subprocess.Popen(
+        argv, cwd="/",  # the caller's cwd may be unreadable to APP_USER
+        env=env, stdin=subprocess.PIPE if input is not None else None, text=True, **pipes,
+        # Its own process group, so sudo relays our signals and the step's group isn't ours.
+        preexec_fn=os.setpgrp,
+    ) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            # Timed out, or interrupted: a terminal's ^C no longer reaches the step's group.
+            _stop_step(proc)
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _env_lines(names: Iterable[str], env: Mapping[str, str]) -> str:
@@ -88,14 +200,13 @@ def app_step(
     ``names`` are variables to copy from the caller, ``env`` is settings given here. Raises
     CouldNotRun if the step never started, so with ``capture`` a non-zero exit is always the
     step's own verdict and never a refused sudo. Otherwise as subprocess.run: CalledProcessError
-    under ``check``, and TimeoutExpired, by which time the step has been told to stop.
+    under ``check``, and TimeoutExpired, by which time the step and all it started have stopped.
     """
     stdin = _env_lines(names, env or {})
     sudo = ["sudo", "-n", "-H", "-u", APP_USER, "--"]
     # sudo gets only PATH, so the secrets don't depend on its env_reset to be stripped.
     sudo_env = {"PATH": os.environ.get("PATH", os.defpath)}
     started = _STARTED if capture else ""
-    pipes = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE} if capture else {}
     try:
         # A separate probe, so a refused sudo can't be read as the step's own failure.
         probe = subprocess.run(
@@ -108,21 +219,10 @@ def app_step(
                 "Installing or recovering an app creates that user, so check that this "
                 "profile's cloudgpu.toml lists the app in `apps`."
             )
-        with subprocess.Popen(
+        proc = run_stoppable(
             [*sudo, "/bin/sh", "-c", _BOOTSTRAP, "cloudgpu-run-as-app", cwd, started, *cmd],
-            cwd="/",  # the caller's cwd may be unreadable to APP_USER
-            env=sudo_env, stdin=subprocess.PIPE, text=True, **pipes,
-        ) as proc:
-            try:
-                out, err = proc.communicate(stdin, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # sudo passes SIGTERM on to the step. SIGKILL would stop only sudo.
-                proc.terminate()
-                try:
-                    proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise
+            input=stdin, timeout=timeout, env=sudo_env, capture=capture)
+        out, err = proc.stdout, proc.stderr
     except OSError as e:
         raise CouldNotRun(f"couldn't run as '{APP_USER}': {e}") from e
     if capture:

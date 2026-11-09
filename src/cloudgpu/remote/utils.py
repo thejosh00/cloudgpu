@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 # APP_USER: the unprivileged user that runs app services and app-venv code.
-from .run_as_app import APP_USER, CouldNotRun, app_step
+from .run_as_app import APP_USER, CouldNotRun, app_step, run_stoppable
 
 # Printed by every app-venv check before it does anything else, so a check that never got as
 # far as running (sudo refused, venv unreadable) can't be mistaken for one that failed.
@@ -124,13 +124,12 @@ def run_venv_check(venv_dir: str, code: str, timeout: int = 600) -> bool:
     except KeyError:
         raise VenvCheckUnavailable(f"user '{APP_USER}' doesn't exist yet") from None
     try:
-        result = run(
+        # From / (ubuntu's cwd may be unreadable to APP_USER, or hold planted modules), and on a
+        # timeout nothing the check started is left running as APP_USER.
+        result = run_stoppable(
             ["sudo", "-n", "-H", "-u", APP_USER, "--", python, "-c",
              f"print({_CHECK_STARTED!r}, flush=True)\n{code}"],
-            cwd="/",  # ubuntu's cwd may be unreadable to APP_USER, or hold planted modules
-            capture=True,
-            check=False,
-            timeout=timeout,
+            capture=True, timeout=timeout,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         raise VenvCheckUnavailable(f"couldn't run as '{APP_USER}': {e}") from e

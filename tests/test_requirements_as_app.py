@@ -279,7 +279,8 @@ class TestEveryInstallRunsAsApp:
         assert [c.kwargs["timeout"] for c in step.call_args_list] == [600, 120]
         assert all(not c.kwargs.get("capture") for c in step.call_args_list), "pip must stream"
 
-    @pytest.mark.parametrize("path,timeout", [("venv-missing", 120), ("rebuild", 600)])
+    # A missing venv is rebuilt from nothing, so it gets a fresh install's 600 s (0.7-fix).
+    @pytest.mark.parametrize("path,timeout", [("venv-missing", 600), ("rebuild", 600)])
     def test_comfyui_recover_timeouts_kept(self, box, tmp_path, stubs, path, timeout):
         """Bug: as above, on the recovery paths (the app's, then ComfyUI-Manager's as in install)."""
         _, call = go(box, tmp_path, stubs, COMFY, path)
