@@ -9,7 +9,6 @@ to show what cloudgpu-app "can't" read, the fake sudo hides the marker file whil
 
 from __future__ import annotations
 
-import grp
 import os
 import pwd
 import stat
@@ -24,6 +23,7 @@ from cloudgpu.remote.apps import aitoolkit
 from cloudgpu.remote.apps.aitoolkit import AIToolkitInstaller
 from cloudgpu.remote.apps.comfyui import ComfyUIInstaller
 from cloudgpu.remote.state import State
+from cloudgpu.remote.run_as_app import CouldNotRun
 from cloudgpu.remote.utils import pip_install
 
 APP_USER = "cloudgpu-app"
@@ -580,15 +580,17 @@ class TestWriteAccessComesFirst:
         assert box.index("sudo chgrp", installer.app_dir) < first
 
     @pytest.mark.parametrize("spec", [COMFY, TOOLKIT], ids=["comfyui", "ai-toolkit"])
-    def test_venv_shared_again_after_ubuntus_own_installs(self, box, tmp_path, stubs, spec):
-        """Bug: files from ubuntu's --no-deps install have no group write, so pip as app can't replace them."""
+    def test_venv_shared_before_any_pip_step(self, box, tmp_path, stubs, spec):
+        """Bug: pip as cloudgpu-app runs on a venv it can't write yet, and every install fails.
+
+        Was test_venv_shared_again_after_ubuntus_own_installs: since 0.1-fix no install is ubuntu's,
+        so the venv is shared once, before the first pip step, rather than again before each -r.
+        """
         installer = make(box, tmp_path, spec)
         stubs(spec)
         installer.install()
-        no_deps = box.index("pip ran as", "--no-deps")
-        first = box.first_install()
-        assert no_deps < first
-        assert any("sudo chgrp" in c and installer.venv_dir in c for c in box.calls()[no_deps:first])
+        first_pip = box.index("pip ran as")
+        assert box.index("sudo chgrp", installer.venv_dir) < first_pip
 
 
 class TestVenvWipe:
@@ -634,12 +636,11 @@ class TestVenvWipe:
         assert not any("sudo rm" in c for c in box.calls())
 
 
-class TestUbuntusOwnInstalls:
-    """They stay ubuntu's, because a planted file can't change what they name, but must still work."""
-
-    def no_group_yet(self, monkeypatch):
-        monkeypatch.setattr(grp, "getgrnam", lambda name: type("G", (), {"gr_gid": 54321})())
-        monkeypatch.setattr(os, "getgroups", lambda: [20])
+class TestNamedInstallsRunAsApp:
+    """Since 0.1-fix: the venv's pip loads cloudgpu-app's .pth files whatever it's asked to install,
+    so installs that name their packages run as cloudgpu-app too. These replace
+    TestUbuntusOwnInstalls, which held them to running as ubuntu (through utils._with_app_group,
+    now removed)."""
 
     def venv(self, box, tmp_path) -> Path:
         venv = tmp_path / "venv"
@@ -647,53 +648,39 @@ class TestUbuntusOwnInstalls:
         box.flag("user-exists")
         return venv
 
-    def test_new_session_when_this_process_lacks_the_group(self, box, tmp_path, monkeypatch):
-        """Bug: on a new instance ubuntu isn't in the group yet, so it can't replace cloudgpu-app's files."""
-        self.no_group_yet(monkeypatch)
+    def test_pip_install_runs_as_app(self, box, tmp_path):
+        """Bug: a named-package install runs the venv's pip as ubuntu."""
         pip_install(str(self.venv(box, tmp_path)), "--no-deps", "torchvision")
-        assert box.calls()[0].startswith(f"sudo -n -u {ME} -- ")
-        assert box.calls()[1].startswith(f"pip ran as {ME} ")
-        assert not any(f"-u {APP_USER}" in c for c in box.calls())
+        ran = [c for c in box.calls() if c.startswith("pip ran as")]
+        assert len(ran) == 1 and ran[0].startswith(f"pip ran as {APP_USER} "), box.calls()
+        assert ran[0].endswith("install --no-deps torchvision")
 
-    def test_directly_when_this_process_has_the_group(self, box, tmp_path, monkeypatch):
-        """Bug: a sudo session is added when nothing needs it, so every caller changes by accident."""
-        self.no_group_yet(monkeypatch)
-        monkeypatch.setattr(os, "getgroups", lambda: [20, 54321])
-        pip_install(str(self.venv(box, tmp_path)), "--no-deps", "torchvision")
-        assert [c.split(" in ")[0] for c in box.calls()] == ["pip ran as the caller, directly"]
-
-    def test_directly_when_the_group_is_this_process_primary(self, box, tmp_path, monkeypatch):
-        """Bug: as above, for a primary group, which getgroups may leave out."""
-        self.no_group_yet(monkeypatch)
-        monkeypatch.setattr(os, "getgid", lambda: 54321)
-        pip_install(str(self.venv(box, tmp_path)), "--no-deps", "torchvision")
-        assert [c.split(" in ")[0] for c in box.calls()] == ["pip ran as the caller, directly"]
-
-    def test_directly_when_there_is_no_group(self, box, tmp_path, monkeypatch):
-        """Bug: `status`-style callers on a new instance fail, or sudo for a group that isn't there."""
-        def no_group(name):
-            raise KeyError(name)
-        monkeypatch.setattr(grp, "getgrnam", no_group)
-        pip_install(str(self.venv(box, tmp_path)), "--upgrade", "pip")
-        assert [c.split(" in ")[0] for c in box.calls()] == ["pip ran as the caller, directly"]
-
-    def test_failure_through_the_session_still_fails(self, box, tmp_path, monkeypatch):
-        """Bug: going through sudo loses pip's non-zero exit, or a refused sudo reads as success."""
-        self.no_group_yet(monkeypatch)
+    def test_refused_sudo_fails_and_pip_never_runs(self, box, tmp_path):
+        """Bug: when it can't run as cloudgpu-app, pip is run as ubuntu instead."""
+        venv = self.venv(box, tmp_path)
         box.flag("sudo-refuses")
+        with pytest.raises(CouldNotRun):
+            pip_install(str(venv), "--upgrade", "pip")
+        assert not any(c.startswith("pip ran as") for c in box.calls()), box.calls()
+
+    def test_pip_failure_still_fails(self, box, tmp_path):
+        """Bug: going through sudo loses pip's non-zero exit."""
+        venv = self.venv(box, tmp_path)
+        (venv / "bin" / "pip").write_text("#!/bin/bash\nexit 3\n")
         with pytest.raises(subprocess.CalledProcessError):
-            pip_install(str(self.venv(box, tmp_path)), "--no-deps", "torchvision")
+            pip_install(str(venv), "--no-deps", "torchvision")
 
     @pytest.mark.parametrize("spec", [COMFY, TOOLKIT], ids=["comfyui", "ai-toolkit"])
-    def test_ubuntus_named_installs_stay_ubuntus(self, box, tmp_path, stubs, spec):
-        """Bug: installs the plan says stay ubuntu's are moved too, which phase 4 relies on not happening."""
+    def test_every_pip_step_of_install_runs_as_app(self, box, tmp_path, stubs, spec):
+        """Bug: the torchvision/torchaudio step (or any other pip step) of install runs as ubuntu."""
         installer = make(box, tmp_path, spec)
         stubs(spec)
         installer.install()
-        no_deps = [c for c in box.calls() if c.startswith("pip ran as") and "--no-deps" in c]
-        assert no_deps and all(c.startswith("pip ran as the caller, directly") for c in no_deps)
+        ran = [c for c in box.calls() if c.startswith("pip ran as")]
+        assert any("--no-deps" in c for c in ran), ran
+        assert all(c.startswith(f"pip ran as {APP_USER} ") for c in ran), "\n".join(ran)
 
-    def test_force_reinstall_of_torch_stays_ubuntus(self, box, tmp_path, stubs):
+    def test_force_reinstall_of_torch_runs_as_app(self, box, tmp_path, stubs):
         """Bug: as above, for the torch install, in the path where torch is broken."""
         installer = make(box, tmp_path, COMFY)
         answers = iter([False, True])
@@ -701,4 +688,4 @@ class TestUbuntusOwnInstalls:
         with patch("cloudgpu.remote.utils.torch_index_url", return_value="https://example.invalid/cu124"):
             installer.install()
         torch = [c for c in box.calls() if "--force-reinstall" in c and c.startswith("pip ran as")]
-        assert torch and torch[0].startswith("pip ran as the caller, directly")
+        assert torch and torch[0].startswith(f"pip ran as {APP_USER} ")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import grp
 import os
 import pwd
 import subprocess
@@ -64,27 +63,18 @@ def run(
 
 
 def pip_install(venv_dir: str, *args: str, timeout: int = 600) -> None:
-    """Run pip install in a venv, as the caller. Never for anything that reads app_dir: see
-    service.install_requirements_as_app."""
-    pip = os.path.join(venv_dir, "bin", "pip")
-    run(_with_app_group([pip, "install", *args]), timeout=timeout)
+    """Run pip install in a venv as APP_USER, never as the caller.
 
-
-def _with_app_group(cmd: list[str]) -> list[str]:
-    """``cmd`` as the caller, with APP_USER's group if this process doesn't have it yet.
-
-    The venv is mostly cloudgpu-app's files, shared through that group, and `usermod -aG` doesn't
-    reach a process that's already running. So on a new instance the caller couldn't replace them,
-    but a new sudo session as itself reads the group afresh. It's still the caller: this is for
-    steps that name what they install, and it makes nothing run as APP_USER.
+    The venv's pip is a script run by the venv's Python, which loads every .pth file in
+    site-packages before pip starts. APP_USER can write those, so whatever the packages named
+    here, running it as the caller would run APP_USER's files as a user with passwordless sudo.
+    Raises CouldNotRun if it can't run as APP_USER; there's no fallback to the caller. The venv
+    must already be shared with APP_USER (service.prepare_venv_checks). As the ``-r`` installs
+    (service.install_requirements_as_app): no caller environment, no tokens, PATH given.
     """
-    try:
-        gid = grp.getgrnam(APP_USER).gr_gid
-    except KeyError:
-        return cmd  # nothing can be shared through a group this instance doesn't have
-    if gid == os.getgid() or gid in os.getgroups():
-        return cmd
-    return ["sudo", "-n", "-u", pwd.getpwuid(os.getuid()).pw_name, "--", *cmd]
+    pip = os.path.join(venv_dir, "bin", "pip")
+    app_step([pip, "install", *args],
+             env={"PATH": os.environ.get("PATH", os.defpath)}, timeout=timeout)
 
 
 def requirements_present(path: str) -> bool:

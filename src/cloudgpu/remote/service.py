@@ -128,12 +128,12 @@ def install_requirements_as_app(venv_dir: str, requirements: str, *, timeout: in
     """``pip install -r`` as cloudgpu-app, because pip builds what a requirements file names.
 
     cloudgpu-app can write those files, and ubuntu has passwordless sudo. Raises if it can't run or
-    pip fails. The venv is shared again each time, because ubuntu's own installs since the last
-    time left files only ubuntu can replace. No token reaches pip: a requirements file that needs
+    pip fails. The venv must already be shared with cloudgpu-app: ensure_torch does that, and runs
+    before this in every install and rebuild. Nothing installs as ubuntu any more, so there are no
+    files of ubuntu's to share again here. No token reaches pip: a requirements file that needs
     one has to get it some other way. PATH is for sdist compiles, as sudo may reset it. pip's cache
     and temp files go to cloudgpu-app's own HOME and /tmp, and it streams its output.
     """
-    prepare_venv_checks(venv_dir)
     pip = os.path.join(venv_dir, "bin", "pip")
     app_step([pip, "install", "-r", requirements],
              env={"PATH": os.environ.get("PATH", os.defpath)}, timeout=timeout)
@@ -148,7 +148,8 @@ def ensure_torch(venv_dir: str, *, prepare: Callable[[str], None], check: Callab
     cloudgpu-app), install CUDA torch if that fails, check again and raise if it still fails.
 
     The installer passes its own prepare_venv_checks, check_torch_cuda, pip_install_torch and
-    pip_install, so each step is the one it imports (and that its tests stub, in-process).
+    pip_install, so each step is the one it imports (and that its tests stub, in-process). Both
+    installs run pip as cloudgpu-app (utils.pip_install), which ``prepare`` makes possible.
     """
     log("Checking PyTorch CUDA availability...")
     prepare(venv_dir)
@@ -170,7 +171,8 @@ def wipe_venv(venv_dir: str) -> None:
     """Remove a venv so it can be rebuilt, or raise.
 
     It's root's rm because neither user can be relied on: cloudgpu-app can't write the venvs
-    directory, and ubuntu may not have the group yet on a new instance (see utils._with_app_group).
+    directory, and ubuntu may not have the group yet on a new instance (`usermod -aG` doesn't
+    reach a process that's already running).
     rm runs nothing from the venv, and doesn't follow symlinks in it.
     """
     run(["sudo", "rm", "-rf", venv_dir], timeout=1800)

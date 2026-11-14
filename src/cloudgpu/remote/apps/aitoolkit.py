@@ -9,7 +9,7 @@ import sys
 import time
 
 from ..installer import AppInstaller
-from ..run_as_app import app_step
+from ..run_as_app import CouldNotRun, app_step
 from ..service import (app_status, ensure_torch, install_requirements_as_app, install_service,
                        prepare_app_dir, prepare_venv_checks, service_active, wipe_venv)
 from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
@@ -298,6 +298,9 @@ class AIToolkitInstaller(AppInstaller):
         """
         os.makedirs(self.state.venvs_dir, exist_ok=True)
         run(["python3", "-m", "venv", self.venv_dir])
+        # The upgrade runs the venv's pip, so it runs as cloudgpu-app (utils.pip_install), and
+        # the venv ubuntu just made has to be shared with it first.
+        prepare_venv_checks(self.venv_dir)
         pip_install(self.venv_dir, "--upgrade", "pip", timeout=300)
 
     def _ensure_torch(self) -> None:
@@ -346,7 +349,8 @@ class AIToolkitInstaller(AppInstaller):
         tag, and the newest torchcodec on an index pairs with the newest torch
         on that same index — which is exactly what pip_install_torch() puts in
         the venv. Only video/audio datasets use it (via torchaudio), so a
-        failure here warns instead of aborting the install.
+        failure here warns instead of aborting the install. The exception is a
+        pip that couldn't run as cloudgpu-app at all (CouldNotRun), which raises.
         """
         index_url = torch_index_url()
         args = ["--no-deps", "torchcodec"]  # its only deps are test extras
@@ -355,6 +359,10 @@ class AIToolkitInstaller(AppInstaller):
         log("Installing torchcodec (video/audio dataset support)...")
         try:
             pip_install(self.venv_dir, *args, timeout=600)
+        except CouldNotRun:
+            # Not torchcodec's failure: nothing can run as cloudgpu-app, so the install can't
+            # be trusted to go on, and pip must not be tried any other way.
+            raise
         except Exception as e:
             log(f"torchcodec install failed ({e}); video and audio datasets "
                 f"will not work, image training is unaffected", "warn")

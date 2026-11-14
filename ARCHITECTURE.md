@@ -93,6 +93,7 @@ only for autoterminate, as content, into a root-only 600 file under /etc/cloudgp
 | I14 | A crash while saving the local state file can't lose the tracked id | **unenforced:** `save_state` writes in place; partly covered by `up` looking on the filesystem first |
 | I15 | No test reaches the real Lambda API | **unenforced:** tests monkeypatch or use the fake; nothing fails a test that would go to cloud.lambda.ai |
 | I16 | secrets.env is mode 600 | **unenforced:** asked for in the README; the code never checks or sets it locally |
+| I17 | During install and a venv rebuild, no program in an app venv (`bin/pip`, `bin/python3`) runs as `ubuntu`, and a pip step that can't run as `cloudgpu-app` fails the install | `tests/test_pip_as_app_0_1_fix.py`: "test_no_venv_program_runs_as_the_caller", "test_install_fails_when_a_pip_step_cannot_run_as_app" |
 
 ## Decisions
 

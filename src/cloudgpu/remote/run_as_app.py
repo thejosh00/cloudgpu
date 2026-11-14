@@ -16,7 +16,7 @@ Named variables travel on stdin to a small shell that sets them and then execs t
 three reasons: sudo strips the environment, argv would show the values in the process list, and
 --preserve-env depends on the instance's sudoers. If they don't arrive, the end marker doesn't
 either, and the step doesn't run. The same shell sets the umask, because sudo applies its own
-(022 by default), and without group write `pip_install` as ubuntu breaks on the next `up`. It also
+(022 by default), and the app's files must stay writable through the cloudgpu-app group. It also
 does the `cd`, so the caller doesn't need to be able to enter a directory cloudgpu-app owns.
 
 The installers call `app_step` directly, for what their steps need beyond that: a working
