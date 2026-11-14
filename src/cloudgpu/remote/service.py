@@ -225,30 +225,58 @@ def _restarts(props: dict[str, str]) -> int | None:
         return None
 
 
-def confirm_running(name: str, *, settle: float = SETTLE_SECONDS) -> None:
-    """Raise unless ``name`` is still up ``settle`` seconds after a start, without having restarted.
+def _running(before: dict[str, str], after: dict[str, str], settle: float) -> tuple[bool, str, str, str]:
+    """Whether a service read before and after a settle stayed up, and what systemd reports.
 
-    Up means ActiveState=active, SubState=running, and NRestarts no higher than just after the
-    start. The error names the service, says what systemd reports, and ends with the last lines
-    of its journal, so install, recover and up fail saying why.
+    Up means ActiveState=active, SubState=running, and NRestarts no higher than before the
+    settle. Returns (up, ActiveState, SubState, restarts in words); unreadable is not up.
     """
-    before = service_props(name)
-    time.sleep(settle)
-    after = service_props(name)
     active, sub = after.get("ActiveState", "unknown"), after.get("SubState", "unknown")
     restarts_before, restarts_after = _restarts(before), _restarts(after)
     restarted = (restarts_after is None or restarts_before is None
                  or restarts_after > restarts_before)
-    if active == "active" and sub == "running" and not restarted:
-        return
     restarts = "unknown" if restarts_after is None else str(restarts_after)
     if restarts_before is not None and restarts_after is not None:
         restarts = f"{restarts_after - restarts_before} in {settle:g}s"
+    return active == "active" and sub == "running" and not restarted, active, sub, restarts
+
+
+def _journal_tail(name: str) -> str:
     journal = run(["sudo", "journalctl", "-u", name, "-n", str(JOURNAL_LINES), "--no-pager"],
                   capture=True, check=False)
-    tail = (getattr(journal, "stdout", "") or "").strip() or "(no journal output)"
+    return (getattr(journal, "stdout", "") or "").strip() or "(no journal output)"
+
+
+def confirm_running(name: str, *, settle: float = SETTLE_SECONDS) -> None:
+    """Raise unless ``name`` is still up ``settle`` seconds after a start, without having restarted.
+
+    The error names the service, says what systemd reports, and ends with the last lines
+    of its journal, so install and recover fail saying why.
+    """
+    before = service_props(name)
+    time.sleep(settle)
+    up, active, sub, restarts = _running(before, service_props(name), settle)
+    if up:
+        return
     raise RuntimeError(f"Service '{name}' didn't stay up after starting: {active}/{sub}, "
-                       f"restarts: {restarts}. Last journal lines:\n{tail}")
+                       f"restarts: {restarts}. Last journal lines:\n{_journal_tail(name)}")
+
+
+def verify_services(names: list[str], *, settle: float = SETTLE_SECONDS) -> list[dict[str, Any]]:
+    """What systemd says of each service, by confirm_running's test, after one settle for all.
+
+    Read-only (`up`'s verify step): starts and restarts nothing. Each entry is {"name", "ok",
+    "active", "sub", "restarts", "journal"}; the journal's last lines only for one that isn't ok.
+    ``settle`` 0 is a single look, for services recovery confirmed a moment ago.
+    """
+    before = {name: service_props(name) for name in names}
+    time.sleep(settle)
+    report = []
+    for name in names:
+        up, active, sub, restarts = _running(before[name], service_props(name), settle)
+        report.append({"name": name, "ok": up, "active": active, "sub": sub, "restarts": restarts,
+                       "journal": "" if up else _journal_tail(name)})
+    return report
 
 
 def restart_service(name: str) -> None:

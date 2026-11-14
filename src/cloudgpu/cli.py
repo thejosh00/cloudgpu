@@ -748,6 +748,57 @@ def _restart_services(host: str, app_list: list[str]) -> None:
         display.warn(f"Could not restart services (exit {result.returncode}); they may still be starting.")
 
 
+def _verify_services(config_name: str, runtime: dict, persistent_dir: str, services: list[str],
+                     *, settled: bool) -> None:
+    """Stop `up` unless every expected service is running, as systemd on the instance reports it.
+
+    The remote `verify` reads systemd (it never goes by the restart's exit code) with the test
+    install and recover use: active, running, and not restarted across a settle. ``settled``:
+    recovery confirmed these same services a moment ago and `up` hasn't restarted them since, so
+    one look is enough; after `up`'s own restart (even a failed one) they get the full settle.
+    A check that can't be made is a failure. Changes nothing: not the state file, not the instance.
+    """
+    if not services:
+        display.info("No service apps on this machine, so nothing to verify.")
+        return
+    names = ", ".join(services)
+    display.info(f"Checking that {names} {'is' if len(services) == 1 else 'are'} running...")
+    args = [f"--service {s}" for s in services] + (["--settle 0"] if settled else [])
+    try:
+        result = ssh.ssh_run(runtime["host"], _remote_cmd(persistent_dir, "verify", args), timeout=300)
+        if not result.ok:
+            raise ValueError(f"the check exited {result.returncode}: {result.stderr.strip()[-500:]}")
+        reported = {s["name"]: s for s in json.loads(result.stdout)["services"]}
+    except (ValueError, KeyError, TypeError, OSError, ssh.subprocess.SubprocessError) as e:
+        display.error(f"Couldn't check whether {names} {'is' if len(services) == 1 else 'are'} "
+                      f"running, and unknown is not running: {escape(str(e) or type(e).__name__)}")
+        _stop_not_verified(config_name, runtime)
+    unknown = {"ok": False, "active": "unknown", "sub": "unknown", "restarts": "unknown",
+               "journal": "(the check didn't report this service)"}
+    failed = [s for s in services if reported.get(s, unknown).get("ok") is not True]
+    if not failed:
+        display.info(f"  running: {names}")
+        return
+    for s in failed:
+        r = {**unknown, **reported.get(s, {})}
+        display.error(
+            f"Service '{s}' is not running: {escape(str(r['active']))}/{escape(str(r['sub']))}, "
+            f"restarts: {escape(str(r['restarts']))}. Last journal lines:\n{escape(str(r['journal']))}"
+        )
+    display.error(f"Config '{escape(config_name)}' is not up: {len(failed)} of {len(services)} "
+                  f"expected service(s) not running ({', '.join(failed)}).")
+    _stop_not_verified(config_name, runtime)
+
+
+def _stop_not_verified(config_name: str, runtime: dict) -> NoReturn:
+    """Verify failed: nothing is forgotten or terminated, so say what is still billing."""
+    display.error(
+        f"Instance {runtime.get('instance_id') or '?'} is still running and billing. "
+        f"'cloudgpu down -C {config_name}' stops it; 'cloudgpu up -C {config_name}' tries again."
+    )
+    sys.exit(1)
+
+
 def _report_up(config_name: str, runtime: dict, persistent_dir: str, app_list: list[str]) -> None:
     """Print final status + how to reach the machine + billing reminder."""
     output = _remote_run(runtime["host"], persistent_dir, "status")
@@ -933,7 +984,7 @@ def _wait_for_booting(config_name: str, cfg: dict, inst: dict) -> dict:
 
 # The steps every `up` runs, in this order, whichever way it found its machine (plans/v2.md,
 # Phase 2). Each is safe to run again, so an `up` stopped anywhere is finished by running it
-# again. "verify" (item 2.3) has its place in _up_locked between the last two and no step yet.
+# again.
 UP_STEPS = (
     "find or launch the instance",
     "set up the instance",
@@ -941,6 +992,7 @@ UP_STEPS = (
     "make apps match",
     "provision",
     "restart services",
+    "verify",
     "report",
 )
 
@@ -1011,7 +1063,10 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
         )
     _clear_reprovision(host, persistent_dir, marked)
 
-    # --- verify (plan item 2.3) goes here: nothing yet. ---
+    # Success is what systemd says now, not what the restart's exit code said. Only an `up`
+    # that restarted nothing skips the settle wait: recovery's own confirm just waited it.
+    _step("verify")
+    _verify_services(config_name, state, persistent_dir, services, settled=not to_provision)
 
     _step("report")
     _report_up(config_name, state, persistent_dir, _apps_for_config(config_name))

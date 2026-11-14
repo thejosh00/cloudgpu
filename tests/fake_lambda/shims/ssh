@@ -43,6 +43,11 @@ elif "python3 -m remote" in command and command.endswith(" status"):
     if recovered and os.environ.get("FAKE_SHIM_APPS_AFTER_RECOVER"):
         apps = os.environ["FAKE_SHIM_APPS_AFTER_RECOVER"]
     print(json.dumps({"detection": detection, "apps": json.loads(apps)}))
+elif "python3 -m remote" in command and " verify " in command:
+    # FAKE_SHIM_VERIFY: what the remote `verify` prints (default: every asked service running).
+    asked = [part.split()[0] for part in command.split("--service ")[1:]]
+    running = {"ok": True, "active": "active", "sub": "running", "restarts": "0", "journal": ""}
+    print(os.environ.get("FAKE_SHIM_VERIFY") or json.dumps({"services": [{"name": n, **running} for n in asked]}))
 elif "python3 -m remote" in command and command.endswith(" recover"):
     sys.exit(int(os.environ.get("FAKE_SHIM_RECOVER_EXIT") or 0))
 elif "provision.py" in command or "provision.sh" in command:

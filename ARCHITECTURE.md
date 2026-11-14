@@ -96,6 +96,7 @@ only for autoterminate, as content, into a root-only 600 file under /etc/cloudgp
 | I17 | During install and a venv rebuild, no program in an app venv (`bin/pip`, `bin/python3`) runs as `ubuntu`, and a pip step that can't run as `cloudgpu-app` fails the install | `tests/test_pip_as_app_0_1_fix.py`: "test_no_venv_program_runs_as_the_caller", "test_install_fails_when_a_pip_step_cannot_run_as_app" |
 | I18 | A config's listed profile that can't be loaded stops `up` before the lock, any Lambda call or any state write | `tests/test_config_profiles_2_1.py`: "test_a_missing_config_profile_stops_up_before_anything_happens" |
 | I19 | A local state file that can't be used stops every command that reads it, before any Lambda call, with the file unchanged | `tests/test_state_file_2_2.py`: "test_a_corrupt_state_file_stops_the_command" |
+| I20 | `up` reports success and exits 0 only if every service app on the machine (recorded apps plus this `up`'s) is running as systemd on the instance reports it, after a settle when `up` restarted them; a check that can't be made is a failure, and a failed verify changes nothing | `tests/test_up_verify_2_3.py`: "test_up_fails_when_a_service_is_not_running_after_the_restart", "test_up_fails_in_a_sentence_when_the_check_cannot_be_made" |
 
 ## Decisions
 

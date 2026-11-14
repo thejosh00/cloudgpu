@@ -54,6 +54,13 @@ def cmd_clear_reprovision(state: State, args: argparse.Namespace) -> None:
     state.clear_reprovision(args.app)
 
 
+def cmd_verify(state: State, args: argparse.Namespace) -> None:
+    """Report whether each named service is running (read-only; the caller decides)."""
+    from . import service
+    settle = service.SETTLE_SECONDS if args.settle is None else args.settle
+    print(json.dumps({"services": service.verify_services(args.service, settle=settle)}, indent=2))
+
+
 def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:
     """Arm (hours > 0) or disarm (hours <= 0) the instance lifetime cap."""
     from . import autoterminate
@@ -98,6 +105,11 @@ def main() -> None:
                                          help="Drop an app's re-provision mark (after provisioning)")
     clear_parser.add_argument("--app", required=True)
 
+    verify_parser = subparsers.add_parser("verify", help="Report whether services are running")
+    verify_parser.add_argument("--service", action="append", required=True)
+    verify_parser.add_argument("--settle", type=float, default=None,
+                               help="Seconds each must stay up (default: the install settle); 0 looks once")
+
     at_parser = subparsers.add_parser("autoterminate", help="Arm/disarm the instance lifetime cap")
     at_parser.add_argument("--hours", type=float, required=True, help="Cap in hours; <= 0 disarms")
     at_parser.add_argument("--instance-id", default=None, help="This instance's Lambda id")
@@ -113,6 +125,7 @@ def main() -> None:
         "recover": cmd_recover,
         "status": cmd_status,
         "clear-reprovision": cmd_clear_reprovision,
+        "verify": cmd_verify,
         "autoterminate": cmd_autoterminate,
     }
 

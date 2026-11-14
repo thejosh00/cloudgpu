@@ -20,6 +20,7 @@ PLAN_ORDER = [
     "make apps match",
     "provision",
     "restart services",
+    "verify",
     "report",
 ]
 COMFY = {"comfyui": {"status": "installed", "version": "1", "app_dir": "/lambda/nfs/box-fs/apps/comfyui"}}
@@ -112,9 +113,9 @@ def test_each_step_is_announced_before_its_work(tmp_path):
     with FakeLambda() as fake:
         result = _up(fake, tmp_path, "fresh", config_extra=GEN, shim_env=RECORDED_ENV)
     out = result.output
-    marks = ["Step 1/7", "Launched", "Step 2/7", "Remote tool synced", "Step 3/7", "Step 4/7",
-             "Recovering existing apps", "Installing ai-toolkit", "Step 5/7", "Provisioning 'gen'",
-             "Step 6/7", "Restarting service(s)", "Step 7/7", "is up"]
+    marks = ["Step 1/8", "Launched", "Step 2/8", "Remote tool synced", "Step 3/8", "Step 4/8",
+             "Recovering existing apps", "Installing ai-toolkit", "Step 5/8", "Provisioning 'gen'",
+             "Step 6/8", "Restarting service(s)", "Step 7/8", "Step 8/8", "is up"]
     at = [out.find(m) for m in marks]
     assert -1 not in at and at == sorted(at), (list(zip(marks, at)), out)
 
