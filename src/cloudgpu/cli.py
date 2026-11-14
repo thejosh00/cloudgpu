@@ -49,6 +49,16 @@ def _remote_run(host: str, persistent_dir: str, command: str, extra_args: list[s
     return result.stdout
 
 
+def _load_state(config_name: str) -> dict:
+    """The config's state, or stop: a state file that can't be used is reported, never read as
+    "no instance" (which would let `up` launch a second machine and `down` find nothing)."""
+    try:
+        return configs.load_state(config_name)
+    except configs.StateFileError as e:
+        display.error(escape(str(e)))
+        sys.exit(1)
+
+
 def _resolve_target(host: str | None = None, config_name: str | None = None) -> tuple[str, str]:
     """Resolve the (host, persistent_dir) to operate on.
 
@@ -62,7 +72,7 @@ def _resolve_target(host: str | None = None, config_name: str | None = None) -> 
             configs.find_config(config_name)  # validate it exists
         except config.ConfigError as e:
             raise click.UsageError(str(e)) from e
-        state = configs.load_state(config_name)
+        state = _load_state(config_name)
         if state.get("host") and state.get("persistent_dir"):
             return state["host"], state["persistent_dir"]
         if state.get("instance_id") and not state.get("host"):
@@ -352,7 +362,7 @@ def _provisioned_profiles(config_name: str | None) -> list[dict]:
     """The profiles provisioned onto this config's instance (unloadable ones skipped)."""
     if not config_name:
         return []
-    state = configs.load_state(config_name)
+    state = _load_state(config_name)
     loaded: list[dict] = []
     for pname in state.get("provisioned_profiles", []):
         try:
@@ -914,7 +924,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
 
     # Reuse a live instance if we already track one for this config. The state file stays as it
     # is until something replaces it: every way of stopping below keeps it, and what it records.
-    state = configs.load_state(config_name)
+    state = _load_state(config_name)
     tracked = state.get("instance_id")
     read = liveness.read_instance(tracked) if tracked else None
     if read and read.kind is liveness.Kind.UNKNOWN:
@@ -1041,7 +1051,7 @@ def provision(config_name: str, profile_csv: str) -> None:
     if not profile_list:
         raise click.UsageError("Pass at least one profile with --profile.")
 
-    state = configs.load_state(config_name)
+    state = _load_state(config_name)
     host, persistent_dir = state.get("host"), state.get("persistent_dir")
     if not host or not persistent_dir:
         raise click.UsageError(
@@ -1087,7 +1097,7 @@ def autoterminate(hours: float | None, off: bool, config_name: str) -> None:
         cfg = configs.load_config(config_name)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
-    state = configs.load_state(config_name)
+    state = _load_state(config_name)
     if not state.get("host") or not state.get("persistent_dir"):
         raise click.UsageError(f"No tracked instance for config '{config_name}'; run 'cloudgpu up' first.")
 
@@ -1170,7 +1180,7 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
 
     name = cfg["name"]
     filesystem = cfg["filesystem"]
-    state = configs.load_state(config_name)
+    state = _load_state(config_name)
 
     # Find the instance: tracked id, or whatever is mounting the filesystem.
     instance_id = state.get("instance_id")

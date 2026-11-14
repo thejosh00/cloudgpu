@@ -54,9 +54,9 @@ flowchart LR
 | Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | no (v2 phase 3 plans a bucket sync) |
 | Instance marker, autoterminate config with key | /var/lib/cloudgpu/instance, /etc/cloudgpu/ (instance disk) | no | no |
 
-There are no migrations. The local state file is written in place (not atomically) and an
-unreadable one loads as empty; `up` then still looks for an instance on the filesystem before
-launching. The README's layout shows .cloudgpu/ on the filesystem; the code uses cloudgpu/.
+There are no migrations. The local state file is written atomically (a temporary file beside
+it, synced, then renamed over it). One that exists but can't be read, or isn't a JSON object, is
+never read as "no instance": every command that reads it stops and names the file. The README's layout shows .cloudgpu/ on the filesystem; the code uses cloudgpu/.
 
 ## Trust boundaries
 
@@ -90,11 +90,12 @@ only for autoterminate, as content, into a root-only 600 file under /etc/cloudgp
 | I11 | The API override accepts loopback only, refused before any request | `tests/test_lambda_api_override.py`: "test_non_loopback_override_is_refused_before_any_request" |
 | I12 | A failed capacity sample records nothing | `tests/test_capacity.py`: "test_api_error_exits_nonzero_and_leaves_the_file_unchanged" |
 | I13 | Remote code is stdlib-only | **unenforced:** module docstrings say so; no import check (candidate) |
-| I14 | A crash while saving the local state file can't lose the tracked id | **unenforced:** `save_state` writes in place; partly covered by `up` looking on the filesystem first |
+| I14 | A failed or interrupted save of the local state file leaves the previous file as it was, and no temporary file | `tests/test_state_file_2_2.py`: "TestSaveState::test_a_write_that_fails_partway_keeps_the_old_file", "TestSaveState::test_a_failed_replace_keeps_the_old_file" |
 | I15 | No test reaches the real Lambda API | **unenforced:** tests monkeypatch or use the fake; nothing fails a test that would go to cloud.lambda.ai |
 | I16 | secrets.env is mode 600 | **unenforced:** asked for in the README; the code never checks or sets it locally |
 | I17 | During install and a venv rebuild, no program in an app venv (`bin/pip`, `bin/python3`) runs as `ubuntu`, and a pip step that can't run as `cloudgpu-app` fails the install | `tests/test_pip_as_app_0_1_fix.py`: "test_no_venv_program_runs_as_the_caller", "test_install_fails_when_a_pip_step_cannot_run_as_app" |
 | I18 | A config's listed profile that can't be loaded stops `up` before the lock, any Lambda call or any state write | `tests/test_config_profiles_2_1.py`: "test_a_missing_config_profile_stops_up_before_anything_happens" |
+| I19 | A local state file that can't be used stops every command that reads it, before any Lambda call, with the file unchanged | `tests/test_state_file_2_2.py`: "test_a_corrupt_state_file_stops_the_command" |
 
 ## Decisions
 

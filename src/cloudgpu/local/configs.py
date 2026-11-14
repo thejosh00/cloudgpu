@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -180,19 +181,66 @@ def hold_up_lock(config_path_or_name: str | Path):
     return handle
 
 
+class StateFileError(config.ConfigError):
+    """The config's state file exists but can't be used: unreadable, not JSON, or not a JSON object.
+
+    The message names the file and says what to do. Nothing has been changed when it is raised.
+    """
+
+    def __init__(self, path: Path, config_name: str, why: str):
+        super().__init__(
+            f"The state file {path} can't be used ({why}), so cloudgpu can't tell which instance "
+            f"config '{config_name}' tracks. Stopped without changing anything. Look at the file "
+            "and repair it if you can (it is JSON). Or move it aside and run "
+            f"'cloudgpu up -C {config_name}', which adopts the instance mounting the config's "
+            "filesystem (or launches one if there is none); the list of provisioned profiles is "
+            "then gone unless the config lists them (profiles = [...])."
+        )
+        self.path = path
+
+
 def load_state(config_path_or_name: str | Path) -> dict[str, Any]:
-    """Return the config's runtime state, or {} if no instance is tracked."""
+    """Return the config's runtime state, or {} if there is no state file.
+
+    Raises:
+        StateFileError: If the file exists but can't be read, isn't JSON, or isn't a JSON object.
+    """
     path = state_path(config_path_or_name)
-    if not path.exists():
-        return {}
     try:
-        return json.loads(path.read_text())
-    except (ValueError, OSError):
+        text = path.read_text()
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:  # ValueError: bytes that aren't text
+        raise StateFileError(path, str(config_path_or_name), f"couldn't read it: {e}") from e
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        why = "it is empty" if not text.strip() else f"it isn't valid JSON: {e}"
+        raise StateFileError(path, str(config_path_or_name), why) from e
+    if not isinstance(data, dict):
+        raise StateFileError(
+            path, str(config_path_or_name), f"it holds a JSON {type(data).__name__}, not an object")
+    return data
 
 
 def save_state(config_path_or_name: str | Path, data: dict[str, Any]) -> None:
-    state_path(config_path_or_name).write_text(json.dumps(data, indent=2) + "\n")
+    """Write the state file atomically: a temporary file beside it, synced, then renamed over it.
+
+    A failure leaves the previous file as it was and no temporary file. The temporary name ends
+    in STATE_SUFFIX so that the same ignore rules cover one left by a kill.
+    """
+    path = state_path(config_path_or_name)
+    text = json.dumps(data, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=f".tmp{STATE_SUFFIX}")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def clear_state(config_path_or_name: str | Path) -> None:
