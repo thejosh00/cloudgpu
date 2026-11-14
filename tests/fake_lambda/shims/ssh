@@ -11,6 +11,21 @@ host, command = args[0], " ".join(args[1:])
 with open(os.environ["FAKE_SHIM_LOG"], "a") as log:
     log.write(json.dumps({"tool": "ssh", "host": host, "command": command}) + "\n")
 
+# FAKE_SHIM_FAIL_ON: a call whose command contains this stops there. With FAKE_SHIM_FAIL_AFTER,
+# only once an earlier call this run contained that. FAKE_SHIM_FAIL_MODE: "exit" (default) exits
+# 1; "stall" touches <log>.stalled and hangs, for the test to send the Ctrl-C into.
+fail_on = os.environ.get("FAKE_SHIM_FAIL_ON")
+if fail_on and fail_on in command:
+    after = os.environ.get("FAKE_SHIM_FAIL_AFTER")
+    with open(os.environ["FAKE_SHIM_LOG"]) as log:
+        earlier = [json.loads(line).get("command", "") for line in log][:-1]
+    if not after or any(after in c for c in earlier):
+        if os.environ.get("FAKE_SHIM_FAIL_MODE") == "stall":
+            import time
+            open(os.environ["FAKE_SHIM_LOG"] + ".stalled", "w").close()
+            time.sleep(60)
+        sys.exit(1)
+
 filesystem = os.environ["FAKE_SHIM_FILESYSTEM"]
 detection = {"persistent_dir": f"/lambda/nfs/{filesystem}", "gpu": {"available": False}}
 if command == "echo ok":

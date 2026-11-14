@@ -604,8 +604,14 @@ def _ensure_apps(host: str, persistent_dir: str, app_list: list[str], known: dic
         return
     if known is None:
         known = _recover_recorded(host, persistent_dir)
+    _install_missing(host, persistent_dir, app_list, known)
 
-    # Install any profile app not yet present in state.json.
+
+def _install_missing(host: str, persistent_dir: str, app_list: list[str], known: dict) -> None:
+    """Install each app in ``app_list`` that the filesystem (``known``) doesn't record yet.
+
+    Safe to run again: an app whose install finished is recorded, so it isn't installed twice.
+    """
     for app in [a for a in app_list if a not in known]:
         if app not in AVAILABLE_APPS:
             display.warn(f"Unknown app '{app}' in profile; skipping. Known: {', '.join(AVAILABLE_APPS)}")
@@ -824,6 +830,16 @@ def _each_once(profile_list: list[dict]) -> list[dict]:
     return once
 
 
+def _app_union(profile_list: list[dict]) -> list[str]:
+    """Every app the profiles name, each once, in the order first named."""
+    app_union: list[str] = []
+    for prof in profile_list:
+        for a in prof.get("apps", []):
+            if a not in app_union:
+                app_union.append(a)
+    return app_union
+
+
 def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir: str,
                         profile_list: list[dict], known: dict | None = None) -> list[str]:
     """Ensure apps + run provisioning for each profile, record them in state.
@@ -833,11 +849,7 @@ def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir
     provisioned into its own remote dir. Profile names are merged into
     state['provisioned_profiles']. ``known``: the apps already recovered this run, if any.
     """
-    app_union: list[str] = []
-    for prof in profile_list:
-        for a in prof.get("apps", []):
-            if a not in app_union:
-                app_union.append(a)
+    app_union = _app_union(profile_list)
 
     _ensure_apps(host, persistent_dir, app_union, known)
     for prof in profile_list:
@@ -919,12 +931,101 @@ def _wait_for_booting(config_name: str, cfg: dict, inst: dict) -> dict:
     )
 
 
+# The steps every `up` runs, in this order, whichever way it found its machine (plans/v2.md,
+# Phase 2). Each is safe to run again, so an `up` stopped anywhere is finished by running it
+# again. "verify" (item 2.3) has its place in _up_locked between the last two and no step yet.
+UP_STEPS = (
+    "find or launch the instance",
+    "set up the instance",
+    "arm the cap",
+    "make apps match",
+    "provision",
+    "restart services",
+    "report",
+)
+
+
+def _step(name: str) -> None:
+    """Say which of UP_STEPS starts now."""
+    display.info(f"[bold]Step {UP_STEPS.index(name) + 1}/{len(UP_STEPS)}: {name}[/bold]")
+
+
 def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     filesystem = cfg["filesystem"]
-
-    # Reuse a live instance if we already track one for this config. The state file stays as it
-    # is until something replaces it: every way of stopping below keeps it, and what it records.
+    # Read before anything else: a state file that can't be used stops `up` here.
     state = _load_state(config_name)
+
+    _step("find or launch the instance")
+    state = _find_or_launch(config_name, cfg, state)
+    host = state["host"]
+
+    # The config's filesystem must back the persistent dir, never whatever else is mounted.
+    _step("set up the instance")
+    persistent_dir, _ = _setup_host(host, filesystem)
+    state["persistent_dir"] = persistent_dir
+    configs.save_state(config_name, state)
+
+    # Before the slow steps, so the cap holds even if an install or provisioning hangs.
+    _step("arm the cap")
+    deadline = _configure_auto_terminate(cfg, host, state.get("instance_id"), persistent_dir)
+    if deadline is not None:
+        state["auto_terminate_at"] = deadline
+    else:
+        state.pop("auto_terminate_at", None)
+    configs.save_state(config_name, state)
+
+    # Recover what the filesystem records (once per `up`; the remote restarts and confirms each
+    # recorded service), then install what this `up`'s profiles need and it lacks. This `up`'s
+    # profiles are the requested ones plus the recorded ones a venv rebuild emptied.
+    _step("make apps match")
+    known = _recover_recorded(host, persistent_dir)
+    redo, marked = _reprovision(config_name, state, known, profile_list)
+    to_provision = profile_list + redo
+    app_union = _app_union(to_provision)
+    _install_missing(host, persistent_dir, app_union, known)
+
+    # The only step that may have nothing to do. Each profile is recorded as soon as its own
+    # provisioning succeeded, so an `up` stopped later still knows it is on the filesystem.
+    _step("provision")
+    if not to_provision:
+        display.info("Nothing to provision.")
+    for prof in to_provision:
+        _run_provision(prof, host, persistent_dir)
+        if prof["name"] not in (state.get("provisioned_profiles") or []):
+            state["provisioned_profiles"] = [*(state.get("provisioned_profiles") or []), prof["name"]]
+        configs.save_state(config_name, state)
+
+    # Everything on the machine (the recorded apps and this `up`'s), but only when something was
+    # provisioned: recovery restarted and confirmed the recorded services a moment ago, and a
+    # second restart would be unchecked. A re-provision mark goes only after all of this.
+    _step("restart services")
+    services = apps.service_apps(list(dict.fromkeys([*known, *app_union])))
+    if not services:
+        display.info("No service apps on this machine, so nothing to restart.")
+    elif to_provision:
+        _restart_services(host, services)
+    else:
+        display.info(
+            f"Nothing was provisioned, so not restarting {', '.join(services)} again: "
+            "recovery already restarted and confirmed them."
+        )
+    _clear_reprovision(host, persistent_dir, marked)
+
+    # --- verify (plan item 2.3) goes here: nothing yet. ---
+
+    _step("report")
+    _report_up(config_name, state, persistent_dir, _apps_for_config(config_name))
+
+
+def _find_or_launch(config_name: str, cfg: dict, state: dict) -> dict:
+    """The config's instance, as the state to carry on with: reused, adopted or launched.
+
+    Reuse a live instance if one is tracked for this config. The state file stays as it is until
+    something replaces it: every way of stopping here keeps it, and what it records. Run again
+    after an `up` that stopped later, this finds the instance that `up` recorded and launches
+    nothing.
+    """
+    filesystem = cfg["filesystem"]
     tracked = state.get("instance_id")
     read = liveness.read_instance(tracked) if tracked else None
     if read and read.kind is liveness.Kind.UNKNOWN:
@@ -1006,31 +1107,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
             state["provisioned_profiles"] = provisioned
         configs.save_state(config_name, state)
 
-    # Set up the host (SSH, detect, sync) and persist where it landed. The config's
-    # filesystem must back the persistent dir — never whatever else happens to be mounted.
-    persistent_dir, _ = _setup_host(state["host"], filesystem)
-    state["persistent_dir"] = persistent_dir
-    configs.save_state(config_name, state)
-
-    # Arm the billing cap before the slow steps, so it holds even if install/provision hang.
-    deadline = _configure_auto_terminate(cfg, state["host"], state.get("instance_id"), persistent_dir)
-    if deadline is not None:
-        state["auto_terminate_at"] = deadline
-    else:
-        state.pop("auto_terminate_at", None)
-    configs.save_state(config_name, state)
-
-    # Recover what the filesystem records, on every up (with or without profiles), once.
-    known = _recover_recorded(state["host"], persistent_dir)
-
-    # Provision the requested profiles (if any), and the recorded ones a venv rebuild emptied
-    # (the marks are cleared only once that provisioning succeeded), then report.
-    redo, marked = _reprovision(config_name, state, known, profile_list)
-    if profile_list or redo:
-        _provision_profiles(config_name, state, state["host"], persistent_dir, profile_list + redo, known)
-    _clear_reprovision(state["host"], persistent_dir, marked)
-    app_list = _apps_for_config(config_name)
-    _report_up(config_name, state, persistent_dir, app_list)
+    return state
 
 
 @cli.command()
