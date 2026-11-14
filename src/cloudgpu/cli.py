@@ -790,6 +790,30 @@ def _parse_profiles(profile_csv: str | None) -> list[dict]:
     return loaded
 
 
+def _config_profiles(cfg: dict) -> list[dict]:
+    """Load each profile the config lists; UsageError naming the profile and the config file."""
+    loaded = []
+    for n in cfg.get("profiles") or []:
+        try:
+            loaded.append(profiles.load_profile(n))
+        except config.ConfigError as e:
+            raise click.UsageError(
+                f"{cfg['path']}: can't load profile '{n}' listed in 'profiles': {e}"
+            ) from e
+    return loaded
+
+
+def _each_once(profile_list: list[dict]) -> list[dict]:
+    """The profiles in order, without a later one that is the same folder as an earlier one."""
+    seen: set = set()
+    once = []
+    for prof in profile_list:
+        if prof["dir"] not in seen:
+            seen.add(prof["dir"])
+            once.append(prof)
+    return once
+
+
 def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir: str,
                         profile_list: list[dict], known: dict | None = None) -> list[str]:
     """Ensure apps + run provisioning for each profile, record them in state.
@@ -823,10 +847,11 @@ def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir
 @click.option("--config", "-C", "config_name", required=True, help="Config name (hardware: configs/<name>.toml)")
 @click.option("--profile", "-P", "profile_csv", default=None, help="Profile(s) to provision (comma-separated; optional)")
 def up(config_name: str, profile_csv: str | None) -> None:
-    """Launch/recover the config's machine, then provision the given profile(s).
+    """Launch/recover the config's machine, then provision its profile(s).
 
-    The config (hardware) is required; profiles (provisioning) are optional and
-    comma-separated — with none you get a bare instance. Idempotent: reuses a running
+    The config (hardware) is required. Every `up` provisions the profiles the config lists
+    (`profiles = [...]`), then any given with -P (comma-separated) that aren't among them;
+    with neither you get a bare instance. Idempotent: reuses a running
     instance if one exists, otherwise polls for GPU capacity, launches (auto-creating the
     filesystem if needed), sets up, and provisions. Re-run after a termination to recover.
     """
@@ -834,7 +859,8 @@ def up(config_name: str, profile_csv: str | None) -> None:
         cfg = configs.load_config(config_name)
     except config.ConfigError as e:
         raise click.UsageError(str(e)) from e
-    profile_list = _parse_profiles(profile_csv)
+    # All loaded here, before the lock and any Lambda call: a typo must not launch a machine.
+    profile_list = _each_once(_config_profiles(cfg) + _parse_profiles(profile_csv))
 
     # One `up` per config at a time on this computer, so two can't both launch. Refuse rather
     # than wait: the other may be polling for capacity for hours.

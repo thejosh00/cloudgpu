@@ -3,7 +3,8 @@
 A *config* is a single TOML file under a top-level ``configs/`` directory describing
 the instance to launch: which GPU, which SSH key, which persistent filesystem, region,
 and the billing/auto-terminate policy. It owns the instance and its runtime state; one
-or more *profiles* (see ``profiles.py``) are provisioned onto that instance.
+or more *profiles* (see ``profiles.py``) are provisioned onto that instance. The config
+can name them (``profiles = [...]``), and every ``cloudgpu up`` then provisions those.
 
   configs/<name>.toml         — hardware, hand-edited (``cloudgpu init --config`` scaffolds).
   configs/<name>.state.json   — tool-written runtime state (which instance is up); gitignored.
@@ -39,6 +40,7 @@ _DEFAULTS: dict[str, Any] = {
     "poll_seconds": 20,
     "max_hours": 12,
     "auto_terminate_hours": 0,  # > 0: instance self-terminates this long after each `up`
+    "profiles": [],  # profile names or paths (as -P takes them) that every `up` provisions
 }
 
 
@@ -114,6 +116,16 @@ def load_config(name_or_path: str | Path) -> dict[str, Any]:
         raise config.ConfigError(
             f"{path}: 'auto_terminate_hours' must be a number (hours; 0 disables)."
         ) from None
+
+    # Only the shape: whether each profile exists is `up`'s to check, so `down`, `status` and
+    # the rest keep working on a config that names a missing one.
+    listed = cfg.get("profiles")
+    if not isinstance(listed, list) or not all(isinstance(p, str) and p.strip() for p in listed):
+        raise config.ConfigError(
+            f"{path}: 'profiles' must be a list of profile names or paths, "
+            'e.g. ["qwen-image", "krea2"].'
+        )
+    cfg["profiles"] = list(listed)
     return cfg
 
 
@@ -203,6 +215,7 @@ def _toml_template(name: str, *, filesystem: str | None, gpu: list[str], ssh_key
         '# region = "us-east-3"           # optional; defaults to the filesystem\'s region',
         "poll_seconds = 20                # capacity poll interval",
         "max_hours = 12                   # give up after this long",
+        '# profiles = ["qwen-image"]      # profiles every \'up\' provisions (names or paths, as -P takes them)',
         "# auto_terminate_hours = 8       # billing cap: instance self-terminates this long after the last 'up'",
     ]) + "\n"
 

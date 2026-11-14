@@ -5,8 +5,8 @@ Last checked against: `710782a` on 2026-11-09
 ## Purpose and boundaries
 
 A Python CLI that declaratively manages GPU machines on Lambda Cloud for one person: a config
-(the hardware) plus profiles (what to install) go in, and `cloudgpu up` finds capacity, launches,
-sets the machine up and installs or recovers the apps. Machines are disposable; the persistent
+(the hardware, and the profiles it should carry) plus profiles (what to install) go in, and
+`cloudgpu up` finds capacity, launches, sets the machine up and installs or recovers the apps. Machines are disposable; the persistent
 filesystem is what lasts, so a terminated instance is routine.
 
 **Out of scope:** other cloud providers, a control-plane service or web UI, containers
@@ -30,7 +30,7 @@ flowchart LR
 | CLI | `src/cloudgpu/cli.py` | Click commands: `up`, `down`, `provision`, `install`, `recover`, `status`, `ssh`, `forward`, `autoterminate`, `capacity`, `lambda` |
 | Lambda client | `src/cloudgpu/local/lambda_api.py` | stdlib urllib; key from LAMBDA_API_KEY; test-only loopback override |
 | Launch and liveness | `src/cloudgpu/local/orchestration.py`, `src/cloudgpu/local/liveness.py` | Poll capacity in the filesystem's region, classify launch outcomes, gone/alive/unknown |
-| Configs and profiles | `src/cloudgpu/local/configs.py`, `src/cloudgpu/local/profiles.py` | configs/<name>.toml (hardware, owns the instance) and profiles/<name>/ folders |
+| Configs and profiles | `src/cloudgpu/local/configs.py`, `src/cloudgpu/local/profiles.py` | configs/<name>.toml (hardware, owns the instance, and may list `profiles` that every `up` provisions, before any `-P` ones) and profiles/<name>/ folders |
 | Transport | `src/cloudgpu/local/ssh.py`, `src/cloudgpu/local/sync.py` | ssh via subprocess; rsync the remote tool and write the instance marker |
 | Capacity log | `src/cloudgpu/local/capacity.py` | One JSONL sample per run, for the v2 failover go/no-go |
 | Local app registry | `src/cloudgpu/local/apps.py` | Ports, service-or-not, files `init` vendors |
@@ -94,6 +94,7 @@ only for autoterminate, as content, into a root-only 600 file under /etc/cloudgp
 | I15 | No test reaches the real Lambda API | **unenforced:** tests monkeypatch or use the fake; nothing fails a test that would go to cloud.lambda.ai |
 | I16 | secrets.env is mode 600 | **unenforced:** asked for in the README; the code never checks or sets it locally |
 | I17 | During install and a venv rebuild, no program in an app venv (`bin/pip`, `bin/python3`) runs as `ubuntu`, and a pip step that can't run as `cloudgpu-app` fails the install | `tests/test_pip_as_app_0_1_fix.py`: "test_no_venv_program_runs_as_the_caller", "test_install_fails_when_a_pip_step_cannot_run_as_app" |
+| I18 | A config's listed profile that can't be loaded stops `up` before the lock, any Lambda call or any state write | `tests/test_config_profiles_2_1.py`: "test_a_missing_config_profile_stops_up_before_anything_happens" |
 
 ## Decisions
 
