@@ -41,6 +41,7 @@ flowchart LR
 | Services | `src/cloudgpu/remote/service.py` | systemd units, sandboxed, run as `cloudgpu-app` |
 | Run-as-app helper | `src/cloudgpu/remote/run_as_app.py` | Provisioning steps run as `cloudgpu-app` with only named env vars |
 | Auto-terminate | `src/cloudgpu/remote/autoterminate.py` | Root-only timer that terminates the instance past its deadline |
+| Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Nothing calls it yet (v2 item 3.2) |
 | Profile templates | `src/cloudgpu/templates/comfyui/` | provision.py and comfylib.py, vendored into profiles |
 
 ## Where state lives
