@@ -16,6 +16,10 @@ from ..utils import (run, pip_install, pip_install_torch, venv_python, check_tor
 
 COMFYUI_PORT = 8188
 
+# What only the person can make again, relative to the persistent dir: generated images, uploaded
+# inputs, and saved workflows and settings. Declared here once; local/apps.py imports it.
+COMFYUI_SYNC_PATHS = ("apps/comfyui/output", "apps/comfyui/input", "apps/comfyui/user")
+
 COMFYUI_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 MANAGER_REPO = "https://github.com/ltdrdata/ComfyUI-Manager.git"
 

@@ -23,6 +23,7 @@ except ModuleNotFoundError:  # py3.10 backport (declared in pyproject)
     import tomli as tomllib  # type: ignore[no-redef]
 
 from . import config
+from .configs import check_extra_paths
 
 PROFILE_FILE = "cloudgpu.toml"
 PROFILES_DIR = "profiles"
@@ -109,6 +110,18 @@ def load_profile(name_or_path: str | Path) -> dict[str, Any]:
     if (not isinstance(profile["ports"], list)
             or not all(isinstance(p, int) for p in profile["ports"])):
         raise config.ConfigError(f"{path}: 'ports' must be a list of port numbers.")
+
+    # A profile can only add paths; where and how often to sync is the config's.
+    sync = raw.get("sync", {})
+    if not isinstance(sync, dict):
+        raise config.ConfigError(f"{path}: 'sync' must be a table, written as [sync].")
+    unknown = sorted(set(sync) - {"extra_paths"})
+    if unknown:
+        raise config.ConfigError(
+            f"{path}: '{unknown[0]}' can't be set in a profile's [sync], which takes only "
+            "'extra_paths'. 'remote' and 'interval_minutes' belong in the config's [sync]."
+        )
+    profile["sync"] = {"extra_paths": check_extra_paths(path, sync.get("extra_paths", []))}
     return profile
 
 
@@ -124,6 +137,10 @@ def _toml_template(name: str, *, apps: list[str]) -> str:
         f"apps = {arr(apps)}              # apps to install on the instance",
         "provision_timeout = 3600         # seconds; cap on the provision script",
         "ports = []                       # extra 'cloudgpu forward' ports (apps' own are automatic)",
+        "",
+        "# More paths to sync to the config's bucket, on top of the apps' own. Keep this table last.",
+        "# [sync]",
+        '# extra_paths = ["notebooks"]    # relative to the persistent dir',
     ]) + "\n"
 
 

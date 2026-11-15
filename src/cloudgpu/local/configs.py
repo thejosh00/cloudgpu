@@ -42,7 +42,11 @@ _DEFAULTS: dict[str, Any] = {
     "max_hours": 12,
     "auto_terminate_hours": 0,  # > 0: instance self-terminates this long after each `up`
     "profiles": [],  # profile names or paths (as -P takes them) that every `up` provisions
+    "sync": None,  # no [sync] table: sync is off
 }
+
+SYNC_INTERVAL_MINUTES = 5
+_SYNC_KEYS = ("remote", "interval_minutes", "extra_paths")
 
 
 # --- locating + loading a config ------------------------------------------
@@ -127,7 +131,67 @@ def load_config(name_or_path: str | Path) -> dict[str, Any]:
             'e.g. ["qwen-image", "krea2"].'
         )
     cfg["profiles"] = list(listed)
+    cfg["sync"] = _load_sync(path, cfg.get("sync"))
     return cfg
+
+
+def check_extra_paths(path: Path, value: Any) -> list[str]:
+    """Validate a ``[sync]`` table's ``extra_paths`` (a config's or a profile's) and return it.
+
+    Raises:
+        ConfigError: If it isn't a list of relative paths that stay inside the persistent dir.
+    """
+    key = "'extra_paths' in [sync]"
+    if not isinstance(value, list) or not all(isinstance(p, str) and p.strip() for p in value):
+        raise config.ConfigError(
+            f"{path}: {key} must be a list of paths relative to the persistent dir, "
+            'e.g. ["notebooks"].'
+        )
+    for p in value:
+        parts = p.split("/")
+        if p.startswith(("/", "~")) or ".." in parts or not any(s not in ("", ".") for s in parts):
+            raise config.ConfigError(
+                f"{path}: {key} holds '{p}', which must be a relative path inside the persistent "
+                "dir (no leading '/', no '~', no '..')."
+            )
+    return list(value)
+
+
+def _load_sync(path: Path, sync: Any) -> dict[str, Any] | None:
+    """Validate the optional ``[sync]`` table. None (no table) means sync is off.
+
+    Only the shape: this runs for `down` and `status` too, so nothing here calls rclone.
+    """
+    if sync is None:
+        return None
+    if not isinstance(sync, dict):
+        raise config.ConfigError(f"{path}: 'sync' must be a table, written as [sync].")
+    unknown = sorted(set(sync) - set(_SYNC_KEYS))
+    if unknown:
+        raise config.ConfigError(
+            f"{path}: unknown key '{unknown[0]}' in [sync]. It takes {', '.join(_SYNC_KEYS)}."
+        )
+
+    remote = sync.get("remote")
+    name, colon, bucket = remote.partition(":") if isinstance(remote, str) else ("", "", "")
+    if (not colon or not name or "/" in name or not bucket or bucket.startswith("/")
+            or remote != remote.strip()):
+        raise config.ConfigError(
+            f"{path}: [sync] must set 'remote' to an rclone remote and bucket, "
+            '"<remote name>:<bucket>[/<prefix>]", e.g. "b2:my-cloudgpu-bucket/small".'
+        )
+
+    interval = sync.get("interval_minutes", SYNC_INTERVAL_MINUTES)
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+        raise config.ConfigError(
+            f"{path}: 'interval_minutes' in [sync] must be a whole number of minutes, at least 1."
+        )
+
+    return {
+        "remote": remote,
+        "interval_minutes": interval,
+        "extra_paths": check_extra_paths(path, sync.get("extra_paths", [])),
+    }
 
 
 # --- runtime state (tool-written, beside the config file) -----------------
@@ -265,6 +329,13 @@ def _toml_template(name: str, *, filesystem: str | None, gpu: list[str], ssh_key
         "max_hours = 12                   # give up after this long",
         '# profiles = ["qwen-image"]      # profiles every \'up\' provisions (names or paths, as -P takes them)',
         "# auto_terminate_hours = 8       # billing cap: instance self-terminates this long after the last 'up'",
+        "",
+        "# Sync outputs, datasets and saved workflows to your own bucket. Keep this table last:",
+        "# every key below [sync] belongs to it.",
+        "# [sync]",
+        f'# remote = "b2:my-cloudgpu-bucket/{name}"   # rclone remote and prefix',
+        "# interval_minutes = 5",
+        "# extra_paths = []               # more paths to sync, relative to the persistent dir",
     ]) + "\n"
 
 

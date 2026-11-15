@@ -19,6 +19,11 @@ from ..utils import (VenvCheckUnavailable, run, pip_install, pip_install_torch,
 
 AITOOLKIT_PORT = 8675
 
+# What only the person can make again, relative to the persistent dir: uploaded datasets and
+# training outputs (LoRAs, samples). The installer and unit set neither folder, so these are
+# upstream's defaults under the app dir. Declared here once; local/apps.py imports it.
+AITOOLKIT_SYNC_PATHS = ("apps/ai-toolkit/datasets", "apps/ai-toolkit/output")
+
 AITOOLKIT_REPO = "https://github.com/ostris/ai-toolkit.git"
 NODE_VERSION = "22.17.1"  # README requires Node > 20
 
