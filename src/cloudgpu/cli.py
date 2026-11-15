@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -736,6 +737,101 @@ def _configure_auto_terminate(cfg: dict, host: str, instance_id: str | None, per
         sys.exit(1)
 
 
+# Where the two files of a sync setup land in ubuntu's home; the remote setup deletes both.
+SYNC_KEY_TRANSFER = ".cloudgpu-rclone.conf"
+SYNC_REQUEST_TRANSFER = ".cloudgpu-datasync.json"
+
+
+def _plan_sync(cfg: dict, state: dict, profile_list: list[dict]) -> dict | None:
+    """What this `up` will ask the instance to sync, or None without ``[sync]``. Local only.
+
+    Run before `up` launches or changes anything: with ``[sync]``, the bucket key must be in the
+    person's rclone config under the remote's name, and every path must stay inside the
+    persistent dir (the instance would refuse it anyway, after the launch). The paths are
+    ``apps.sync_paths`` for the config, this `up`'s profiles and the ones the state file records
+    as already provisioned, and those profiles' apps. Nothing from the key file is kept or shown.
+    """
+    sync_cfg = cfg.get("sync")
+    if not sync_cfg:
+        return None
+    try:
+        profiles.rclone_remote_section(sync_cfg["remote"])
+    except config.ConfigError as e:
+        display.error(escape(f"{e} Nothing was launched or changed."))
+        sys.exit(1)
+    in_play = list(profile_list)
+    for name in state.get("provisioned_profiles") or []:
+        try:
+            in_play.append(profiles.load_profile(name))
+        except config.ConfigError:
+            continue
+    in_play = _each_once(in_play)
+    paths = apps.sync_paths(cfg, _app_union(in_play), in_play)
+    for path in paths:
+        if path.startswith(("/", "~")) or ".." in path.split("/"):
+            display.error(escape(
+                f"The sync path '{path}' must be a relative path inside the persistent dir "
+                "(no leading '/', no '~', no '..'). Nothing was launched or changed."
+            ))
+            sys.exit(1)
+    return {"remote": sync_cfg["remote"], "paths": paths, "interval_minutes": sync_cfg["interval_minutes"]}
+
+
+def _stop_sync_failed(config_name: str, runtime: dict, what: str, e: Exception) -> NoReturn:
+    """Sync the person asked for must never be silently absent: stop, and say what is billing."""
+    display.error(
+        f"{what}: {escape(str(e))}\n"
+        f"Instance {runtime.get('instance_id') or '?'} is still running and billing. "
+        f"'cloudgpu down -C {config_name}' stops it; 'cloudgpu up -C {config_name}' tries again."
+    )
+    sys.exit(1)
+
+
+def _install_sync(config_name: str, runtime: dict, persistent_dir: str, plan: dict) -> None:
+    """Put the bucket key, the path list and the sync units in place on the instance. Starts nothing.
+
+    Only the remote's own section of the person's rclone config travels, as file content over
+    the rsync stream (never a command line or an environment variable); the remote setup moves
+    it to root-only storage and deletes the transferred copy whether or not it worked. The local
+    temporary copy is mode 600 in a private temp dir and is removed whatever happens.
+    """
+    host = runtime["host"]
+    display.info(f"Setting up sync to {escape(plan['remote'])} ({len(plan['paths'])} paths, "
+                 f"every {plan['interval_minutes']} minutes)...")
+    try:
+        with tempfile.TemporaryDirectory(prefix="cloudgpu-sync-") as tmp:
+            key_path = os.path.join(tmp, "rclone.conf")
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(profiles.rclone_remote_section(plan["remote"]))
+            request_path = os.path.join(tmp, "datasync.json")
+            with open(request_path, "w") as f:
+                json.dump(plan, f)
+            sync.copy_file(request_path, host, SYNC_REQUEST_TRANSFER)
+            sync.copy_file(key_path, host, SYNC_KEY_TRANSFER)
+        _remote_run(host, persistent_dir, "datasync",
+                    ["setup", f"--key-file {SYNC_KEY_TRANSFER}", f"--spec-file {SYNC_REQUEST_TRANSFER}"])
+    except (ssh.SSHError, subprocess.SubprocessError, OSError, config.ConfigError) as e:
+        _stop_sync_failed(config_name, runtime, "Could not set up the bucket sync", e)
+
+
+def _start_sync_timer(config_name: str, runtime: dict, persistent_dir: str) -> None:
+    """Start (or keep running) the sync timer that `_install_sync` put in place."""
+    try:
+        _remote_run(runtime["host"], persistent_dir, "datasync", ["start"])
+    except (ssh.SSHError, subprocess.SubprocessError, OSError) as e:
+        _stop_sync_failed(config_name, runtime, "Could not start the bucket sync timer", e)
+    display.info("Sync timer running.")
+
+
+def _remove_sync(config_name: str, runtime: dict, persistent_dir: str) -> None:
+    """The config has no ``[sync]``: take timer, units and key off the instance (quiet if none)."""
+    try:
+        _remote_run(runtime["host"], persistent_dir, "datasync", ["remove"])
+    except (ssh.SSHError, subprocess.SubprocessError, OSError) as e:
+        _stop_sync_failed(config_name, runtime, "Could not remove the bucket sync", e)
+
+
 def _restart_services(host: str, app_list: list[str]) -> None:
     """Restart the profile's service apps (so provision changes take effect)."""
     services = apps.service_apps(app_list)
@@ -1006,6 +1102,8 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     filesystem = cfg["filesystem"]
     # Read before anything else: a state file that can't be used stops `up` here.
     state = _load_state(config_name)
+    # Local only, and before any launch or ssh: a missing bucket key stops `up` here.
+    sync_plan = _plan_sync(cfg, state, profile_list)
 
     _step("find or launch the instance")
     state = _find_or_launch(config_name, cfg, state)
@@ -1025,6 +1123,13 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     else:
         state.pop("auto_terminate_at", None)
     configs.save_state(config_name, state)
+    # Same step, after the cap: like it, the sync lives on the instance's own disk, so every
+    # `up` puts it back (or takes it away). Two calls, so a restore can later go between them.
+    if sync_plan:
+        _install_sync(config_name, state, persistent_dir, sync_plan)
+        _start_sync_timer(config_name, state, persistent_dir)
+    else:
+        _remove_sync(config_name, state, persistent_dir)
 
     # Recover what the filesystem records (once per `up`; the remote restarts and confirms each
     # recorded service), then install what this `up`'s profiles need and it lacks. This `up`'s

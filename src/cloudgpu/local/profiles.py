@@ -14,6 +14,7 @@ Secrets stay in the shared ``~/.config/cloudgpu/secrets.env`` (see ``secrets_fil
 
 from __future__ import annotations
 
+import configparser
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,52 @@ def secrets_file() -> Path:
     Keep it mode 600; it is never committed and must not be printed.
     """
     return config.CONFIG_DIR / "secrets.env"
+
+
+def rclone_config_file() -> Path:
+    """Path to the rclone config holding the bucket key for configs with ``[sync]``.
+
+    The person writes it once; it holds a section named as the part before ``:`` in the
+    config's ``[sync] remote``. Only that section is sent to an instance (see
+    ``rclone_remote_section``). It is never committed, never printed, and deliberately not
+    part of secrets.env, which is exported whole to provision scripts.
+    """
+    return config.CONFIG_DIR / "rclone.conf"
+
+
+def rclone_remote_section(remote: str) -> str:
+    """The one section of the rclone config that ``remote`` (``name:bucket/path``) names, as text.
+
+    A plain ini read: rclone is never run here. Every message names the file and the section
+    and nothing else, because the parser's own errors quote lines of the file.
+
+    Raises:
+        ConfigError: If the file is missing, can't be read, or has no such section.
+    """
+    name = remote.split(":", 1)[0]
+    path = rclone_config_file()
+    wanted = (
+        f"A config with [sync] needs the bucket key in {path}, in a section named [{name}] "
+        f"(the part of [sync] remote before ':')"
+    )
+    if not path.is_file():
+        raise config.ConfigError(f"{wanted}, but that file does not exist.")
+    # default_section: nothing in the file is shared between sections, so only [name] travels.
+    parser = configparser.RawConfigParser(default_section="cloudgpu-no-defaults", strict=False)
+    parser.optionxform = str  # keep the keys as written
+    try:
+        with open(path, encoding="utf-8") as f:
+            parser.read_file(f)
+    except (OSError, UnicodeDecodeError, configparser.Error):
+        raise config.ConfigError(
+            f"{wanted}, but that file could not be read as an rclone config."
+        ) from None
+    if not parser.has_section(name):
+        raise config.ConfigError(f"{wanted}, but that file has no [{name}] section.")
+    lines = [f"[{name}]"]
+    # A value on several lines keeps its continuation lines indented, as ini wants them.
+    lines += [f"{key} = {(value or '').replace(chr(10), chr(10) + '    ')}" for key, value in parser.items(name)]
+    return "\n".join(lines) + "\n"
 
 
 # --- locating + loading a profile -----------------------------------------

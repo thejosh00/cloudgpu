@@ -43,8 +43,9 @@ flowchart LR
 | Services | `src/cloudgpu/remote/service.py` | systemd units, sandboxed, run as `cloudgpu-app` |
 | Run-as-app helper | `src/cloudgpu/remote/run_as_app.py` | Provisioning steps run as `cloudgpu-app` with only named env vars |
 | Auto-terminate | `src/cloudgpu/remote/autoterminate.py` | Root-only timer that terminates the instance past its deadline |
-| Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Nothing calls it yet (v2 item 3.2) |
-| Sync setup | `src/cloudgpu/remote/datasync_setup.py` | Remote command `datasync setup/start/remove`: creates the `cloudgpu-sync` user, moves the transferred bucket key to a root-only file, installs a pinned, checksum-verified rclone, a root-owned copy of the runner, its spec, and a oneshot service and timer; `start` enables the timer; `remove` takes timer, units, key, spec and runner away. `up` does not call it yet (v2 item 3.2 part 3) |
+| Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Run by the timer that `up` sets up |
+| Sync setup | `src/cloudgpu/remote/datasync_setup.py` | Remote command `datasync setup/start/remove`: creates the `cloudgpu-sync` user, moves the transferred bucket key to a root-only file, installs a pinned, checksum-verified rclone, a root-owned copy of the runner, its spec, and a oneshot service and timer; `start` enables the timer; `remove` takes timer, units, key, spec and runner away. Every `up` calls it (below) |
+| Sync on `up` | `src/cloudgpu/cli.py` (`_plan_sync`, `_install_sync`, `_start_sync_timer`, `_remove_sync`), `src/cloudgpu/local/profiles.py` (`rclone_remote_section`) | With `[sync]` in the config: before any launch or ssh, checks ~/.config/cloudgpu/rclone.conf has the remote's section and works out the paths (`apps.sync_paths` for this `up`'s profiles plus the ones the state file records); then, inside the "arm the cap" step of every `up`, sends that one section and the path list as files, runs remote `datasync setup`, then `datasync start` (two calls, so a restore can go between them). Without `[sync]`: runs `datasync remove`. A failure stops `up` before the slow steps |
 | Profile templates | `src/cloudgpu/templates/comfyui/` | provision.py and comfylib.py, vendored into profiles |
 
 ## Where state lives
@@ -52,12 +53,13 @@ flowchart LR
 | State | Where | Survives a terminated instance? | Backed up? |
 |---|---|---|---|
 | Tracked instance (id, host, profiles) | configs/<name>.state.json beside the config (`src/cloudgpu/local/configs.py`), plus a configs/<name>.up.lock flock | yes (local) | no; gitignored |
+| Bucket key (rclone config; you write it once, a section per remote) | ~/.config/cloudgpu/rclone.conf (`profiles.rclone_config_file`); needed by `up` only when the config has `[sync]`, never by `down` or `status` | yes (local) | no; nothing checks its mode |
 | Manual-flow host | ~/.config/cloudgpu/config.json (`src/cloudgpu/local/config.py`) | yes (local) | no |
 | Capacity samples | ~/.local/state/cloudgpu/capacity.jsonl, append-only | yes (local) | no |
 | App records and re-provision marks | cloudgpu/state.json on the persistent filesystem | yes | no |
 | Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | no (v2 phase 3 plans a bucket sync) |
 | Instance marker, autoterminate config with key | /var/lib/cloudgpu/instance, /etc/cloudgpu/ (instance disk) | no | no |
-| Bucket key (rclone config), sync spec, runner copy | /etc/cloudgpu/rclone.conf (root, 600), /etc/cloudgpu/datasync.json, /etc/cloudgpu/datasync.py (instance disk) | no | no; the key's original is ~/.config/cloudgpu/rclone.conf on your machine (item 3.2 part 3) |
+| Bucket key (rclone config), sync spec, runner copy | /etc/cloudgpu/rclone.conf (root, 600), /etc/cloudgpu/datasync.json, /etc/cloudgpu/datasync.py (instance disk) | no | no; the key's original is ~/.config/cloudgpu/rclone.conf on your machine, and `up` sends the remote's section again each time |
 | Pinned rclone | /usr/local/lib/cloudgpu/rclone-v<version>/rclone (root-owned, instance disk) | no | no; downloaded again and checked against the pinned SHA-256 |
 | Time of the last complete sync | /var/lib/cloudgpu-sync/last-success (instance disk; directory owned by `cloudgpu-sync`, mode 750, so reading it over ssh needs sudo) | no | no |
 
@@ -82,7 +84,12 @@ the provision entry point runs; profile rsyncs exclude it. The Lambda key goes t
 only for autoterminate, as content, into a root-only 600 file under /etc/cloudgpu. The bucket key
 (an rclone config) is installed the same way at /etc/cloudgpu/rclone.conf by `datasync setup`,
 which never opens it and deletes the transferred copy whether or not the install worked; a sync
-run, which is not root, gets a per-run copy from systemd and never the file itself.
+run, which is not root, gets a per-run copy from systemd and never the file itself. On your
+machine the bucket key lives in ~/.config/cloudgpu/rclone.conf, apart from secrets.env (which is
+exported whole to provision scripts). `up` reads it with a plain ini parser (rclone is never run
+locally), never prints a value or a parser error from it, and sends only the section named by
+`[sync] remote`, as file content from a mode-600 file in a private temp dir that is removed
+whatever happens; other remotes in the file stay behind.
 
 ## Invariants
 
@@ -108,6 +115,8 @@ run, which is not root, gets a per-run copy from systemd and never the file itse
 | I18 | A config's listed profile that can't be loaded stops `up` before the lock, any Lambda call or any state write | `tests/test_config_profiles_2_1.py`: "test_a_missing_config_profile_stops_up_before_anything_happens" |
 | I19 | A local state file that can't be used stops every command that reads it, before any Lambda call, with the file unchanged | `tests/test_state_file_2_2.py`: "test_a_corrupt_state_file_stops_the_command" |
 | I20 | `up` reports success and exits 0 only if every service app on the machine (recorded apps plus this `up`'s) is running as systemd on the instance reports it, after a settle when `up` restarted them; a check that can't be made is a failure, and a failed verify changes nothing | `tests/test_up_verify_2_3.py`: "test_up_fails_when_a_service_is_not_running_after_the_restart", "test_up_fails_in_a_sentence_when_the_check_cannot_be_made" |
+| I21 | Only the config's own remote section of rclone.conf goes to the instance, as file content; the bucket key is in no ssh or rsync command line, no ssh environment and no output | `tests/test_datasync_up_3_2.py`: "test_only_the_remotes_section_travels_and_the_key_is_in_no_command" |
+| I22 | With `[sync]` and no usable key section, `up` stops before any Lambda call or ssh; a failed sync setup, start or removal fails `up` with the instance still tracked | `tests/test_datasync_up_3_2.py`: "test_up_with_sync_stops_before_any_launch_or_ssh_without_the_key", "test_a_failed_remote_sync_step_fails_up_in_a_sentence_and_keeps_the_instance" |
 
 ## Decisions
 
@@ -143,8 +152,9 @@ uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` ag
   Toolkit installs, the autoterminate timer firing (tests use fakes and recorded commands).
 - The sync setup on a real instance: that systemd there has `LoadCredential=` (247 or newer),
   that `cloudgpu-sync` can read the synced dirs and `cloudgpu-app` can't read the key, that the
-  pinned rclone downloads and runs, and that the timer fires.
+  pinned rclone downloads and runs, and that the timer fires. `up`'s calls to it are tested only
+  against an ssh shim that answers nothing: no real `datasync setup` has ever run from `up`.
 - Lambda's real API shapes where the fake marks an ASSUMPTION (`tests/fake_lambda/__init__.py`).
-- The user's machine: whether secrets.env exists and its mode, which configs and profiles exist.
+- The user's machine: whether secrets.env and rclone.conf exist and their modes, which configs and profiles exist.
 - That the persistent filesystem survives termination as Lambda documents (not testable here).
 - `workflows/` (cloudgpu-build loop scripts) was not read beyond its file names.
