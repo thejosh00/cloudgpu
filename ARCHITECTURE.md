@@ -23,6 +23,8 @@ flowchart LR
   inst --> svc[App services as cloudgpu-app]
   svc --> fs
   timer[Root autoterminate timer, on instance] -->|own key copy| lambda
+  fs -->|read only, through the cloudgpu-app group| dsync[Sync timer as cloudgpu-sync, on instance]
+  dsync -->|rclone copy, bucket key as a systemd credential| bucket[(Your bucket)]
 ```
 
 | Component | Where | Does |
@@ -42,6 +44,7 @@ flowchart LR
 | Run-as-app helper | `src/cloudgpu/remote/run_as_app.py` | Provisioning steps run as `cloudgpu-app` with only named env vars |
 | Auto-terminate | `src/cloudgpu/remote/autoterminate.py` | Root-only timer that terminates the instance past its deadline |
 | Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Nothing calls it yet (v2 item 3.2) |
+| Sync setup | `src/cloudgpu/remote/datasync_setup.py` | Remote command `datasync setup/start/remove`: creates the `cloudgpu-sync` user, moves the transferred bucket key to a root-only file, installs a pinned, checksum-verified rclone, a root-owned copy of the runner, its spec, and a oneshot service and timer; `start` enables the timer; `remove` takes timer, units, key, spec and runner away. `up` does not call it yet (v2 item 3.2 part 3) |
 | Profile templates | `src/cloudgpu/templates/comfyui/` | provision.py and comfylib.py, vendored into profiles |
 
 ## Where state lives
@@ -54,6 +57,9 @@ flowchart LR
 | App records and re-provision marks | cloudgpu/state.json on the persistent filesystem | yes | no |
 | Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | no (v2 phase 3 plans a bucket sync) |
 | Instance marker, autoterminate config with key | /var/lib/cloudgpu/instance, /etc/cloudgpu/ (instance disk) | no | no |
+| Bucket key (rclone config), sync spec, runner copy | /etc/cloudgpu/rclone.conf (root, 600), /etc/cloudgpu/datasync.json, /etc/cloudgpu/datasync.py (instance disk) | no | no; the key's original is ~/.config/cloudgpu/rclone.conf on your machine (item 3.2 part 3) |
+| Pinned rclone | /usr/local/lib/cloudgpu/rclone-v<version>/rclone (root-owned, instance disk) | no | no; downloaded again and checked against the pinned SHA-256 |
+| Time of the last complete sync | /var/lib/cloudgpu-sync/last-success (instance disk; directory owned by `cloudgpu-sync`, mode 750, so reading it over ssh needs sudo) | no | no |
 
 There are no migrations. The local state file is written atomically (a temporary file beside
 it, synced, then renamed over it). One that exists but can't be read, or isn't a JSON object, is
@@ -67,12 +73,16 @@ never read as "no instance": every command that reads it stops and names the fil
 | `ubuntu` on the instance | ssh from the CLI | Run setup and provision scripts with every provisioning secret; passwordless sudo | — |
 | App code, custom nodes (`cloudgpu-app`) | systemd service, or `src/cloudgpu/remote/run_as_app.py` | Write its own app dirs, venvs, its HOME and /tmp | Read the root-only Lambda key, see /home, write the OS, get tokens it wasn't named |
 | Autoterminate timer (root) | systemd timer | Terminate this instance via the API | — |
+| Sync run (`cloudgpu-sync`) | systemd timer; the bucket key handed to each run by systemd `LoadCredential=` (systemd 247 or newer) | Read what the `cloudgpu-app` group can read; upload to the bucket; write /var/lib/cloudgpu-sync | Write anything on the persistent filesystem or the OS, use sudo, log in. `cloudgpu-app` can't read the key or /var/lib/cloudgpu-sync, or change rclone, the runner or its spec (all root-owned on the instance disk) |
 | Tests | CLOUDGPU_TEST_LAMBDA_API_BASE | Point the client at a fake | Point it anywhere but a loopback IP |
 
 Secrets on disk: provisioning tokens in ~/.config/cloudgpu/secrets.env (the README asks for mode
 600; nothing checks it). It is copied to the instance as content, sourced, and deleted before
 the provision entry point runs; profile rsyncs exclude it. The Lambda key goes to the instance
-only for autoterminate, as content, into a root-only 600 file under /etc/cloudgpu.
+only for autoterminate, as content, into a root-only 600 file under /etc/cloudgpu. The bucket key
+(an rclone config) is installed the same way at /etc/cloudgpu/rclone.conf by `datasync setup`,
+which never opens it and deletes the transferred copy whether or not the install worked; a sync
+run, which is not root, gets a per-run copy from systemd and never the file itself.
 
 ## Invariants
 
@@ -131,6 +141,9 @@ uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` ag
 
 - Everything on a real instance: systemd sandbox behaviour, `sudo`, the marker, ComfyUI and AI
   Toolkit installs, the autoterminate timer firing (tests use fakes and recorded commands).
+- The sync setup on a real instance: that systemd there has `LoadCredential=` (247 or newer),
+  that `cloudgpu-sync` can read the synced dirs and `cloudgpu-app` can't read the key, that the
+  pinned rclone downloads and runs, and that the timer fires.
 - Lambda's real API shapes where the fake marks an ASSUMPTION (`tests/fake_lambda/__init__.py`).
 - The user's machine: whether secrets.env exists and its mode, which configs and profiles exist.
 - That the persistent filesystem survives termination as Lambda documents (not testable here).

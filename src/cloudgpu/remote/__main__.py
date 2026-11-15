@@ -73,6 +73,15 @@ def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:
         autoterminate.disarm()
 
 
+def cmd_datasync(state: State, args: argparse.Namespace) -> None:
+    """Put the bucket sync in place (setup), start its timer (start), or take it away (remove)."""
+    from . import datasync_setup
+    code = datasync_setup.main(args.action, state.persistent_dir, key_file=args.key_file,
+                               request_file=args.spec_file, start_timer=args.start)
+    if code:
+        sys.exit(code)
+
+
 def cmd_status(state: State, args: argparse.Namespace) -> None:
     """Show status of all installed apps."""
     detection = detect_all()
@@ -116,6 +125,15 @@ def main() -> None:
     at_parser.add_argument("--key-file", default=None,
                            help="File with a LAMBDA_API_KEY=... line (deleted after reading)")
 
+    ds_parser = subparsers.add_parser("datasync", help="Set up, start or remove the bucket sync")
+    ds_parser.add_argument("action", choices=["setup", "start", "remove"])
+    ds_parser.add_argument("--key-file", default=None,
+                           help="Transferred rclone config holding the bucket key (deleted after)")
+    ds_parser.add_argument("--spec-file", default=None,
+                           help="Transferred JSON: remote, paths, interval_minutes (deleted after)")
+    ds_parser.add_argument("--start", action="store_true",
+                           help="With setup: also start the timer")
+
     args = parser.parse_args()
     state = State(args.persistent_dir)
 
@@ -127,6 +145,7 @@ def main() -> None:
         "clear-reprovision": cmd_clear_reprovision,
         "verify": cmd_verify,
         "autoterminate": cmd_autoterminate,
+        "datasync": cmd_datasync,
     }
 
     try:
