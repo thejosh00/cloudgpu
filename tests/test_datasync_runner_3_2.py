@@ -141,7 +141,8 @@ def test_only_known_flags_are_passed(datasync, box, capfd):
     run(datasync, box, capfd)
     (call,) = box.calls()
     assert call["argv"] == [
-        "copy", "--config", str(box.config), "--fast-list", f"{box.root}/a", "b2:bkt/small/a",
+        "copy", "--config", str(box.config), "--fast-list", "--exclude", "*.partial",
+        f"{box.root}/a", "b2:bkt/small/a",
     ]
 
 

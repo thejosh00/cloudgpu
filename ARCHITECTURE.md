@@ -39,11 +39,11 @@ flowchart LR
 | Remote entry | `src/cloudgpu/remote/__main__.py` | Runs on the instance over ssh; dispatches to installers |
 | Installers | `src/cloudgpu/remote/installer.py`, `src/cloudgpu/remote/apps/` | `AppInstaller` per app (ComfyUI, AI Toolkit) |
 | Instance guard | `src/cloudgpu/remote/instance.py` | Installers refuse to run without the root-owned marker |
-| Records | `src/cloudgpu/remote/state.py`, `src/cloudgpu/remote/recovery.py` | state.json on the filesystem: installed apps and re-provision marks |
+| Records | `src/cloudgpu/remote/state.py`, `src/cloudgpu/remote/recovery.py` | state.json on the filesystem: installed apps, re-provision marks, and the record of a finished restore from the bucket (`get_restore`, `needs_restore`) |
 | Services | `src/cloudgpu/remote/service.py` | systemd units, sandboxed, run as `cloudgpu-app` |
 | Run-as-app helper | `src/cloudgpu/remote/run_as_app.py` | Provisioning steps run as `cloudgpu-app` with only named env vars |
 | Auto-terminate | `src/cloudgpu/remote/autoterminate.py` | Root-only timer that terminates the instance past its deadline |
-| Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Run by the timer that `up` sets up |
+| Sync runner | `src/cloudgpu/remote/datasync.py` | Standalone: one run uploads the declared paths with `rclone copy` (never deletes, never follows symlinks) and records the last good run. Run by the timer that `up` sets up. Its `restore` entry is the other direction, once per filesystem: `rclone copy --ignore-existing` down per path (never replaces or deletes a local file, nothing through a symlink; a path missing from the bucket, rclone exit 3, is nothing to restore; any other failure fails), then a record (remote, UTC time) in state.json; with a record for the same remote it downloads nothing. Nothing calls `restore` yet (3.3 parts 2 and 3) |
 | Sync setup | `src/cloudgpu/remote/datasync_setup.py` | Remote command `datasync setup/start/remove`: creates the `cloudgpu-sync` user, moves the transferred bucket key to a root-only file, installs a pinned, checksum-verified rclone, a root-owned copy of the runner, its spec, and a oneshot service and timer; `start` enables the timer; `remove` takes timer, units, key, spec and runner away. Every `up` calls it (below) |
 | Sync on `up` | `src/cloudgpu/cli.py` (`_plan_sync`, `_install_sync`, `_start_sync_timer`, `_remove_sync`), `src/cloudgpu/local/profiles.py` (`rclone_remote_section`) | With `[sync]` in the config: before any launch or ssh, checks ~/.config/cloudgpu/rclone.conf has the remote's section and works out the paths (`apps.sync_paths` for this `up`'s profiles plus the ones the state file records); then, inside the "arm the cap" step of every `up`, sends that one section and the path list as files, runs remote `datasync setup`, then `datasync start` (two calls, so a restore can go between them). Without `[sync]`: runs `datasync remove`. A failure stops `up` before the slow steps |
 | Profile templates | `src/cloudgpu/templates/comfyui/` | provision.py and comfylib.py, vendored into profiles |
@@ -56,7 +56,7 @@ flowchart LR
 | Bucket key (rclone config; you write it once, a section per remote) | ~/.config/cloudgpu/rclone.conf (`profiles.rclone_config_file`); needed by `up` only when the config has `[sync]`, never by `down` or `status` | yes (local) | no; nothing checks its mode |
 | Manual-flow host | ~/.config/cloudgpu/config.json (`src/cloudgpu/local/config.py`) | yes (local) | no |
 | Capacity samples | ~/.local/state/cloudgpu/capacity.jsonl, append-only | yes (local) | no |
-| App records and re-provision marks | cloudgpu/state.json on the persistent filesystem | yes | no |
+| App records, re-provision marks, restore record | cloudgpu/state.json on the persistent filesystem | yes | no |
 | Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | no (v2 phase 3 plans a bucket sync) |
 | Instance marker, autoterminate config with key | /var/lib/cloudgpu/instance, /etc/cloudgpu/ (instance disk) | no | no |
 | Bucket key (rclone config), sync spec, runner copy | /etc/cloudgpu/rclone.conf (root, 600), /etc/cloudgpu/datasync.json, /etc/cloudgpu/datasync.py (instance disk) | no | no; the key's original is ~/.config/cloudgpu/rclone.conf on your machine, and `up` sends the remote's section again each time |

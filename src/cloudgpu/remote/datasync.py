@@ -21,9 +21,14 @@ default (no ``--copy-links``, no ``--links``); the declared path itself and the
 directories above it inside the persistent dir are checked here, and a path with a link
 in it is skipped and named.
 
+``restore`` is the other direction, run once per filesystem before any service starts:
+``rclone copy <remote>/<path> <persistent dir>/<path>`` per declared path, skipping every
+file that already exists locally, then a record in the filesystem's own state.json (see
+``restore`` below).
+
 This file must stay standalone (stdlib imports only, no package-relative imports): it
 runs from a root-owned copy outside the package, as a user that is not root, via
-``python3 <copy> run --spec <file>``.
+``python3 <copy> run --spec <file>`` (and ``restore --spec <file>``).
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -40,7 +46,37 @@ import time
 # --fast-list: one recursive listing of the bucket side of a path (one call per 1,000
 # files) instead of one listing per directory. It changes how the destination is listed,
 # not what is copied.
-RCLONE_FLAGS = ("--fast-list",)
+#
+# --exclude "*.partial": rclone's local backend downloads to "<name>.<8 hex>.partial" and
+# renames when the file is complete (the default since v1.63; --inplace turns it off and
+# is never passed here). A restore that was killed can leave such a file behind; it is
+# half a file and must never reach the bucket.
+PARTIAL_EXCLUDE = ("--exclude", "*.partial")
+RCLONE_FLAGS = ("--fast-list", *PARTIAL_EXCLUDE)
+
+# --ignore-existing: skip every file that already exists at the destination, whatever its
+# size or time, so a restore never replaces a local file. No "sync", no delete flag, no
+# link flag, no --inplace.
+RESTORE_FLAGS = ("--ignore-existing", *PARTIAL_EXCLUDE)
+
+# rclone's documented exit codes (https://rclone.org/docs/#exit-code). A restore relies on:
+#   0  success
+#   3  "Directory not found": the source directory is not in the bucket, so there is
+#      nothing to restore for that path (the first `up` ever with [sync]).
+# Everything else fails the path, and is never read as "empty": 1 (generic, which
+# includes a wrong key), 2 (syntax), 4 (file not found), 5 (temporary, e.g. network),
+# 6 (less serious), 7 (fatal), 8 (transfer limit), 9 (no transfer; only with
+# --error-on-no-transfer, never passed), 10 (duration limit), and death by signal.
+RCLONE_DIR_NOT_FOUND = 3
+
+# One restore, all paths together, may take this long: the same six hours as the upload
+# run's RUN_TIMEOUT (datasync_setup.py), enforced here rather than left to a unit.
+RESTORE_TIMEOUT = 6 * 60 * 60
+
+# What rclone's local backend names a download in progress: <name>.<8 hex>.partial
+_PARTIAL_LEFTOVER = re.compile(r"\.[0-9a-f]{8}\.partial$")
+
+RESTORE_KEY = "restore"  # in state.json; the same key as cloudgpu.remote.state.RESTORE_KEY
 
 
 def log(msg: str) -> None:
@@ -233,6 +269,203 @@ def run(
     return 0
 
 
+def restore_command(rclone: str, rclone_config: str, source: str, dest: str) -> list[str]:
+    """The one rclone call that restores one path (pure; testable without rclone)."""
+    return [rclone, "copy", "--config", rclone_config, *RESTORE_FLAGS, source, dest]
+
+
+def state_file(persistent_dir: str) -> str:
+    return os.path.join(persistent_dir, "cloudgpu", "state.json")
+
+
+def _load_state(persistent_dir: str) -> dict:
+    """state.json as a dict; a missing file is a new filesystem. Raises ValueError/OSError
+    for one that can't be read, so a damaged file is never overwritten."""
+    kind, detail = classify(persistent_dir, "cloudgpu")
+    if kind == "symlink":
+        raise ValueError(f"{detail} is a symlink")
+    try:
+        with open(state_file(persistent_dir)) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return {"apps": {}, "created_at": time.time()}
+    if not isinstance(state, dict):
+        raise ValueError("state.json is not a JSON object")
+    return state
+
+
+def read_restore_record(persistent_dir: str) -> dict | None:
+    """The record of this filesystem's finished restore ({"remote", "at"}), or None."""
+    record = _load_state(persistent_dir).get(RESTORE_KEY)
+    if isinstance(record, dict) and isinstance(record.get("remote"), str):
+        return record
+    return None
+
+
+def write_restore_record(persistent_dir: str, remote: str, when: float) -> str:
+    """Record a finished restore in state.json (atomically, keeping everything else in it).
+    Returns the time written (UTC, ISO-8601)."""
+    state = _load_state(persistent_dir)
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+    state[RESTORE_KEY] = {"remote": remote, "at": at}
+    state["updated_at"] = when
+    path = state_file(persistent_dir)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".state.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            os.chmod(tmp, 0o664)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return at
+
+
+def remove_partial_leftovers(directory: str) -> list[str]:
+    """Delete what a killed download left behind under ``directory``: regular files named
+    ``<name>.<8 hex>.partial``. Links are not followed. Returns the paths removed."""
+    removed: list[str] = []
+    for root, _dirs, files in os.walk(directory, followlinks=False):
+        for name in files:
+            if not _PARTIAL_LEFTOVER.search(name):
+                continue
+            full = os.path.join(root, name)
+            try:
+                if stat.S_ISREG(os.lstat(full).st_mode):
+                    os.remove(full)
+                    removed.append(full)
+            except OSError:
+                continue
+    return removed
+
+
+def restore(
+    spec_file: str,
+    rclone: str | None = None,
+    rclone_config: str | None = None,
+    timeout: float | None = None,
+) -> int:
+    """Copy the declared paths down from the bucket, once per filesystem.
+
+    0 when every path was restored, had nothing in the bucket, or was skipped as a
+    symlink (the upload skips those too), and the record was written; also 0, with no
+    rclone call, when state.json already records a restore from this remote. 1 when any
+    path failed: no record, so the next run restores again; what was restored stays.
+    """
+    try:
+        spec = load_spec(spec_file)
+    except (OSError, ValueError) as e:
+        log(f"no valid sync spec at {spec_file}: {e}")
+        return 1
+    settings = {
+        "rclone": rclone or spec.get("rclone"),
+        "rclone_config": rclone_config or spec.get("rclone_config"),
+    }
+    for name, value in settings.items():
+        if not isinstance(value, str) or not value.startswith("/"):
+            log(f"sync spec {spec_file}: '{name}' must be an absolute path "
+                f"(in the spec or as --{name.replace('_', '-')})")
+            return 1
+
+    remote = spec["remote"].rstrip("/")
+    persistent_dir = spec["persistent_dir"]
+    try:
+        record = read_restore_record(persistent_dir)
+    except (OSError, ValueError) as e:
+        log(f"restore failed: could not read {state_file(persistent_dir)}: {e}")
+        return 1
+    if record is not None and record["remote"] == remote:
+        log(f"already restored from {remote} at {record.get('at', 'an unrecorded time')}; "
+            "nothing downloaded")
+        return 0
+
+    deadline = time.monotonic() + (RESTORE_TIMEOUT if timeout is None else timeout)
+    restored: list[str] = []
+    empty: list[str] = []
+    failed: list[str] = []
+    linked: list[str] = []
+    env = _child_env()
+    log(f"restoring from {remote}")
+
+    for path in spec["paths"]:
+        problem = path_problem(path)
+        if problem:
+            log(f"refused {path!r}: {problem}; a synced path must be relative and inside "
+                "the persistent dir")
+            failed.append(str(path))
+            continue
+        rel = "/".join(_parts(path))
+        kind, detail = classify(persistent_dir, rel)
+        if kind == "symlink":
+            log(f"skipped {rel}: {detail} is a symlink, and nothing is restored through a link")
+            linked.append(rel)
+            continue
+        if kind == "other":
+            log(f"failed {rel}: {detail}")
+            failed.append(rel)
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            log(f"failed {rel}: the restore ran out of time before this path")
+            failed.append(rel)
+            continue
+        dest = os.path.join(persistent_dir, rel)  # "dir" or "missing": rclone creates it
+        cmd = restore_command(settings["rclone"], settings["rclone_config"], f"{remote}/{rel}", dest)
+        try:
+            code = subprocess.run(
+                cmd, env=env, stdin=subprocess.DEVNULL, check=False, timeout=left
+            ).returncode
+        except subprocess.TimeoutExpired:
+            log(f"failed {rel}: the restore ran out of time; rclone was stopped")
+            failed.append(rel)
+            continue
+        except OSError as e:
+            log(f"failed {rel}: could not run {settings['rclone']}: {e.strerror or e}")
+            failed.append(rel)
+            continue
+        if code == RCLONE_DIR_NOT_FOUND:
+            empty.append(rel)
+        elif code != 0:
+            log(f"failed {rel}: rclone exited {code}")
+            failed.append(rel)
+            continue
+        else:
+            restored.append(rel)
+        # rclone has finished with this path, so anything still named like a download in
+        # progress is from an earlier, killed run.
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            for leftover in remove_partial_leftovers(dest):
+                log(f"removed a half-downloaded file left by an earlier restore: {leftover}")
+
+    if failed:
+        log(f"restore failed for: {', '.join(failed)} ({len(restored)} restored). Nothing "
+            "is recorded, so the next run restores again; what was restored stays.")
+        return 1
+    try:
+        at = write_restore_record(persistent_dir, remote, time.time())
+    except (OSError, ValueError) as e:
+        log(f"restore copied everything but could not record it in "
+            f"{state_file(persistent_dir)}: {e}")
+        return 1
+    notes = f"{len(restored)} restored, {len(empty)} with nothing in the bucket"
+    if linked:
+        notes += f", symlinked paths left out: {', '.join(linked)}"
+    log(f"restore ok from {remote}: {notes}; recorded {at}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="datasync.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -241,7 +474,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rclone", help="rclone binary (overrides the spec)")
     p.add_argument("--rclone-config", help="rclone config file (overrides the spec)")
     p.add_argument("--last-success-file", help="where to record the finish time (overrides the spec)")
+    r = sub.add_parser("restore", help="copy the declared paths down from the bucket, once per filesystem")
+    r.add_argument("--spec", required=True, help="JSON spec file")
+    r.add_argument("--rclone", help="rclone binary (overrides the spec)")
+    r.add_argument("--rclone-config", help="rclone config file (overrides the spec)")
     args = parser.parse_args(argv)
+    if args.command == "restore":
+        return restore(args.spec, args.rclone, args.rclone_config)
     return run(args.spec, args.rclone, args.rclone_config, args.last_success_file)
 
 

@@ -8,6 +8,12 @@ import time
 from typing import Any
 
 
+# Where a finished restore from the bucket is recorded: {"remote": ..., "at": <UTC ISO-8601>}.
+# Written on the instance by the standalone runner (datasync.py, which can't import this
+# module and carries the same key).
+RESTORE_KEY = "restore"
+
+
 class State:
     """Manages state.json in the persistent cloudgpu directory."""
 
@@ -67,6 +73,18 @@ class State:
         state = self.load()
         state.get("apps", {}).pop(app_name, None)
         self.save(state)
+
+    def get_restore(self) -> dict[str, Any] | None:
+        """The record of this filesystem's finished restore from the bucket, or None."""
+        record = self.load().get(RESTORE_KEY)
+        if isinstance(record, dict) and isinstance(record.get("remote"), str):
+            return record
+        return None
+
+    def needs_restore(self, remote: str) -> bool:
+        """True when this filesystem was never restored, or was restored from another remote."""
+        record = self.get_restore()
+        return record is None or record["remote"] != remote.rstrip("/")
 
     def list_apps(self) -> dict[str, Any]:
         """List all installed apps."""
