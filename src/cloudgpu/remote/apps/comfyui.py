@@ -6,7 +6,7 @@ import os
 import stat
 import time
 
-from ..installer import AppInstaller
+from ..installer import AppInstaller, clone_repo, needs_clone, restored_names
 from ..run_as_app import app_step
 from ..service import (app_status, ensure_torch, install_requirements_as_app, install_service,
                        prepare_app_dir, prepare_venv_checks, service_active, wipe_venv)
@@ -48,11 +48,12 @@ class ComfyUIInstaller(AppInstaller):
 
         # 1. Clone ComfyUI. The first clone stays ubuntu's: apps_dir isn't cloudgpu-app's to write,
         # and there's nothing planted in a path that doesn't exist yet.
-        fresh = not os.path.exists(self.app_dir)
+        # A directory holding only what a restore from the bucket put there is not an install.
+        fresh = needs_clone(self.app_dir, restored_names(COMFYUI_SYNC_PATHS, "comfyui"))
         if fresh:
             log("Cloning ComfyUI...")
             os.makedirs(self.state.apps_dir, exist_ok=True)
-            run(["git", "clone", COMFYUI_REPO, self.app_dir])
+            clone_repo(COMFYUI_REPO, self.app_dir, run)
         prepare_app_dir(self.app_dir)
         if fresh:
             trust_repo_as_app(self.app_dir)
@@ -122,7 +123,7 @@ class ComfyUIInstaller(AppInstaller):
         """Recover ComfyUI on a new instance."""
         log("Recovering ComfyUI...")
 
-        if not os.path.isdir(self.app_dir):
+        if needs_clone(self.app_dir, restored_names(COMFYUI_SYNC_PATHS, "comfyui")):
             log("App directory missing, doing full install", "warn")
             # Custom nodes live in app_dir: the profiles must put them back.
             self.state.mark_reprovision(self.name)
@@ -157,7 +158,7 @@ class ComfyUIInstaller(AppInstaller):
 
     def get_status(self) -> dict:
         """Get current ComfyUI status."""
-        app_exists = os.path.isdir(self.app_dir)
+        app_exists = os.path.isdir(self.app_dir) and not needs_clone(self.app_dir, restored_names(COMFYUI_SYNC_PATHS, "comfyui"))
         venv_exists = os.path.isdir(self.venv_dir)
         torch_ok = torch_cuda_status(self.venv_dir) if venv_exists else False
 

@@ -12,7 +12,10 @@
 - a copy of the runner (datasync.py), the spec it reads, a oneshot service and a timer.
 
 ``setup`` does not start anything; ``start`` enables the timer. They are separate so a
-restore can run in between. ``remove`` stops the timer and takes the units, key, spec
+restore can run in between: ``restore`` copies the declared paths down from the bucket in a
+one-off restricted run as the sync user, which can write the declared paths and nothing
+else, then shares what arrived with the ``cloudgpu-app`` group and records the restore.
+``remove`` stops the timer and takes the units, key, spec
 and runner copy away, quietly when there was nothing.
 
 Nothing is put on the persistent filesystem, where ``cloudgpu-app`` can write.
@@ -20,6 +23,7 @@ Nothing is put on the persistent filesystem, where ``cloudgpu-app`` can write.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
@@ -29,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -50,6 +55,9 @@ LAST_SUCCESS_FILE = f"{STATE_DIR}/last-success"
 # A run has no rclone timeout of its own. This only stops a hung run from blocking every
 # later one for ever; a first upload of large datasets must still fit inside it.
 RUN_TIMEOUT = "6h"
+RESTORE_UNIT_NAME = "cloudgpu-datasync-restore"
+# Ours on top of the unit's own limit, so a systemd-run that never returns is still ended.
+RESTORE_WAIT_SECONDS = 6 * 60 * 60 + 300
 
 # One pinned rclone. The hashes are those in
 # https://downloads.rclone.org/v1.76.0/SHA256SUMS (fetched 2026-11-15).
@@ -327,6 +335,171 @@ def start() -> None:
     log("Sync timer started.")
 
 
+# --- restore -----------------------------------------------------------------------
+
+def _app_gid() -> int:
+    return grp.getgrnam(APP_USER).gr_gid
+
+
+def _timer_active() -> bool:
+    done = subprocess.run(["sudo", "systemctl", "is-active", "--quiet", f"{UNIT_NAME}.timer"],
+                          check=False, timeout=120)
+    return done.returncode == 0
+
+
+def _make_restore_dir(persistent_dir: str, rel: str) -> None:
+    """Create a declared path that isn't there yet, as this (provisioning) user, not root.
+
+    Directories on the way are plain (755), as the installers' own ``makedirs`` leaves
+    them. The declared directory itself gets the ``cloudgpu-app`` group, group write and
+    setgid, so the sync user (in that group) can write into it and what it writes keeps
+    the group. Nothing is opened through a link: each directory is opened with
+    O_NOFOLLOW and changed through that handle.
+    """
+    parts = datasync._parts(rel)
+    current = persistent_dir
+    for i, part in enumerate(parts):
+        current = os.path.join(current, part)
+        last = i == len(parts) - 1
+        try:
+            os.mkdir(current, 0o755)
+        except FileExistsError:
+            continue
+        if last:
+            fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fchown(fd, -1, _app_gid())
+                os.fchmod(fd, 0o2775)
+            finally:
+                os.close(fd)
+
+
+def prepare_restore_paths(persistent_dir: str, paths: list[str]) -> list[str]:
+    """The declared directories a restore may write, created where missing.
+
+    A path that is a symlink, or under one, is left out and said (the runner says it
+    too and restores nothing there); one that is something else is left for the runner
+    to fail on by name.
+    """
+    writable: list[str] = []
+    for path in paths:
+        rel = "/".join(datasync._parts(path))
+        kind, detail = datasync.classify(persistent_dir, rel)
+        if kind == "missing":
+            try:
+                _make_restore_dir(persistent_dir, rel)
+            except OSError as e:
+                raise SetupError(f"Could not create {rel} to restore into: "
+                                 f"{e.strerror or e}.") from None
+            kind, detail = datasync.classify(persistent_dir, rel)
+        if kind == "symlink":
+            log(f"Not restoring into {rel}: {detail} is a symlink.")
+            continue
+        if kind != "dir":
+            continue
+        full = os.path.join(persistent_dir, rel)
+        if any(c.isspace() for c in full):
+            raise SetupError(f"The synced path {full!r} has a space in it, which the "
+                             "restricted restore cannot be limited to.")
+        writable.append(full)
+    return writable
+
+
+def restore_run_command(writable: list[str]) -> list[str]:
+    """The one-off restricted restore (pure; testable without systemd).
+
+    The upload service's restrictions, as a transient unit, plus ReadWritePaths for the
+    declared directories only: the rest of the persistent dir, state.json included,
+    stays read-only to it. The key reaches it as the upload's does (LoadCredential).
+    UMask 0002 so what rclone creates is group-writable from the start.
+    """
+    properties = [
+        f"User={SYNC_USER}",
+        f"Group={SYNC_USER}",
+        f"SupplementaryGroups={APP_USER}",
+        f"LoadCredential={CREDENTIAL_NAME}:{KEY_PATH}",
+        f"StateDirectory={STATE_DIR_NAME}",
+        "StateDirectoryMode=0750",
+        f"Environment=HOME={STATE_DIR}",
+        "UMask=0002",
+        f"RuntimeMaxSec={RUN_TIMEOUT}",
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        *(f"ReadWritePaths={path}" for path in writable),
+    ]
+    cmd = ["systemd-run", f"--unit={RESTORE_UNIT_NAME}", "--wait", "--collect", "--pipe",
+           "--quiet"]
+    for prop in properties:
+        cmd += ["-p", prop]
+    script = (f"exec /usr/bin/python3 {RUNNER_PATH} restore --no-record --spec {SPEC_PATH} "
+              f'--rclone-config "${{CREDENTIALS_DIRECTORY}}/{CREDENTIAL_NAME}"')
+    return [*cmd, "/bin/sh", "-c", script]
+
+
+def share_restored(writable: list[str]) -> None:
+    """Give what was restored the group and modes of files the apps wrote themselves
+    (the commands of ``service.migrate_ownership``). ``chgrp -h`` and ``chmod -R`` change
+    no link's target, and every path here was checked to be a real directory."""
+    for path in writable:
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        _sudo("chgrp", "-hR", APP_USER, path)
+        _sudo("chmod", "-R", "g+rwX", path)
+        _sudo("find", path, "-type", "d", "-exec", "chmod", "g+s", "{}", "+")
+
+
+def restore(persistent_dir: str) -> None:
+    """Restore this filesystem from the bucket if it hasn't been (between setup and start).
+
+    The record in ``<persistent dir>/cloudgpu/state.json`` is read and written here, by
+    the provisioning user that owns that file, never by the restricted run.
+    """
+    try:
+        spec = datasync.load_spec(SPEC_PATH)
+    except (OSError, ValueError) as e:
+        raise SetupError(f"Sync is not set up on this instance, so nothing can be restored "
+                         f"({e}).") from None
+    remote = spec["remote"].rstrip("/")
+    try:
+        record = datasync.read_restore_record(persistent_dir)
+    except (OSError, ValueError) as e:
+        raise SetupError(f"Could not read {datasync.state_file(persistent_dir)}: {e}") from None
+    if record is not None and record["remote"] == remote:
+        log(f"This filesystem was already restored from {remote} at "
+            f"{record.get('at', 'an unrecorded time')}; nothing downloaded.")
+        return
+
+    # No upload may run while files are arriving: stop the timer and any run in progress.
+    timer_was_active = _timer_active()
+    if timer_was_active:
+        _sudo("systemctl", "stop", f"{UNIT_NAME}.timer")
+    _sudo_quiet("systemctl", "stop", f"{UNIT_NAME}.service")
+    writable: list[str] = []
+    try:
+        writable = prepare_restore_paths(persistent_dir, spec["paths"])
+        log(f"Restoring {len(spec['paths'])} paths from {remote}...")
+        try:
+            code = subprocess.run(["sudo", *restore_run_command(writable)], check=False,
+                                  timeout=RESTORE_WAIT_SECONDS).returncode
+        finally:
+            # Also after a failure: the paths that did restore stay, and must be usable.
+            share_restored(writable)
+        if code != 0:
+            raise SetupError(f"The restore from {remote} failed (the paths are named above). "
+                             "Nothing is recorded, so the next up restores again.")
+        try:
+            at = datasync.write_restore_record(persistent_dir, remote, time.time())
+        except (OSError, ValueError) as e:
+            raise SetupError(f"The restore copied everything but could not record it in "
+                             f"{datasync.state_file(persistent_dir)}: {e}") from None
+        log(f"Restored from {remote}; recorded {at}.")
+    finally:
+        if timer_was_active:
+            _sudo("systemctl", "start", f"{UNIT_NAME}.timer")
+
+
 def remove() -> None:
     """Stop the timer and remove units, key, spec and runner copy (silent when absent).
 
@@ -338,6 +511,7 @@ def remove() -> None:
         return
     _sudo_quiet("systemctl", "disable", "--now", f"{UNIT_NAME}.timer")
     _sudo_quiet("systemctl", "stop", f"{UNIT_NAME}.service")
+    _sudo_quiet("systemctl", "stop", f"{RESTORE_UNIT_NAME}.service")
     _sudo("rm", "-f", *files)
     _sudo("systemctl", "daemon-reload")
     log("Sync removed from this instance.")
@@ -358,6 +532,8 @@ def main(action: str, persistent_dir: str, key_file: str | None = None,
                 start()
         elif action == "start":
             start()
+        elif action == "restore":
+            restore(persistent_dir)
         else:
             remove()
     except SetupError as e:

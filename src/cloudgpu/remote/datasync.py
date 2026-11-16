@@ -356,8 +356,12 @@ def restore(
     rclone: str | None = None,
     rclone_config: str | None = None,
     timeout: float | None = None,
+    record: bool = True,
 ) -> int:
     """Copy the declared paths down from the bucket, once per filesystem.
+
+    ``record=False`` (``--no-record``) is for the restricted run, which cannot write
+    state.json: it neither reads nor writes the record; its caller does both.
 
     0 when every path was restored, had nothing in the bucket, or was skipped as a
     symlink (the upload skips those too), and the record was written; also 0, with no
@@ -381,15 +385,16 @@ def restore(
 
     remote = spec["remote"].rstrip("/")
     persistent_dir = spec["persistent_dir"]
-    try:
-        record = read_restore_record(persistent_dir)
-    except (OSError, ValueError) as e:
-        log(f"restore failed: could not read {state_file(persistent_dir)}: {e}")
-        return 1
-    if record is not None and record["remote"] == remote:
-        log(f"already restored from {remote} at {record.get('at', 'an unrecorded time')}; "
-            "nothing downloaded")
-        return 0
+    if record:
+        try:
+            found = read_restore_record(persistent_dir)
+        except (OSError, ValueError) as e:
+            log(f"restore failed: could not read {state_file(persistent_dir)}: {e}")
+            return 1
+        if found is not None and found["remote"] == remote:
+            log(f"already restored from {remote} at {found.get('at', 'an unrecorded time')}; "
+                "nothing downloaded")
+            return 0
 
     deadline = time.monotonic() + (RESTORE_TIMEOUT if timeout is None else timeout)
     restored: list[str] = []
@@ -453,15 +458,18 @@ def restore(
         log(f"restore failed for: {', '.join(failed)} ({len(restored)} restored). Nothing "
             "is recorded, so the next run restores again; what was restored stays.")
         return 1
+    notes = f"{len(restored)} restored, {len(empty)} with nothing in the bucket"
+    if linked:
+        notes += f", symlinked paths left out: {', '.join(linked)}"
+    if not record:
+        log(f"restore copied from {remote}: {notes}; the caller records it")
+        return 0
     try:
         at = write_restore_record(persistent_dir, remote, time.time())
     except (OSError, ValueError) as e:
         log(f"restore copied everything but could not record it in "
             f"{state_file(persistent_dir)}: {e}")
         return 1
-    notes = f"{len(restored)} restored, {len(empty)} with nothing in the bucket"
-    if linked:
-        notes += f", symlinked paths left out: {', '.join(linked)}"
     log(f"restore ok from {remote}: {notes}; recorded {at}")
     return 0
 
@@ -478,9 +486,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--spec", required=True, help="JSON spec file")
     r.add_argument("--rclone", help="rclone binary (overrides the spec)")
     r.add_argument("--rclone-config", help="rclone config file (overrides the spec)")
+    r.add_argument("--no-record", action="store_true",
+                   help="neither read nor write the restore record (the caller does)")
     args = parser.parse_args(argv)
     if args.command == "restore":
-        return restore(args.spec, args.rclone, args.rclone_config)
+        return restore(args.spec, args.rclone, args.rclone_config, record=not args.no_record)
     return run(args.spec, args.rclone, args.rclone_config, args.last_success_file)
 
 

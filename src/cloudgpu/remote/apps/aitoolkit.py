@@ -8,7 +8,7 @@ import stat
 import sys
 import time
 
-from ..installer import AppInstaller
+from ..installer import AppInstaller, clone_repo, needs_clone, restored_names
 from ..run_as_app import CouldNotRun, app_step
 from ..service import (app_status, ensure_torch, install_requirements_as_app, install_service,
                        prepare_app_dir, prepare_venv_checks, service_active, wipe_venv)
@@ -111,11 +111,12 @@ class AIToolkitInstaller(AppInstaller):
 
         # 1. Clone repo. The first clone stays ubuntu's: apps_dir isn't cloudgpu-app's to write,
         # and there's nothing planted in a path that doesn't exist yet.
-        fresh = not os.path.exists(self.app_dir)
+        # A directory holding only what a restore from the bucket put there is not an install.
+        fresh = needs_clone(self.app_dir, restored_names(AITOOLKIT_SYNC_PATHS, "ai-toolkit"))
         if fresh:
             log("Cloning AI Toolkit...")
             os.makedirs(self.state.apps_dir, exist_ok=True)
-            run(["git", "clone", AITOOLKIT_REPO, self.app_dir])
+            clone_repo(AITOOLKIT_REPO, self.app_dir, run)
         prepare_app_dir(self.app_dir)
         if fresh:
             trust_repo_as_app(self.app_dir)
@@ -181,7 +182,7 @@ class AIToolkitInstaller(AppInstaller):
         """Recover AI Toolkit on a new instance."""
         log("Recovering AI Toolkit...")
 
-        if not os.path.isdir(self.app_dir):
+        if needs_clone(self.app_dir, restored_names(AITOOLKIT_SYNC_PATHS, "ai-toolkit")):
             log("App directory missing, doing full install", "warn")
             # The new install gets a new venv: the profiles must put back what they put in it.
             self.state.mark_reprovision(self.name)
@@ -233,7 +234,7 @@ class AIToolkitInstaller(AppInstaller):
 
     def get_status(self) -> dict:
         """Get current AI Toolkit status."""
-        app_exists = os.path.isdir(self.app_dir)
+        app_exists = os.path.isdir(self.app_dir) and not needs_clone(self.app_dir, restored_names(AITOOLKIT_SYNC_PATHS, "ai-toolkit"))
         venv_exists = os.path.isdir(self.venv_dir)
         torch_ok = torch_cuda_status(self.venv_dir) if venv_exists else False
         ui_built = self._ui_built()

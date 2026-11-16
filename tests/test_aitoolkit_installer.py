@@ -251,3 +251,75 @@ class TestAIToolkitInstaller:
 
     def test_verify_not_installed(self, installer):
         assert installer.verify() is False
+
+
+class TestInstallAfterARestore:
+    """3.3: a restore puts apps/ai-toolkit/datasets there before ai-toolkit was installed."""
+
+    @pytest.fixture(autouse=True)
+    def no_real_sudo(self):
+        module = "cloudgpu.remote.apps.aitoolkit"
+        with (patch(f"{module}.prepare_venv_checks"), patch(f"{module}.prepare_app_dir"),
+              patch(f"{module}.trust_repo_as_app") as trust, patch(f"{module}.git_pull_as_app") as pull,
+              patch(f"{module}.git_version_as_app", return_value="abc1234"),
+              patch(f"{module}.install_service"), patch(f"{module}.pip_install"),
+              patch(f"{module}.check_torch_cuda", return_value=True),
+              patch.object(AIToolkitInstaller, "_install_requirements"),
+              patch.object(AIToolkitInstaller, "_build_ui"),
+              patch.object(AIToolkitInstaller, "_ensure_node"),
+              patch.object(AIToolkitInstaller, "_ensure_torch"),
+              patch.object(AIToolkitInstaller, "_create_venv")):
+            self.trust, self.pull = trust, pull
+            yield
+
+    @pytest.fixture
+    def installer(self, tmp_persistent_dir):
+        return AIToolkitInstaller(State(tmp_persistent_dir))
+
+    @staticmethod
+    def _run(clones):
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["git", "clone"]:
+                dest = cmd[-1]
+                clones.append(cmd)
+                os.makedirs(os.path.join(dest, ".git"))
+                os.makedirs(os.path.join(dest, "ui"))
+                os.makedirs(os.path.join(dest, "output"))
+                for name, text in (("run.py", "# run"), ("requirements.txt", "pyyaml\n"),
+                                   ("output/.gitkeep", "")):
+                    with open(os.path.join(dest, name), "w") as f:
+                        f.write(text)
+            return MagicMock(returncode=0, stdout="abc1234\n")
+        return run
+
+    def test_install_over_restored_directories_still_clones_and_keeps_the_files(self, installer):
+        restored = {}
+        for rel, text in (("datasets/cats/1.jpg", "a cat"), ("output/my-lora/lora.safetensors", "weights")):
+            path = os.path.join(installer.app_dir, rel)
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as f:
+                f.write(text)
+            restored[path] = text
+        clones = []
+        with patch("cloudgpu.remote.apps.aitoolkit.run", self._run(clones)):
+            installer.install()
+        assert len(clones) == 1
+        assert os.path.isdir(os.path.join(installer.app_dir, ".git"))
+        assert os.path.isfile(os.path.join(installer.app_dir, "run.py"))
+        assert os.path.isdir(installer.ui_dir)
+        assert os.path.isfile(os.path.join(installer.app_dir, "output", ".gitkeep"))
+        for path, text in restored.items():
+            with open(path) as f:
+                assert f.read() == text
+        self.trust.assert_called_once_with(installer.app_dir)
+        self.pull.assert_not_called()
+        assert installer.state.get_app("ai-toolkit")["status"] == "installed"
+        assert os.path.islink(os.path.join(installer.app_dir, "venv"))
+        assert not os.path.exists(installer.app_dir + ".clone")
+
+    def test_recover_with_only_restored_directories_does_a_full_install(self, installer):
+        os.makedirs(os.path.join(installer.app_dir, "datasets"))
+        clones = []
+        with patch("cloudgpu.remote.apps.aitoolkit.run", self._run(clones)):
+            installer.recover()
+        assert len(clones) == 1 and os.path.isfile(os.path.join(installer.app_dir, "run.py"))
