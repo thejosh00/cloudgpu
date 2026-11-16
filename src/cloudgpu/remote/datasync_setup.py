@@ -15,6 +15,8 @@
 restore can run in between: ``restore`` copies the declared paths down from the bucket in a
 one-off restricted run as the sync user, which can write the declared paths and nothing
 else, then shares what arrived with the ``cloudgpu-app`` group and records the restore.
+``final`` is the last upload before the instance is terminated: it stops the timer, lets
+a run in progress finish, runs the service once more and says whether that run worked.
 ``remove`` stops the timer and takes the units, key, spec
 and runner copy away, quietly when there was nothing.
 
@@ -23,6 +25,7 @@ Nothing is put on the persistent filesystem, where ``cloudgpu-app`` can write.
 
 from __future__ import annotations
 
+import calendar
 import grp
 import hashlib
 import json
@@ -58,6 +61,9 @@ RUN_TIMEOUT = "6h"
 RESTORE_UNIT_NAME = "cloudgpu-datasync-restore"
 # Ours on top of the unit's own limit, so a systemd-run that never returns is still ended.
 RESTORE_WAIT_SECONDS = 6 * 60 * 60 + 300
+# The same for the final sync: RUN_TIMEOUT plus a margin, for each of its two waits.
+FINAL_WAIT_SECONDS = 6 * 60 * 60 + 300
+FINAL_POLL_SECONDS = 5
 
 # One pinned rclone. The hashes are those in
 # https://downloads.rclone.org/v1.76.0/SHA256SUMS (fetched 2026-11-15).
@@ -500,6 +506,85 @@ def restore(persistent_dir: str) -> None:
             _sudo("systemctl", "start", f"{UNIT_NAME}.timer")
 
 
+# --- final sync --------------------------------------------------------------------
+
+def _service_property(name: str) -> str:
+    done = subprocess.run(["sudo", "systemctl", "show", f"--property={name}", "--value",
+                           f"{UNIT_NAME}.service"],
+                          check=False, timeout=120, capture_output=True, text=True)
+    return (done.stdout or "").strip()
+
+
+def _last_success() -> tuple[float, str] | None:
+    """(seconds, text as written) of the last good run, or None. Read with sudo: the
+    directory is the sync user's."""
+    done = subprocess.run(["sudo", "cat", LAST_SUCCESS_FILE], check=False, timeout=120,
+                          capture_output=True, text=True)
+    text = (done.stdout or "").strip()
+    if done.returncode != 0 or not text:
+        return None
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")), text
+    except ValueError:
+        return None
+
+
+def _final_failure(why: str) -> SetupError:
+    last = _last_success()
+    then = (f"The last successful sync finished at {last[1]}." if last
+            else "There has been no successful sync from this instance.")
+    return SetupError(f"{why} {then}")
+
+
+def final() -> None:
+    """One complete upload that started after this was asked for, before termination.
+
+    The timer is stopped first so no later run starts. A run in progress is waited for,
+    not joined: it may already have listed directories that changed since. Then the
+    service runs once more. After any failure the timer is started again.
+    """
+    if not all(os.path.exists(p) for p in (SPEC_PATH, service_path(), timer_path())):
+        raise SetupError("Sync is not set up on this instance, so there is no final sync "
+                         "to do.")
+    service = f"{UNIT_NAME}.service"
+    _sudo("systemctl", "stop", f"{UNIT_NAME}.timer")
+    done = False
+    try:
+        deadline = time.monotonic() + FINAL_WAIT_SECONDS
+        waited = False
+        while _service_property("ActiveState") in ("activating", "deactivating"):
+            if not waited:
+                log("A sync run is in progress; waiting for it to finish...")
+                waited = True
+            if time.monotonic() >= deadline:
+                raise _final_failure("The sync run in progress did not finish in "
+                                     f"{RUN_TIMEOUT}, so no final sync was run.")
+            time.sleep(FINAL_POLL_SECONDS)
+        log("Running the final sync...")
+        # Whole seconds, as the last-success time is written.
+        started = int(time.time())
+        try:
+            # Starting a oneshot returns when its run has ended, non-zero if it failed.
+            code = subprocess.run(["sudo", "systemctl", "start", service], check=False,
+                                  timeout=FINAL_WAIT_SECONDS).returncode
+        except subprocess.TimeoutExpired:
+            raise _final_failure(f"The final sync did not finish in {RUN_TIMEOUT}.") from None
+        result = _service_property("Result")
+        if code != 0 or result != "success":
+            raise _final_failure(f"The final sync run failed (result: {result or 'unknown'}).")
+        last = _last_success()
+        if last is None or last[0] < started:
+            raise _final_failure("The final sync run ended without recording a success.")
+        done = True
+        log(f"Final sync finished at {last[1]}. The sync timer stays stopped.")
+    finally:
+        if not done:
+            again = subprocess.run(["sudo", "systemctl", "start", f"{UNIT_NAME}.timer"],
+                                   check=False, timeout=120)
+            log("The sync timer is running again." if again.returncode == 0
+                else "The sync timer could not be started again.")
+
+
 def remove() -> None:
     """Stop the timer and remove units, key, spec and runner copy (silent when absent).
 
@@ -534,6 +619,8 @@ def main(action: str, persistent_dir: str, key_file: str | None = None,
             start()
         elif action == "restore":
             restore(persistent_dir)
+        elif action == "final":
+            final()
         else:
             remove()
     except SetupError as e:
