@@ -251,15 +251,15 @@ def test_install_and_start_are_two_remote_calls_in_that_order(tmp_path):
     with FakeLambda() as fake:
         result = _up(fake, tmp_path)
     assert result.returncode == 0, result.output
-    assert _datasync(result) == ["setup", "start"], result.output
+    assert _datasync(result) == ["setup", "restore", "start"], result.output
     [setup] = [c["command"] for c in result.shim_calls if " datasync setup" in c["command"]]
     assert "--start" not in setup, setup
     # Inside "arm the cap": after the cap's own call, before recovery.
     remote = [c["command"] for c in result.shim_calls if c["tool"] == "ssh" and "python3 -m remote" in c["command"]]
     kinds = [c.split("--persistent-dir ", 1)[1].split(" ", 1)[1] for c in remote]
     at = kinds.index("autoterminate --hours 0")
-    assert [k.split(" --")[0] for k in kinds[at:at + 4]] == [
-        "autoterminate", "datasync setup", "datasync start", "status"], kinds
+    assert [k.split(" --")[0] for k in kinds[at:at + 5]] == [
+        "autoterminate", "datasync setup", "datasync restore", "datasync start", "status"], kinds
 
 
 # (8)
@@ -325,7 +325,7 @@ def test_a_second_up_converges_again_and_removing_sync_takes_it_away(tmp_path):
         assert result.returncode == 0, result.output
         assert _steps(result) == PLAN_ORDER, result.output
     assert launches == 1
-    assert _datasync(first) == ["setup", "start"] and _datasync(second) == ["setup", "start"]
+    assert _datasync(first) == ["setup", "restore", "start"] and _datasync(second) == ["setup", "restore", "start"]
     assert _sent_text(second, cli.SYNC_KEY_TRANSFER) == _sent_text(first, cli.SYNC_KEY_TRANSFER)
     assert _sent_text(second, cli.SYNC_REQUEST_TRANSFER) == _sent_text(first, cli.SYNC_REQUEST_TRANSFER)
     assert _datasync(third) == ["remove"], third.output
@@ -335,7 +335,7 @@ def test_a_second_up_converges_again_and_removing_sync_takes_it_away(tmp_path):
 # (10)
 @pytest.mark.parametrize("fail_on, config_extra, sentence, ran", [
     (" datasync setup", SYNC, "Could not set up the bucket sync", ["setup"]),
-    (" datasync start", SYNC, "Could not start the bucket sync timer", ["setup", "start"]),
+    (" datasync start", SYNC, "Could not start the bucket sync timer", ["setup", "restore", "start"]),
     (" datasync remove", "", "Could not remove the bucket sync", ["remove"]),
 ], ids=["setup", "start", "remove"])
 def test_a_failed_remote_sync_step_fails_up_in_a_sentence_and_keeps_the_instance(

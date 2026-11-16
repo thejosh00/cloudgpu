@@ -815,6 +815,37 @@ def _install_sync(config_name: str, runtime: dict, persistent_dir: str, plan: di
         _stop_sync_failed(config_name, runtime, "Could not set up the bucket sync", e)
 
 
+# A restore of real datasets can take hours; the instance bounds it (datasync_setup's
+# RESTORE_WAIT_SECONDS: the six-hour run limit plus five minutes), and this waits a little longer.
+RESTORE_SSH_TIMEOUT = 6 * 60 * 60 + 600
+
+
+def _restore_from_bucket(config_name: str, runtime: dict, persistent_dir: str, plan: dict) -> None:
+    """Bring the declared paths down from the bucket if this filesystem has not been restored
+    (the instance decides, and says so). Before the timer and before any service starts.
+
+    What the remote tool says goes to stderr; it is shown here, on success and on failure,
+    in place of the ssh command line. The bucket key is never in it: the remote tool passes
+    rclone the key file's path only.
+    """
+    remote = escape(plan["remote"])
+    display.info(f"Restoring from {remote} if this filesystem has not been restored yet "
+                 "(a first restore of large files can take a long time)...")
+    try:
+        result = ssh.ssh_run(runtime["host"], _remote_cmd(persistent_dir, "datasync", ["restore"]),
+                             timeout=RESTORE_SSH_TIMEOUT)
+    except (ssh.SSHError, subprocess.SubprocessError, OSError) as e:
+        _stop_sync_failed(config_name, runtime, f"Could not restore from {plan['remote']}", e)
+    said = [line.removeprefix(">>> ").removeprefix("error: ").strip()
+            for line in result.stderr.splitlines() if line.strip()]
+    if not result.ok:
+        why = "\n".join(said) or f"the remote restore exited {result.returncode} and said nothing"
+        _stop_sync_failed(config_name, runtime, f"Could not restore from {plan['remote']}",
+                          RuntimeError(f"{why}\nNo service was started and the sync timer was not started."))
+    for line in said:
+        display.info(escape(line))
+
+
 def _start_sync_timer(config_name: str, runtime: dict, persistent_dir: str) -> None:
     """Start (or keep running) the sync timer that `_install_sync` put in place."""
     try:
@@ -1124,9 +1155,11 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
         state.pop("auto_terminate_at", None)
     configs.save_state(config_name, state)
     # Same step, after the cap: like it, the sync lives on the instance's own disk, so every
-    # `up` puts it back (or takes it away). Two calls, so a restore can later go between them.
+    # `up` puts it back (or takes it away). The restore goes between install and start: no
+    # upload runs while files arrive, and no service has started yet (recovery is the next step).
     if sync_plan:
         _install_sync(config_name, state, persistent_dir, sync_plan)
+        _restore_from_bucket(config_name, state, persistent_dir, sync_plan)
         _start_sync_timer(config_name, state, persistent_dir)
     else:
         _remove_sync(config_name, state, persistent_dir)

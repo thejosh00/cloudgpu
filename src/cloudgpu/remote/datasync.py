@@ -24,7 +24,8 @@ in it is skipped and named.
 ``restore`` is the other direction, run once per filesystem before any service starts:
 ``rclone copy <remote>/<path> <persistent dir>/<path>`` per declared path, skipping every
 file that already exists locally, then a record in the filesystem's own state.json (see
-``restore`` below).
+``restore`` below). Before the copies, one ``rclone lsf --max-depth 1 <name>:<bucket>``
+checks the remote can be reached at all.
 
 This file must stay standalone (stdlib imports only, no package-relative imports): it
 runs from a root-owned copy outside the package, as a user that is not root, via
@@ -72,6 +73,14 @@ RCLONE_DIR_NOT_FOUND = 3
 # One restore, all paths together, may take this long: the same six hours as the upload
 # run's RUN_TIMEOUT (datasync_setup.py), enforced here rather than left to a unit.
 RESTORE_TIMEOUT = 6 * 60 * 60
+
+# Before any copy, one listing of the bucket's top level tells an unreachable remote (wrong
+# key, missing bucket, no network: any non-zero exit) from a reachable one whose prefix is
+# still empty (exit 0, possibly listing nothing). Exit 3 from a copy alone can't be trusted
+# to tell a missing bucket from an empty prefix. It has its own bound, before RESTORE_TIMEOUT
+# starts.
+REACH_FLAGS = ("--max-depth", "1")
+REACH_TIMEOUT = 300
 
 # What rclone's local backend names a download in progress: <name>.<8 hex>.partial
 _PARTIAL_LEFTOVER = re.compile(r"\.[0-9a-f]{8}\.partial$")
@@ -274,6 +283,18 @@ def restore_command(rclone: str, rclone_config: str, source: str, dest: str) -> 
     return [rclone, "copy", "--config", rclone_config, *RESTORE_FLAGS, source, dest]
 
 
+def bucket_root(remote: str) -> str:
+    """``name:bucket`` of ``name:bucket/some/prefix`` (``name:`` when there is no bucket)."""
+    name, _, rest = remote.partition(":")
+    return f"{name}:{rest.strip('/').split('/')[0]}"
+
+
+def reach_command(rclone: str, rclone_config: str, remote: str) -> list[str]:
+    """The one rclone call that checks the remote can be reached (pure): list the top level
+    of the bucket. It downloads nothing and its listing is thrown away."""
+    return [rclone, "lsf", "--config", rclone_config, *REACH_FLAGS, bucket_root(remote)]
+
+
 def state_file(persistent_dir: str) -> str:
     return os.path.join(persistent_dir, "cloudgpu", "state.json")
 
@@ -396,7 +417,6 @@ def restore(
                 "nothing downloaded")
             return 0
 
-    deadline = time.monotonic() + (RESTORE_TIMEOUT if timeout is None else timeout)
     restored: list[str] = []
     empty: list[str] = []
     failed: list[str] = []
@@ -404,6 +424,24 @@ def restore(
     env = _child_env()
     log(f"restoring from {remote}")
 
+    reach = reach_command(settings["rclone"], settings["rclone_config"], remote)
+    try:
+        code = subprocess.run(
+            reach, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=False,
+            timeout=min(REACH_TIMEOUT, RESTORE_TIMEOUT if timeout is None else timeout),
+        ).returncode
+        why = f"exited {code}" if code else ""
+    except subprocess.TimeoutExpired:
+        why = "did not answer in time"
+    except OSError as e:
+        why = f"could not be run: {e.strerror or e}"
+    if why:
+        log(f"restore failed: the remote could not be reached (rclone lsf {reach[-1]} {why}); "
+            "nothing was downloaded and nothing is recorded")
+        return 1
+
+    # The copies' time starts here: the check above has its own, shorter bound.
+    deadline = time.monotonic() + (RESTORE_TIMEOUT if timeout is None else timeout)
     for path in spec["paths"]:
         problem = path_problem(path)
         if problem:

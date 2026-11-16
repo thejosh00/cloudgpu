@@ -273,7 +273,7 @@ def test_no_record_runner_neither_reads_nor_writes_state_json(tmp_path, monkeypa
                         lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0))
     code = datasync.main(["restore", "--no-record", "--spec", str(spec),
                           "--rclone", "/x/rclone", "--rclone-config", "/x/conf"])
-    assert code == 0 and len(seen) == 1
+    assert code == 0 and [c[1] for c in seen] == ["lsf", "copy"]  # part 3: the reachable check first
     assert (fs / "cloudgpu/state.json").read_text() == "{ not json"
     assert [p.name for p in (fs / "cloudgpu").iterdir()] == ["state.json"]
 

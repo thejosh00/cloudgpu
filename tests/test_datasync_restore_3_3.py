@@ -29,6 +29,9 @@ here = os.path.dirname(os.path.abspath(__file__))
 argv = sys.argv[1:]
 with open(os.path.join(here, "calls.jsonl"), "a") as f:
     f.write(json.dumps({{"argv": argv, "env": dict(os.environ)}}) + "\\n")
+if argv[0] == "lsf":  # the reachable check: <bin>/reach-exit holds a forced exit code
+    reach = os.path.join(here, "reach-exit")
+    sys.exit(int(open(reach).read()) if os.path.exists(reach) else 0)
 if os.path.exists(os.path.join(here, "sleep")):
     time.sleep(float(open(os.path.join(here, "sleep")).read()))
 source, dest = argv[-2], argv[-1]
@@ -100,11 +103,21 @@ class Box:
     def force_exit(self, **codes: int) -> None:
         (self.bin / "exit.json").write_text(json.dumps(codes))
 
-    def calls(self) -> list[dict]:
+    def all_calls(self) -> list[dict]:
         log = self.bin / "calls.jsonl"
         if not log.exists():
             return []
         return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def calls(self) -> list[dict]:
+        """The copy calls (the reachable check, `lsf`, is in reach_calls)."""
+        return [c for c in self.all_calls() if c["argv"][0] != "lsf"]
+
+    def reach_calls(self) -> list[dict]:
+        return [c for c in self.all_calls() if c["argv"][0] == "lsf"]
+
+    def fail_reach(self, code: int) -> None:
+        (self.bin / "reach-exit").write_text(str(code))
 
     def record(self) -> dict | None:
         if not self.state.exists():
@@ -222,7 +235,8 @@ def test_rclone_that_cannot_be_run_fails_and_writes_no_record(datasync, box, cap
     """Catches: a missing rclone binary raising a traceback or being recorded as restored."""
     box.write_spec(["a"], rclone="/nowhere/rclone")
     rc, out = restore(datasync, box, capfd)
-    assert rc == 1 and "restore failed for: a" in out
+    # Part 3: the reachable check is rclone's first call, so that is where this now stops.
+    assert rc == 1 and "restore failed: the remote could not be reached" in out
     assert box.record() is None
 
 
@@ -419,3 +433,74 @@ def test_the_file_restores_as_a_standalone_script(datasync, box, tmp_path):
     assert (box.root / "a/a.png").read_text() == "from the bucket"
     assert box.record()["remote"] == REMOTE
     assert SECRET not in done.stdout + done.stderr
+
+
+# --- the remote is reachable before anything is copied (part 3) ---------------------------
+
+
+def test_one_reachable_check_on_the_bucket_root_before_any_copy(datasync, box, capfd):
+    """Catches: no check at all (a missing bucket read as "nothing to restore" and recorded),
+    a check after the copies, a check per path, or one that lists the prefix (which may not
+    exist yet) instead of the bucket."""
+    box.in_bucket("datasets")
+    box.write_spec(["datasets", "apps/comfyui/output"])
+    code, _ = restore(datasync, box, capfd)
+    assert code == 0
+    argvs = [c["argv"] for c in box.all_calls()]
+    assert argvs[0] == ["lsf", "--config", str(box.config), "--max-depth", "1", "b2:bkt"]
+    assert [a[0] for a in argvs] == ["lsf", "copy", "copy"]
+
+
+@pytest.mark.parametrize("code", [1, 3, 5, 7])
+def test_unreachable_remote_fails_before_any_copy_and_writes_no_record(datasync, box, capfd, code):
+    """Catches: a wrong key, missing bucket (exit 3 here too) or dead network going on to the
+    copies, where exit 3 would be read as an empty bucket and the restore recorded."""
+    box.in_bucket("datasets")
+    box.write_spec(["datasets"])
+    box.fail_reach(code)
+    rc, out = restore(datasync, box, capfd)
+    assert rc == 1
+    assert "could not be reached" in out and "b2:bkt" in out, out
+    assert box.calls() == [] and len(box.reach_calls()) == 1
+    assert box.record() is None
+    assert not (box.root / "datasets").exists()
+
+
+def test_reachable_check_carries_no_key_and_no_rclone_environment(datasync, box, capfd, monkeypatch):
+    """Catches: the key (or an RCLONE_* flag in disguise) reaching the check's argv,
+    environment or the output."""
+    monkeypatch.setenv("RCLONE_COPY_LINKS", "true")
+    box.write_spec(["datasets"])
+    box.fail_reach(1)
+    _, out = restore(datasync, box, capfd)
+    (call,) = box.reach_calls()
+    assert SECRET not in json.dumps(call) and SECRET not in out
+    assert not [k for k in call["env"] if k.upper().startswith("RCLONE_")]
+
+
+def test_already_restored_makes_no_reachable_check_either(datasync, box, capfd):
+    """Catches: every later `up` depending on the bucket being reachable although nothing
+    would be downloaded."""
+    box.write_spec(["datasets"])
+    assert restore(datasync, box, capfd)[0] == 0
+    before = len(box.all_calls())
+    box.fail_reach(1)
+    code, out = restore(datasync, box, capfd)
+    assert code == 0 and "already restored" in out
+    assert len(box.all_calls()) == before
+
+
+def test_reachable_check_that_cannot_run_or_hangs_fails_without_a_record(datasync, box, capfd):
+    """Catches: a missing rclone binary raising a traceback out of the check."""
+    box.write_spec(["datasets"], rclone=str(box.bin / "nope"))
+    rc, out = restore(datasync, box, capfd)
+    assert rc == 1 and "could not be reached" in out and box.record() is None
+
+
+def test_bucket_root_of_a_remote():
+    """Catches: listing the prefix rather than the bucket, or mangling a remote with no bucket."""
+    from cloudgpu.remote import datasync
+
+    assert datasync.bucket_root("b2:bkt/small/deeper") == "b2:bkt"
+    assert datasync.bucket_root("b2:bkt") == "b2:bkt"
+    assert datasync.bucket_root("alias:") == "alias:"
