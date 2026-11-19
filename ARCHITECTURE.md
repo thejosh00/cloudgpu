@@ -148,7 +148,7 @@ example `tests/test_api_errors_0_12.py`). Nothing runs the remote half against a
 and there's no evidence script (rung 3).
 
 ```bash
-uv run --frozen --extra dev pytest                     # whole suite, over six minutes (6:36 when measured at 5dea7a9 by the architect)
+uv run --frozen --extra dev pytest                     # whole suite, about 7 minutes (6:52 on 2026-11-19: 1113 passed, 1 skipped)
 uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` against the fake
 ```
 
