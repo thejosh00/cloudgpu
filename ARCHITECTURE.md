@@ -1,6 +1,6 @@
 # cloudgpu — architecture
 
-Last checked against: `710782a` on 2026-11-09
+Last checked against: `5dea7a9` on 2026-11-19
 
 ## Purpose and boundaries
 
@@ -57,7 +57,7 @@ flowchart LR
 | Manual-flow host | ~/.config/cloudgpu/config.json (`src/cloudgpu/local/config.py`) | yes (local) | no |
 | Capacity samples | ~/.local/state/cloudgpu/capacity.jsonl, append-only | yes (local) | no |
 | App records, re-provision marks, restore record | cloudgpu/state.json on the persistent filesystem | yes | no |
-| Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | no (v2 phase 3 plans a bucket sync) |
+| Remote tool, launch scripts, apps, venvs, models | cloudgpu/remote, cloudgpu/bin, apps/, venvs/ on the filesystem | yes | only the declared sync paths, and only with `[sync]` in the config: the timer uploads them to your bucket (`src/cloudgpu/remote/datasync.py`; by default ComfyUI's output, input and user, and AI Toolkit's datasets and output). The rest, models and venvs included, is not |
 | Instance marker, autoterminate config with key | /var/lib/cloudgpu/instance, /etc/cloudgpu/ (instance disk) | no | no |
 | Bucket key (rclone config), sync spec, runner copy | /etc/cloudgpu/rclone.conf (root, 600), /etc/cloudgpu/datasync.json, /etc/cloudgpu/datasync.py (instance disk) | no | no; the key's original is ~/.config/cloudgpu/rclone.conf on your machine, and `up` sends the remote's section again each time |
 | Pinned rclone | /usr/local/lib/cloudgpu/rclone-v<version>/rclone (root-owned, instance disk) | no | no; downloaded again and checked against the pinned SHA-256 |
@@ -117,7 +117,10 @@ whatever happens; other remotes in the file stay behind.
 | I19 | A local state file that can't be used stops every command that reads it, before any Lambda call, with the file unchanged | `tests/test_state_file_2_2.py`: "test_a_corrupt_state_file_stops_the_command" |
 | I20 | `up` reports success and exits 0 only if every service app on the machine (recorded apps plus this `up`'s) is running as systemd on the instance reports it, after a settle when `up` restarted them; a check that can't be made is a failure, and a failed verify changes nothing | `tests/test_up_verify_2_3.py`: "test_up_fails_when_a_service_is_not_running_after_the_restart", "test_up_fails_in_a_sentence_when_the_check_cannot_be_made" |
 | I21 | Only the config's own remote section of rclone.conf goes to the instance, as file content; the bucket key is in no ssh or rsync command line, no ssh environment and no output | `tests/test_datasync_up_3_2.py`: "test_only_the_remotes_section_travels_and_the_key_is_in_no_command" |
-| I22 | With `[sync]` and no usable key section, `up` stops before any Lambda call or ssh; a failed sync setup, start or removal fails `up` with the instance still tracked | `tests/test_datasync_up_3_2.py`: "test_up_with_sync_stops_before_any_launch_or_ssh_without_the_key", "test_a_failed_remote_sync_step_fails_up_in_a_sentence_and_keeps_the_instance" |
+| I22 | With `[sync]` and no usable key section, `up` stops before any Lambda call or ssh; a failed sync setup, restore, start or removal fails `up` with the instance still tracked, and after a failed restore `up` runs nothing more on the instance | `tests/test_datasync_up_3_2.py`: "test_up_with_sync_stops_before_any_launch_or_ssh_without_the_key", "test_a_failed_remote_sync_step_fails_up_in_a_sentence_and_keeps_the_instance" (setup, start, removal); `tests/test_up_restore_3_3.py`: "test_a_failed_restore_fails_up_in_a_sentence_and_starts_nothing" (restore) |
+| I23 | A restore never replaces a file that is already on the filesystem: every restore copy is `rclone copy --ignore-existing` | `tests/test_datasync_restore_3_3.py`: "test_existing_local_file_is_left_byte_for_byte" (a fake rclone that honours the flag; no real rclone has run) |
+| I24 | A filesystem with a restore record for the same remote is not restored again: nothing is copied, so a file deleted on the instance stays deleted | `tests/test_datasync_restore_3_3.py`: "test_second_run_makes_no_rclone_call_and_says_already_restored" (the runner); `tests/test_datasync_restore_setup_3_3.py`: "test_an_already_restored_filesystem_runs_nothing_and_says_when" (the `datasync restore` command that `up` calls) |
+| I25 | `up` calls the restore after the cap is armed, and before the sync timer and before recovery, installs or restarts start any service | `tests/test_up_restore_3_3.py`: "test_restore_runs_after_install_and_cap_before_timer_and_any_service" |
 
 ## Decisions
 
@@ -139,11 +142,13 @@ Not a Bun-family app; the family design in ~/workspace/architect/FAMILY.md doesn
 
 Rung 2 on the verifiability ladder (~/workspace/architect/VISION.md), for the local half only:
 `tests/fake_lambda` starts a fake Lambda API on an ephemeral loopback port, in a temp directory,
-with `ssh`/`rsync` shims, and drives the real `cloudgpu up` in a subprocess. Nothing runs the
-remote half against a real instance, and there's no evidence script (rung 3).
+with `ssh`/`rsync` shims, and drives the real `cloudgpu up` in a subprocess. The one-command
+scripted run below drives `up` only; `down` is driven against the fake only inside pytest (for
+example `tests/test_api_errors_0_12.py`). Nothing runs the remote half against a real instance,
+and there's no evidence script (rung 3).
 
 ```bash
-uv run --frozen --extra dev pytest                     # whole suite, about 4.5 minutes
+uv run --frozen --extra dev pytest                     # whole suite, over six minutes (6:36 when measured at 5dea7a9 by the architect)
 uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` against the fake
 ```
 
@@ -151,10 +156,11 @@ uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` ag
 
 - Everything on a real instance: systemd sandbox behaviour, `sudo`, the marker, ComfyUI and AI
   Toolkit installs, the autoterminate timer firing (tests use fakes and recorded commands).
-- The sync setup on a real instance: that systemd there has `LoadCredential=` (247 or newer),
+- Sync and restore on a real instance: that systemd there has `LoadCredential=` (247 or newer),
   that `cloudgpu-sync` can read the synced dirs and `cloudgpu-app` can't read the key, that the
-  pinned rclone downloads and runs, and that the timer fires. `up`'s calls to it are tested only
-  against an ssh shim that answers nothing: no real `datasync setup` has ever run from `up`.
+  pinned rclone downloads and runs, that the timer fires, and that a real rclone restores without
+  replacing a file (I23 to I25 are proven against a fake rclone and an ssh shim). `up`'s calls are
+  tested only against ssh shims: no real `datasync setup` or restore has ever run.
 - Lambda's real API shapes where the fake marks an ASSUMPTION (`tests/fake_lambda/__init__.py`).
 - The user's machine: whether secrets.env and rclone.conf exist and their modes, which configs and profiles exist.
 - That the persistent filesystem survives termination as Lambda documents (not testable here).
