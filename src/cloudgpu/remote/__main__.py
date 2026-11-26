@@ -85,7 +85,7 @@ def cmd_datasync(state: State, args: argparse.Namespace) -> None:
 
 
 def cmd_status(state: State, args: argparse.Namespace) -> None:
-    """Show status of all installed apps."""
+    """Show status of all installed apps, and of the bucket sync when it is installed."""
     detection = detect_all()
     apps = {}
     for app_name, app_state in state.list_apps().items():
@@ -95,7 +95,13 @@ def cmd_status(state: State, args: argparse.Namespace) -> None:
         else:
             apps[app_name] = {**app_state, "status": "unknown_installer"}
 
-    print(json.dumps({"detection": detection, "apps": apps}, indent=2))
+    data = {"detection": detection, "apps": apps}
+    # Only when sync is installed: otherwise the answer is exactly what it was before 3.4.
+    from . import datasync_setup
+    sync_info = datasync_setup.sync_status()
+    if sync_info is not None:
+        data["sync"] = sync_info
+    print(json.dumps(data, indent=2))
 
 
 def main() -> None:

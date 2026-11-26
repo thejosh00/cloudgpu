@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import pwd
+import re
 import shutil
 import subprocess
 import sys
@@ -583,6 +584,54 @@ def final() -> None:
                                    check=False, timeout=120)
             log("The sync timer is running again." if again.returncode == 0
                 else "The sync timer could not be started again.")
+
+
+# --- status ------------------------------------------------------------------------
+
+def _timer_interval_minutes() -> int | None:
+    """The interval of the timer that is installed (what decides how often runs happen)."""
+    try:
+        with open(timer_path()) as f:
+            text = f.read()
+    except OSError:
+        return None
+    match = re.search(r"^OnUnitActiveSec=(\d+)min\s*$", text, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def sync_status() -> dict | None:
+    """What `status` shows about the sync, or None when it is not installed (spec or timer
+    missing). Then nothing is run: a last-success file that ``remove`` left behind is not
+    evidence of a working sync. Only reads; starts, stops and restarts nothing.
+
+    The age is measured on the instance's clock, the one the last-success time was written by.
+    """
+    if not (os.path.exists(SPEC_PATH) and os.path.exists(timer_path())):
+        return None
+    remote = None
+    interval = _timer_interval_minutes()
+    try:
+        spec = datasync.load_spec(SPEC_PATH)
+        remote = spec["remote"]
+        if interval is None and isinstance(spec.get("interval_minutes"), int):
+            interval = spec["interval_minutes"]
+    except (OSError, ValueError):
+        pass
+    try:
+        active = _timer_active()
+    except (OSError, subprocess.SubprocessError):
+        active = False
+    try:
+        last = _last_success()
+    except (OSError, subprocess.SubprocessError):
+        last = None
+    return {
+        "remote": remote,
+        "interval_minutes": interval,
+        "timer_active": active,
+        "last_success": last[1] if last else None,
+        "age_seconds": max(0, int(time.time() - last[0])) if last else None,
+    }
 
 
 def remove() -> None:

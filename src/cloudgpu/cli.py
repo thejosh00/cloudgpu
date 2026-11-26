@@ -380,9 +380,47 @@ def status(host: str | None, config_name: str | None) -> None:
 
     display.show_detection(status_data.get("detection", {}))
     display.show_status(status_data.get("apps", {}))
+    if "sync" in status_data:
+        _show_sync(status_data["sync"])
     if overdue:
         display.error(f"Instance is past its auto-terminate deadline (see above); run 'cloudgpu down -C {config_name}'.")
         sys.exit(1)
+
+
+# A last success older than this many intervals (or STALE_FLOOR_SECONDS, if longer) is stale.
+STALE_INTERVALS = 3
+STALE_FLOOR_SECONDS = 15 * 60
+
+
+def _sync_stale_after(interval_minutes: object) -> int:
+    """Seconds after which the last successful sync is stale. An unknown interval: the floor."""
+    if isinstance(interval_minutes, bool) or not isinstance(interval_minutes, int) or interval_minutes < 1:
+        return STALE_FLOOR_SECONDS
+    return max(STALE_INTERVALS * interval_minutes * 60, STALE_FLOOR_SECONDS)
+
+
+def _show_sync(info: dict) -> None:
+    """The sync lines of `status`, from what the instance reported (only sent when installed).
+    Stale (older than the threshold, or the timer not active) and never-succeeded each warn."""
+    remote = escape(str(info.get("remote") or "an unknown remote"))
+    interval = info.get("interval_minutes")
+    every = f" every {interval} min" if isinstance(interval, int) else ""
+    active = info.get("timer_active") is True
+    display.info(f"Sync: to {remote}{every}, timer {'active' if active else '[red]not active[/red]'}")
+    last, age = info.get("last_success"), info.get("age_seconds")
+    if not isinstance(age, (int, float)) or not last:
+        display.info("  Last successful sync: none yet")
+        not_active = "The sync timer is not active and there is " if not active else "There is "
+        display.warn(f"{not_active}no successful sync yet: work on the instance is only on the instance.")
+        return
+    ago = f"{_overdue_for(age)} ago"
+    display.info(f"  Last successful sync: {escape(str(last))} ({ago})")
+    if not active:
+        display.warn(f"The sync timer is not active, so nothing more is uploaded; the last successful "
+                     f"sync was {ago}: newer work is only on the instance.")
+    elif age > _sync_stale_after(interval):
+        display.warn(f"The last successful sync was {ago} (stale after "
+                     f"{_overdue_for(_sync_stale_after(interval))}): newer work is only on the instance.")
 
 
 @cli.command(name="ssh", context_settings={"ignore_unknown_options": True})
