@@ -1,4 +1,4 @@
-"""A fake of Lambda Cloud's API, so `cloudgpu up` can run with no GPU and no network.
+"""A fake of Lambda Cloud's API, so `cloudgpu up` and `down` can run with no GPU and no network.
 
 Standard library only, on an ephemeral loopback port. A test says what each launch does
 and then asserts on what the fake saw: every launch request, and which instances are alive.
@@ -66,7 +66,7 @@ class FakeLambda:
     def __init__(
         self, *, launches=(), then="ok", boot_polls=0, filesystem="box-fs", region="us-fake-1",
         instance_reads=(), instance_reads_then="ok", list_reads=(), list_reads_then="ok",
-        boot_ends="active", filesystem_reads=(), filesystem_reads_then="ok",
+        boot_ends="active", filesystem_reads=(), filesystem_reads_then="ok", terminate_takes=True,
     ):
         """
         Args:
@@ -83,6 +83,8 @@ class FakeLambda:
                 "active" (with an ip), or "terminated" / "error" (no ip) for one that died booting.
             filesystem_reads: what each GET /file-systems does, in order (see READ_MODES).
             filesystem_reads_then: what every filesystem list after those does.
+            terminate_takes: False makes a terminate request answer 200 and leave the instance as it
+                was. ASSUMPTION: Lambda can accept a termination that then doesn't happen.
         """
         unknown = {*launches, then} - LAUNCH_MODES
         if unknown:
@@ -105,6 +107,7 @@ class FakeLambda:
         if boot_ends not in ("active", "terminated", "error"):
             raise ValueError(f"unknown boot_ends: {boot_ends!r}")
         self.boot_ends = boot_ends
+        self.terminate_takes = terminate_takes
         # Called with each GET's path before it's answered, outside the lock (a test can look
         # at the state file at that moment).
         self.on_get = None
@@ -346,7 +349,7 @@ def _handler_for(fake: FakeLambda) -> type[BaseHTTPRequestHandler]:
                         self._error(404, "global/object-does-not-exist", "Specified instance does not exist.")
                     else:
                         for inst in fake.instances:
-                            if inst["id"] in wanted:
+                            if inst["id"] in wanted and fake.terminate_takes:
                                 inst["_status"] = "terminated"
                         self._send(200, {"data": {"terminated_instances": []}})
                 else:

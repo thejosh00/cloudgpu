@@ -60,6 +60,49 @@ def _load_state(config_name: str) -> dict:
         sys.exit(1)
 
 
+def _overdue_for(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "under a minute"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _report_overdue(config_name: str, state: dict) -> bool:
+    """Say so on stderr if the instance has outlived its auto-terminate deadline. True if it has.
+
+    The cap is enforced only by a timer on the instance; when that fails, nothing else notices.
+    This only reports: it terminates nothing and changes no state. No Lambda call is made unless
+    the saved deadline has passed.
+    """
+    deadline = state.get("auto_terminate_at")
+    instance_id = state.get("instance_id")
+    if not instance_id or isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return False
+    late = time.time() - deadline
+    if late <= 0:
+        return False
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(deadline))
+    read = liveness.read_instance(instance_id)
+    if read.kind is liveness.Kind.UNKNOWN:
+        display.error(
+            f"The auto-terminate deadline for config '{escape(config_name)}' passed {_overdue_for(late)} ago "
+            f"({when}), and the state of instance {escape(str(instance_id))} couldn't be read: it may still be "
+            f"running and billing.\n{escape(read.detail)}\n"
+            f"Check it with 'cloudgpu lambda instances', or run 'cloudgpu down -C {escape(config_name)}'."
+        )
+        return False
+    if read.kind is liveness.Kind.GONE or read.instance.get("status") == "terminating":
+        return False
+    display.error(
+        f"Instance {escape(str(instance_id))} is OVERDUE: its auto-terminate deadline passed "
+        f"{_overdue_for(late)} ago ({when}) and it is still {escape(liveness.describe(read.instance))}, "
+        f"so the cap on the instance did not work and it is still billing. "
+        f"Run 'cloudgpu down -C {escape(config_name)}' to terminate it."
+    )
+    return True
+
+
 def _resolve_target(host: str | None = None, config_name: str | None = None) -> tuple[str, str]:
     """Resolve the (host, persistent_dir) to operate on.
 
@@ -321,8 +364,11 @@ def _warn_marks_left(host: str, persistent_dir: str, config_name: str | None) ->
 @click.argument("host", required=False)
 @click.option("--config", "-C", "config_name", default=None, help="Config name (resolves the instance to act on)")
 def status(host: str | None, config_name: str | None) -> None:
-    """Show what's installed and their health."""
+    """Show what's installed and their health. Exits 1 if the instance is past its auto-terminate deadline."""
+    explicit_host = host
     host, persistent_dir = _resolve_target(host, config_name)
+    # Before the ssh, so it is said even if the instance can't be reached.
+    overdue = bool(config_name and not explicit_host) and _report_overdue(config_name, _load_state(config_name))
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
@@ -333,6 +379,9 @@ def status(host: str | None, config_name: str | None) -> None:
 
     display.show_detection(status_data.get("detection", {}))
     display.show_status(status_data.get("apps", {}))
+    if overdue:
+        display.error(f"Instance is past its auto-terminate deadline (see above); run 'cloudgpu down -C {config_name}'.")
+        sys.exit(1)
 
 
 @cli.command(name="ssh", context_settings={"ignore_unknown_options": True})
@@ -1133,6 +1182,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     filesystem = cfg["filesystem"]
     # Read before anything else: a state file that can't be used stops `up` here.
     state = _load_state(config_name)
+    _report_overdue(config_name, state)  # reports only; this `up` is about to set a new deadline
     # Local only, and before any launch or ssh: a missing bucket key stops `up` here.
     sync_plan = _plan_sync(cfg, state, profile_list)
 
@@ -1370,6 +1420,7 @@ def autoterminate(hours: float | None, off: bool, config_name: str) -> None:
     state = _load_state(config_name)
     if not state.get("host") or not state.get("persistent_dir"):
         raise click.UsageError(f"No tracked instance for config '{config_name}'; run 'cloudgpu up' first.")
+    _report_overdue(config_name, state)  # reports only; a new deadline is about to be set
 
     if off:
         hours = 0.0
@@ -1400,6 +1451,11 @@ def autoterminate(hours: float | None, off: bool, config_name: str) -> None:
         display.success("Auto-terminate disarmed.")
 
 
+# How long plain `down` waits for Lambda to show the instance terminating or gone.
+DOWN_CONFIRM_SECONDS = 60
+DOWN_CONFIRM_POLL_SECONDS = 5
+
+
 def _find_filesystem(config_name: str, name: str) -> dict | None:
     """Return the account filesystem with this name, or None if the list doesn't have it.
 
@@ -1416,15 +1472,18 @@ def _find_filesystem(config_name: str, name: str) -> dict | None:
         sys.exit(1)
 
 
-def _wait_terminated(instance_id: str, timeout: int = 300, poll: int = 10) -> bool:
+def _wait_terminated(instance_id: str, timeout: float = 300, poll: float = 10, *, going: bool = False) -> bool:
     """Poll until the instance is terminated/gone (so its filesystem frees up).
 
     This is the step before deleting a filesystem, so a read that can't tell keeps polling.
+    With `going`, 'terminating' is enough: that is what `down` needs before it forgets the instance.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         read = liveness.read_instance(instance_id)
         if read.kind is liveness.Kind.GONE:
+            return True
+        if going and read.kind is liveness.Kind.ALIVE and read.instance.get("status") == "terminating":
             return True
         if read.kind is liveness.Kind.UNKNOWN:
             display.warn(escape(read.detail))
@@ -1451,6 +1510,7 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
     name = cfg["name"]
     filesystem = cfg["filesystem"]
     state = _load_state(config_name)
+    _report_overdue(config_name, state)  # reports only; this `down` is about to fix it
 
     # Find the instance: tracked id, or whatever is mounting the filesystem.
     instance_id = state.get("instance_id")
@@ -1492,6 +1552,18 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
     elif instance_id:
         _api_call(lambda_api.terminate_instances, [instance_id])
         display.success(f"Termination requested for {instance_id}.")
+        # Forget the instance only once Lambda shows it going: a request that didn't take
+        # would otherwise leave a billing instance this config no longer knows about.
+        pace = lambda_api.pace()
+        if not _wait_terminated(instance_id, timeout=DOWN_CONFIRM_SECONDS / pace, poll=DOWN_CONFIRM_POLL_SECONDS / pace,
+                                going=True):
+            display.error(
+                f"Lambda accepted the request, but instance {instance_id} is still listed as running after "
+                f"{DOWN_CONFIRM_SECONDS}s and may still be billing. Nothing was cleared: config '{config_name}' "
+                f"still tracks it. Run 'cloudgpu down -C {config_name}' again, or check it with "
+                "'cloudgpu lambda instances'."
+            )
+            sys.exit(1)
     else:
         display.info("No running instance for this config.")
     configs.clear_state(config_name)

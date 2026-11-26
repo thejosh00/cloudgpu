@@ -1,4 +1,4 @@
-"""One scripted `cloudgpu up` against the fake, and what it left behind.
+"""One scripted `cloudgpu up`, then `cloudgpu down`, against the fake, and what they left behind.
 
     uv run --frozen --extra dev python -m tests.fake_lambda
     uv run --frozen --extra dev python -m tests.fake_lambda --launch start_then_502
@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import LAUNCH_MODES, FakeLambda, run_up
+from . import LAUNCH_MODES, FakeLambda, run_cloudgpu, run_up
 
 
 def main() -> int:
@@ -33,7 +33,18 @@ def main() -> int:
         print(f"fake's live instances: {fake.alive()}")
         print(f"local state tracks:    {result.state.get('instance_id')}")
         print(f"ssh/rsync shim calls:  {len(result.shim_calls)}, hosts {sorted({c['host'] for c in result.shim_calls})}")
-    return result.returncode
+        if result.returncode != 0:
+            return result.returncode
+        down = run_cloudgpu(fake, Path(tmp), ["down", "--config", "box", "--yes"])
+        print(down.output)
+        print(f"cloudgpu down exit code: {down.returncode}")
+        print(f"fake saw terminates:     {fake.count('POST', '/terminate')}")
+        print(f"fake's live instances:   {fake.alive()}")
+        print(f"local state tracks:      {down.state.get('instance_id')}")
+        if down.returncode == 0 and fake.alive():
+            print("FAILED: down exited 0 with an instance still alive")
+            return 1
+    return down.returncode
 
 
 if __name__ == "__main__":
