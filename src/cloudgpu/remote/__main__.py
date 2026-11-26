@@ -68,7 +68,7 @@ def cmd_autoterminate(state: State, args: argparse.Namespace) -> None:
         if not args.instance_id or not args.key_file:
             print("--instance-id and --key-file are required to arm", file=sys.stderr)
             sys.exit(2)
-        autoterminate.arm(args.hours, args.instance_id, args.key_file)
+        autoterminate.arm(args.hours, args.instance_id, args.key_file, state.persistent_dir)
     else:
         autoterminate.disarm()
 
