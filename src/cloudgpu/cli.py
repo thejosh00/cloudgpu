@@ -1492,16 +1492,59 @@ def _wait_terminated(instance_id: str, timeout: float = 300, poll: float = 10, *
     return False
 
 
+# The instance bounds a final sync (datasync_setup.FINAL_WAIT_SECONDS, the six-hour run limit
+# plus five minutes, per wait; a run in progress is waited out first, so two waits worst case);
+# this waits a little longer, so the instance's own answer arrives first.
+FINAL_SYNC_SSH_TIMEOUT = 2 * (6 * 60 * 60 + 300) + 600
+
+
+def _final_sync(config_name: str, sync_cfg: dict, host: str | None,
+                persistent_dir: str | None) -> tuple[bool, str]:
+    """Ask the instance for one fresh upload run before termination (`datasync final`).
+
+    Returns (True, "") on success, else (False, one sentence on why, with the last successful
+    sync time when the instance gave one). Nothing is re-sent: what the last `up` installed is
+    synced. The bucket key is in no command or output here; the instance names only its time.
+    Ctrl-C is not caught here (the caller says what was left).
+    """
+    remote = escape(sync_cfg["remote"])
+    display.info(f"Final sync to {remote} before terminating "
+                 "(waits for a run in progress and one more full run)...")
+    if not host or not persistent_dir:
+        return False, "This config's state has no address for the instance, so it could not be reached."
+    try:
+        result = ssh.ssh_run(host, _remote_cmd(persistent_dir, "datasync", ["final"]),
+                             timeout=FINAL_SYNC_SSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, (f"The final sync did not answer within {FINAL_SYNC_SSH_TIMEOUT // 3600} hours; "
+                       "the sync timer on the instance may be stopped.")
+    except (ssh.SSHError, subprocess.SubprocessError, OSError) as e:
+        return False, f"Could not reach the instance over ssh: {e}"
+    said = [line.removeprefix(">>> ").removeprefix("error: ").strip()
+            for line in result.stderr.splitlines() if line.strip()]
+    if result.ok:
+        for line in said:
+            display.info(escape(line))
+        display.success(f"Final sync to {remote} done.")
+        return True, ""
+    if result.returncode == 255:
+        return False, "Could not reach the instance over ssh" + (f": {said[-1]}" if said else ".")
+    return False, " ".join(said) or f"The remote final sync exited {result.returncode} and said nothing."
+
+
 @cli.command()
 @click.option("--config", "-C", "config_name", required=True, help="Config name (the instance to tear down)")
 @click.option("--delete-filesystem", is_flag=True, help="Also delete the persistent filesystem (DESTROYS its data)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
+@click.option("--skip-sync", is_flag=True,
+              help="With [sync]: terminate without the final sync (work since the last sync is lost)")
+def down(config_name: str, delete_filesystem: bool, yes: bool, skip_sync: bool) -> None:
     """Terminate a config's instance. Keeps the filesystem unless --delete-filesystem.
 
     Without --delete-filesystem the data persists, so 'cloudgpu up' brings the machine
     back later. With it, the instance is terminated and the filesystem (and all its data)
-    is permanently deleted.
+    is permanently deleted. With [sync] in the config, a final sync to the bucket runs
+    first; if it fails, nothing is terminated unless you say so (with -y: --skip-sync).
     """
     try:
         cfg = configs.load_config(config_name)
@@ -1517,19 +1560,23 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
     instance_id = state.get("instance_id")
     already_terminating = False
     already_gone = False
+    found: dict = {}
     if instance_id:
         # Read it first: terminating an id Lambda has lost fails, and would keep the stale id forever.
         read = liveness.read_instance(instance_id)
         if read.kind is liveness.Kind.UNKNOWN:
             _stop_unchanged(read.detail)
         already_gone = read.kind is liveness.Kind.GONE
+        if read.kind is liveness.Kind.ALIVE:
+            found = read.instance or {}
     else:
         mounting = liveness.find_mounting(filesystem)
         if mounting.kind is liveness.Kind.UNKNOWN:
             _stop_unchanged(mounting.detail)
         if mounting.kind is liveness.Kind.ALIVE:
-            instance_id = mounting.instance.get("id")
-            already_terminating = mounting.instance.get("status") == "terminating"
+            found = mounting.instance or {}
+            instance_id = found.get("id")
+            already_terminating = found.get("status") == "terminating"
 
     # Confirm (a single, appropriately-scoped prompt).
     if not yes:
@@ -1545,6 +1592,39 @@ def down(config_name: str, delete_filesystem: bool, yes: bool) -> None:
                 f"(filesystem '{filesystem}' is kept)",
                 abort=True,
             )
+
+    # The final sync: after the confirmation, before anything is terminated or cleared.
+    sync_cfg = cfg.get("sync")
+    if sync_cfg:
+        if not instance_id or already_gone or already_terminating:
+            display.info("No instance to sync from, so no final sync was possible.")
+        elif skip_sync:
+            display.warn("Final sync skipped (--skip-sync): work since the last sync is not in the bucket.")
+        else:
+            host = state.get("host") or (f"ubuntu@{found['ip']}" if found.get("ip") else None)
+            persistent_dir = state.get("persistent_dir") or f"/lambda/nfs/{filesystem}"
+            try:
+                ok, why = _final_sync(config_name, sync_cfg, host, persistent_dir)
+            except KeyboardInterrupt:
+                display.error(
+                    f"Interrupted during the final sync: nothing was terminated or deleted, instance "
+                    f"{instance_id} is still running and billing, and config '{config_name}' still tracks it "
+                    f"(its sync timer may be stopped until the next 'cloudgpu up -C {config_name}')."
+                )
+                sys.exit(130)
+            if not ok:
+                display.error(escape(f"The final sync to {sync_cfg['remote']} failed: {why}"))
+                still = (f"Nothing was terminated or deleted. Instance {instance_id} is still running and billing; "
+                         f"config '{config_name}' still tracks it.")
+                if yes:
+                    display.error(f"{still} 'cloudgpu down -C {config_name} -y --skip-sync' terminates it "
+                                  "without a final sync.")
+                    sys.exit(1)
+                if not click.confirm("Terminate anyway, without the work since the last successful sync?",
+                                     default=False):
+                    display.error(f"{still} 'cloudgpu down -C {config_name}' tries again; "
+                                  f"'--skip-sync' terminates it without a final sync.")
+                    sys.exit(1)
 
     if already_gone:
         display.info(f"Instance {instance_id} is already gone; clearing it from this config.")
