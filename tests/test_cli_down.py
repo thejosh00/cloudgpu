@@ -24,7 +24,9 @@ def _repo(tmp_path, monkeypatch, *, with_state=True):
 def test_down_terminates_and_keeps_filesystem(tmp_path, monkeypatch):
     _repo(tmp_path, monkeypatch)
     terminated = []
-    monkeypatch.setattr(lambda_api, "get_instance", lambda i: {"status": "active", "ip": "1.2.3.4"})
+    # Alive when `down` reads it, then terminating once it has asked (R29: `down` now waits to see that).
+    monkeypatch.setattr(lambda_api, "get_instance",
+                        lambda i: {"status": "terminating"} if terminated else {"status": "active", "ip": "1.2.3.4"})
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: terminated.append(ids))
     monkeypatch.setattr(lambda_api, "delete_filesystem",
                         lambda *a, **k: pytest.fail("must not delete filesystem without the flag"))
