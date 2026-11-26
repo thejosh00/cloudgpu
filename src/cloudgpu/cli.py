@@ -94,9 +94,10 @@ def _report_overdue(config_name: str, state: dict) -> bool:
         return False
     if read.kind is liveness.Kind.GONE or read.instance.get("status") == "terminating":
         return False
+    status = str(read.instance.get("status"))
     display.error(
         f"Instance {escape(str(instance_id))} is OVERDUE: its auto-terminate deadline passed "
-        f"{_overdue_for(late)} ago ({when}) and it is still {escape(liveness.describe(read.instance))}, "
+        f"{_overdue_for(late)} ago ({when}) and it is still '{escape(status)}', "
         f"so the cap on the instance did not work and it is still billing. "
         f"Run 'cloudgpu down -C {escape(config_name)}' to terminate it."
     )
