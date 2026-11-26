@@ -1,6 +1,6 @@
 # cloudgpu — architecture
 
-Last checked against: `5dea7a9` on 2026-11-19
+Last checked against: `03e9bb0` plus R29 on 2026-11-26
 
 ## Purpose and boundaries
 
@@ -121,6 +121,8 @@ whatever happens; other remotes in the file stay behind.
 | I23 | A restore never replaces a file that is already on the filesystem: every restore copy is `rclone copy --ignore-existing` | `tests/test_datasync_restore_3_3.py`: "test_existing_local_file_is_left_byte_for_byte" (a fake rclone that honours the flag; no real rclone has run) |
 | I24 | A filesystem with a restore record for the same remote is not restored again: nothing is copied, so a file deleted on the instance stays deleted | `tests/test_datasync_restore_3_3.py`: "test_second_run_makes_no_rclone_call_and_says_already_restored" (the runner); `tests/test_datasync_restore_setup_3_3.py`: "test_an_already_restored_filesystem_runs_nothing_and_says_when" (the `datasync restore` command that `up` calls) |
 | I25 | `up` calls the restore after the cap is armed, and before the sync timer and before recovery, installs or restarts start any service | `tests/test_up_restore_3_3.py`: "test_restore_runs_after_install_and_cap_before_timer_and_any_service" |
+| I26 | A passed auto-terminate deadline with an instance Lambda still shows alive and not terminating is reported on stderr by every command that reads the config's state to act on the instance (`status`, `up`, `autoterminate`, `down`), and fails `status`; the check only reports, and makes no Lambda call unless the saved deadline has passed | `tests/test_overdue_and_down_confirms.py`: "test_status_exits_1_and_names_the_overdue_instance", "test_other_commands_print_the_overdue_error_and_keep_their_exit_code", "test_a_future_deadline_makes_no_lambda_read" |
+| I27 | `down` clears the local state only once the API shows the instance terminating, terminated or gone; a termination not confirmed within 60 seconds exits 1 with the state file unchanged and no filesystem step | `tests/test_overdue_and_down_confirms.py`: "test_down_keeps_the_state_when_the_termination_does_not_take", "test_down_gives_up_after_60_seconds_and_keeps_the_state", "test_down_delete_filesystem_stops_before_the_filesystem_when_unconfirmed" |
 
 ## Decisions
 
@@ -143,13 +145,14 @@ Not a Bun-family app; the family design in ~/workspace/architect/FAMILY.md doesn
 Rung 2 on the verifiability ladder (~/workspace/architect/VISION.md), for the local half only:
 `tests/fake_lambda` starts a fake Lambda API on an ephemeral loopback port, in a temp directory,
 with `ssh`/`rsync` shims, and drives the real `cloudgpu up` in a subprocess. The one-command
-scripted run below drives `up` only; `down` is driven against the fake only inside pytest (for
-example `tests/test_api_errors_0_12.py`). Nothing runs the remote half against a real instance,
+scripted run below drives `up` and then `down`, and reports that the fake has no live instance
+left. The fake can also accept a terminate and keep the instance (`terminate_takes=False`), which
+is how I27 is tested. Nothing runs the remote half against a real instance,
 and there's no evidence script (rung 3).
 
 ```bash
-uv run --frozen --extra dev pytest                     # whole suite, about 7 minutes (6:52 on 2026-11-19: 1113 passed, 1 skipped)
-uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` against the fake
+uv run --frozen --extra dev pytest                     # whole suite, about 7 minutes (6:57 on 2026-11-26: 1129 passed, 1 skipped)
+uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up`, then `down`, against the fake
 ```
 
 ## Unverified
@@ -161,6 +164,11 @@ uv run --frozen --extra dev python -m tests.fake_lambda   # one scripted `up` ag
   pinned rclone downloads and runs, that the timer fires, and that a real rclone restores without
   replacing a file (I23 to I25 are proven against a fake rclone and an ssh shim). `up`'s calls are
   tested only against ssh shims: no real `datasync setup` or restore has ever run.
+- The overdue report and `down`'s confirmation (I26, I27) on a real instance: no real cap has
+  failed with a rotated key, and no real Lambda termination has been seen not to take; that Lambda
+  ever answers 200 to a terminate that doesn't happen is the fake's ASSUMPTION. The on-instance
+  timer is unchanged: when its call fails it still only logs there and retries. The overdue report
+  is only seen when you run a command for that config; nothing notifies you otherwise.
 - Lambda's real API shapes where the fake marks an ASSUMPTION (`tests/fake_lambda/__init__.py`).
 - The user's machine: whether secrets.env and rclone.conf exist and their modes, which configs and profiles exist.
 - That the persistent filesystem survives termination as Lambda documents (not testable here).
