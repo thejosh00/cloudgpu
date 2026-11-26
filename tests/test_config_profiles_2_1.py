@@ -256,7 +256,9 @@ def test_down_still_works_when_a_config_profile_is_missing(tmp_path, monkeypatch
     """Catches: a typo in `profiles` making it impossible to terminate the instance."""
     _repo_with_missing_profile(tmp_path, monkeypatch)
     terminated = []
-    monkeypatch.setattr(lambda_api, "get_instance", lambda i: {"status": "active", "ip": "1.2.3.4"})
+    # Alive when `down` reads it, then terminating once it has asked (R29: `down` now waits to see that).
+    monkeypatch.setattr(lambda_api, "get_instance",
+                        lambda i: {"status": "terminating"} if terminated else {"status": "active", "ip": "1.2.3.4"})
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: terminated.append(ids))
 
     result = CliRunner().invoke(cli.down, ["--yes", "-C", "c"])
