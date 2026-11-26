@@ -370,7 +370,13 @@ def test_down_and_status_do_not_need_the_key_file(tmp_path, command):
     assert "Traceback" not in result.output and "rclone.conf" not in result.output, result.output
     assert not (tmp_path / "home" / ".config" / "cloudgpu" / "rclone.conf").exists()
     assert alive == ([] if command[0] == "down" else [inst])
-    assert not [c for c in result.shim_calls if " datasync " in c["command"]]
+    # 3.4 part 2: `down` with [sync] now asks for the final sync, and sends nothing with it (no key,
+    # no path list): what the last `up` installed is synced. `status` still makes no datasync call.
+    datasync = [c["command"] for c in result.shim_calls if " datasync " in c["command"]]
+    if command[0] == "down":
+        assert len(datasync) == 1 and datasync[0].endswith(" datasync final"), datasync
+    else:
+        assert datasync == []
 
 
 # --- the key file reader itself ---------------------------------------------------------------
