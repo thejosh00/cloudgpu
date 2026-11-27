@@ -125,6 +125,17 @@ def find_profile(name_or_path: str | Path) -> Path:
     return d
 
 
+def record_of(profile: dict[str, Any]) -> str:
+    """How a state file records a loaded profile, so ``load_profile`` finds it again.
+
+    Its name when that name finds this same folder (a profile under ./profiles), else its
+    resolved absolute path, which finds it from any working directory.
+    """
+    if profile_dir(profile["name"]) == profile["dir"]:
+        return profile["name"]
+    return str(profile["dir"])
+
+
 def has_profile(d: str | Path) -> bool:
     """True if directory ``d`` contains a cloudgpu.toml."""
     return (Path(d).expanduser() / PROFILE_FILE).exists()

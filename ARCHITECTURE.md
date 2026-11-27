@@ -52,7 +52,7 @@ flowchart LR
 
 | State | Where | Survives a terminated instance? | Backed up? |
 |---|---|---|---|
-| Tracked instance (id, host, profiles) | configs/<name>.state.json beside the config (`src/cloudgpu/local/configs.py`), plus a configs/<name>.up.lock flock | yes (local) | no; gitignored |
+| Tracked instance (id, host, and the provisioned profiles: a name for one under profiles/, else its resolved path; one that won't load is named in a warning by `up`, `forward` and `status`) | configs/<name>.state.json beside the config (`src/cloudgpu/local/configs.py`), plus a configs/<name>.up.lock flock | yes (local) | no; gitignored |
 | Bucket key (rclone config; you write it once, a section per remote) | ~/.config/cloudgpu/rclone.conf (`profiles.rclone_config_file`); needed by `up` only when the config has `[sync]`, never by `down` or `status` | yes (local) | no; nothing checks its mode |
 | Manual-flow host | ~/.config/cloudgpu/config.json (`src/cloudgpu/local/config.py`) | yes (local) | no |
 | Capacity samples | ~/.local/state/cloudgpu/capacity.jsonl, append-only | yes (local) | no |

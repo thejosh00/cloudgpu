@@ -369,7 +369,11 @@ def status(host: str | None, config_name: str | None) -> None:
     explicit_host = host
     host, persistent_dir = _resolve_target(host, config_name)
     # Before the ssh, so it is said even if the instance can't be reached.
-    overdue = bool(config_name and not explicit_host) and _report_overdue(config_name, _load_state(config_name))
+    overdue = False
+    if config_name and not explicit_host:
+        state = _load_state(config_name)
+        overdue = bool(_report_overdue(config_name, state))
+        _recorded_profiles(state, warn=True)
 
     with console.status("Syncing remote tool..."):
         sync.sync_remote(host, persistent_dir)
@@ -447,18 +451,28 @@ def ssh_cmd(host: str | None, config_name: str | None, command: tuple[str, ...])
     sys.exit(exit_code)
 
 
-def _provisioned_profiles(config_name: str | None) -> list[dict]:
-    """The profiles provisioned onto this config's instance (unloadable ones skipped)."""
+def _recorded_profiles(state: dict, *, warn: bool) -> list[dict]:
+    """The profiles the state file records as provisioned, loaded from what was recorded (a name
+    under ./profiles, or a path). One that won't load is left out, and with ``warn`` named in a
+    warning; it stays recorded, so putting its folder back brings it back."""
+    loaded: list[dict] = []
+    for record in state.get("provisioned_profiles") or []:
+        try:
+            loaded.append(profiles.load_profile(record))
+        except config.ConfigError as e:
+            if warn:
+                display.warn(escape(
+                    f"Recorded profile '{record}' can't be loaded, so it is left out (its apps' ports, "
+                    f"sync paths and re-provisioning): {e}"))
+    return loaded
+
+
+def _provisioned_profiles(config_name: str | None, *, warn: bool = False) -> list[dict]:
+    """The profiles provisioned onto this config's instance (unloadable ones left out, and
+    named in a warning with ``warn``)."""
     if not config_name:
         return []
-    state = _load_state(config_name)
-    loaded: list[dict] = []
-    for pname in state.get("provisioned_profiles", []):
-        try:
-            loaded.append(profiles.load_profile(pname))
-        except config.ConfigError:
-            continue
-    return loaded
+    return _recorded_profiles(_load_state(config_name), warn=warn)
 
 
 def _apps_for_config(config_name: str | None) -> list[str]:
@@ -471,13 +485,14 @@ def _apps_for_config(config_name: str | None) -> list[str]:
     return result
 
 
-def _config_ports(config_name: str | None) -> list[int]:
+def _config_ports(config_name: str | None, *, warn: bool = False) -> list[int]:
     """Ports to forward for the config: its apps' ports, plus profile-declared ones.
 
     A profile can serve something its provision script installed rather than an app
-    (imgv, say), so its 'ports' are forwarded alongside the app ports.
+    (imgv, say), so its 'ports' are forwarded alongside the app ports. With ``warn``, a
+    recorded profile that won't load is named.
     """
-    provisioned = _provisioned_profiles(config_name)
+    provisioned = _provisioned_profiles(config_name, warn=warn)
     ports = apps.app_ports([a for p in provisioned for a in p.get("apps", [])])
     for profile in provisioned:
         for port in profile.get("ports", []):
@@ -513,7 +528,7 @@ def forward(host: str | None, port: int | None, local_port: int | None, run_cmd:
     # Single-port mode: explicit --port, or --run (a command needs one port).
     if port is not None or run_cmd:
         if port is None:
-            derived = _config_ports(config_name)
+            derived = _config_ports(config_name, warn=True)
             if not derived:
                 raise click.UsageError("Pass --port <n> (no app port to infer from this config).")
             port = derived[0]
@@ -529,7 +544,7 @@ def forward(host: str | None, port: int | None, local_port: int | None, run_cmd:
         sys.exit(ssh.ssh_interactive(host, ssh_args=["-L", spec, "-N"]))
 
     # Config mode: forward every app port in one tunnel.
-    ports = _config_ports(config_name)
+    ports = _config_ports(config_name, warn=True)
     if not ports:
         raise click.UsageError(
             "No ports to forward for this config. Pass --port <n>, provision a profile "
@@ -647,17 +662,17 @@ def _reprovision(config_name: str, state: dict, known: dict,
     marked = _marked_apps(known)
     if not marked:
         return [], []
-    requested = {p["name"] for p in profile_list}
+    requested = {p["dir"] for p in profile_list}
     redo: list[dict] = []
     unloadable: list[str] = []
-    for name in state.get("provisioned_profiles") or []:
+    for record in state.get("provisioned_profiles") or []:
         try:
-            prof = profiles.load_profile(name)
-        except config.ConfigError as e:
-            unloadable.append(name)
-            display.warn(f"Can't load recorded profile '{name}': {e}")
+            prof = profiles.load_profile(record)
+        except config.ConfigError:
+            unloadable.append(record)  # named, with the reason, by `up` and `provision` already
             continue
-        if name not in requested and any(a in marked for a in prof.get("apps", [])):
+        if prof["dir"] not in requested and any(a in marked for a in prof.get("apps", [])):
+            requested.add(prof["dir"])
             redo.append(prof)
     apps_list = ", ".join(marked)
     if redo:
@@ -666,8 +681,8 @@ def _reprovision(config_name: str, state: dict, known: dict,
     if unloadable:
         display.warn(
             f"Recovery rebuilt the venv of {apps_list}, and recorded profile(s) "
-            f"{', '.join(unloadable)} can't be loaded, so they can't be provisioned again. "
-            f"Fix them and run 'cloudgpu up -C {config_name} -P {','.join(unloadable)}'; "
+            f"{escape(', '.join(unloadable))} can't be loaded, so they can't be provisioned again. "
+            f"Fix them and run 'cloudgpu up -C {config_name} -P {escape(','.join(unloadable))}'; "
             "until then every 'up' asks again.")
         return redo, []
     return redo, marked
@@ -847,13 +862,8 @@ def _plan_sync(cfg: dict, state: dict, profile_list: list[dict]) -> dict | None:
     except config.ConfigError as e:
         display.error(escape(f"{e} Nothing was launched or changed."))
         sys.exit(1)
-    in_play = list(profile_list)
-    for name in state.get("provisioned_profiles") or []:
-        try:
-            in_play.append(profiles.load_profile(name))
-        except config.ConfigError:
-            continue
-    in_play = _each_once(in_play)
+    # A recorded profile that won't load was named at the start of `up`.
+    in_play = _each_once(list(profile_list) + _recorded_profiles(state, warn=False))
     paths = apps.sync_paths(cfg, _app_union(in_play), in_play)
     for path in paths:
         if path.startswith(("/", "~")) or ".." in path.split("/"):
@@ -1022,7 +1032,7 @@ def _report_up(config_name: str, runtime: dict, persistent_dir: str, app_list: l
     display.show_status(data.get("apps", {}))
 
     provisioned = runtime.get("provisioned_profiles") or []
-    prof_note = f" (profiles: {', '.join(provisioned)})" if provisioned else ""
+    prof_note = f" (profiles: {escape(', '.join(provisioned))})" if provisioned else ""
     display.success(f"Config '{config_name}' is up{prof_note}.")
     display.info(
         f"  GPU: {runtime.get('instance_type') or '?'}   Region: {runtime.get('region') or '?'}"
@@ -1112,8 +1122,8 @@ def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir
 
     Returns the union of the profiles' apps (for reporting / port forwarding). The union
     is installed once (so `recover` runs a single time), then each profile's payload is
-    provisioned into its own remote dir. Profile names are merged into
-    state['provisioned_profiles']. ``known``: the apps already recovered this run, if any.
+    provisioned into its own remote dir. Each profile's record (its name, or its resolved path
+    when given by a path outside ./profiles) is merged into state['provisioned_profiles']. ``known``: the apps already recovered this run, if any.
     """
     app_union = _app_union(profile_list)
 
@@ -1124,8 +1134,8 @@ def _provision_profiles(config_name: str, state: dict, host: str, persistent_dir
 
     provisioned = list(state.get("provisioned_profiles") or [])
     for prof in profile_list:
-        if prof["name"] not in provisioned:
-            provisioned.append(prof["name"])
+        if profiles.record_of(prof) not in provisioned:
+            provisioned.append(profiles.record_of(prof))
     state["provisioned_profiles"] = provisioned
     configs.save_state(config_name, state)
     return app_union
@@ -1222,6 +1232,7 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
     # Read before anything else: a state file that can't be used stops `up` here.
     state = _load_state(config_name)
     _report_overdue(config_name, state)  # reports only; this `up` is about to set a new deadline
+    _recorded_profiles(state, warn=True)  # named once here; later steps leave them out quietly
     # Local only, and before any launch or ssh: a missing bucket key stops `up` here.
     sync_plan = _plan_sync(cfg, state, profile_list)
 
@@ -1270,8 +1281,9 @@ def _up_locked(config_name: str, cfg: dict, profile_list: list[dict]) -> None:
         display.info("Nothing to provision.")
     for prof in to_provision:
         _run_provision(prof, host, persistent_dir)
-        if prof["name"] not in (state.get("provisioned_profiles") or []):
-            state["provisioned_profiles"] = [*(state.get("provisioned_profiles") or []), prof["name"]]
+        record = profiles.record_of(prof)
+        if record not in (state.get("provisioned_profiles") or []):
+            state["provisioned_profiles"] = [*(state.get("provisioned_profiles") or []), record]
         configs.save_state(config_name, state)
 
     # Everything on the machine (the recorded apps and this `up`'s), but only when something was
@@ -1422,6 +1434,7 @@ def provision(config_name: str, profile_csv: str) -> None:
         sync.sync_remote(host, persistent_dir)
     # As `up` does: also provision the recorded profiles that use an app a venv rebuild marked,
     # and clear the marks only once all of them were provisioned again.
+    _recorded_profiles(state, warn=True)
     known = _recover_recorded(host, persistent_dir)
     redo, marked = _reprovision(config_name, state, known, profile_list)
     app_list = _provision_profiles(config_name, state, host, persistent_dir, profile_list + redo, known)

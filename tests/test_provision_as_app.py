@@ -396,7 +396,9 @@ class TestProvisioningPath:
         monkeypatch.setattr(cli, "_run_provision", lambda *a: order.append("provision"))
         monkeypatch.setattr(cli, "_restart_services", lambda *a: None)
         monkeypatch.setattr(cli.configs, "save_state", lambda *a: None)
-        cli._provision_profiles("c", {}, "ubuntu@h", "/p", [{"name": "lora", "apps": ["ai-toolkit"]}])
+        # As load_profile gives it: the state records each profile by its folder ("dir").
+        lora = {"name": "lora", "apps": ["ai-toolkit"], "dir": profiles.profile_dir("lora")}
+        cli._provision_profiles("c", {}, "ubuntu@h", "/p", [lora])
         assert order == ["ensure apps", "provision"]
 
 
